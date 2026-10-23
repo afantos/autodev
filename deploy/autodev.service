@@ -1,0 +1,35 @@
+[Unit]
+Description=autodev orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=autodev
+Group=autodev
+WorkingDirectory=/opt/autodev/instance
+EnvironmentFile=/opt/autodev/instance/.env
+Environment=AUTODEV_CONFIG=/opt/autodev/instance/autodev.config.yaml
+Environment=TZ=America/New_York
+ExecStart=/usr/bin/node /opt/autodev/app/src/cli.ts run
+Restart=always
+RestartSec=10
+# Give running stages time to reach a checkpoint; leases make everything else resumable.
+TimeoutStopSec=90
+KillMode=mixed
+
+# Hardening: the service can only write its own state.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/autodev/instance /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm /tmp
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=12G
+
+[Install]
+WantedBy=multi-user.target

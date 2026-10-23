@@ -1,0 +1,88 @@
+# autodev configuration. Copy to autodev.config.yaml (gitignored).
+# Secrets are NEVER put here — they come from the environment / .env next to this file:
+#   LINEAR_API_KEY            Linear personal API key (Settings → Security & access → API keys)
+#   GITHUB_TOKEN              fine-grained PAT of a *bot* account (see docs/SETUP.md §3)
+#   ANTHROPIC_API_KEY         Claude Console API key with a spend limit (recommended for unattended use)
+#   AUTODEV_DASHBOARD_TOKEN   random string for the status page
+#   AUTODEV_REPORT_WEBHOOK    optional ntfy/Slack webhook for the morning report
+
+dataDir: ./data
+tracker: linear        # linear | local (simulation)
+scm: github            # github | local (simulation)
+runner: claude         # claude | fake (no AI, for dry runs)
+
+projects:
+  - key: webapp                       # short id used in branch names and CLI
+    repo: your-org/webapp             # GitHub owner/name
+    # baseBranch: main                # defaults to the repo's default branch
+    linear:
+      teamKey: ENG                    # Linear team key
+      # projectName: Web App          # optional: scope to one Linear project (otherwise label project:<key> when teams are shared)
+    setup: ["npm ci --offline --no-audit"]  # command networking is disabled
+    # npmCacheDir: ./cache/npm           # dedicated cache, seeded by you before jobs start
+    validate: ["npm run typecheck", "npm run lint", "npm test"]   # run by the orchestrator itself before pushing
+    requiredChecks: []                # GitHub check names that must pass ([] = every reported check)
+    env:                              # non-production values only; {{jobId}}/{{port}} are templated per job
+      DATABASE_URL: "postgres://localhost:5432/webapp_test_{{jobId}}"
+      NODE_ENV: test
+    maxConcurrent: 1
+    stackedBranches: false            # true = may base a ticket on an unmerged dependency's PR branch
+    approvedDependencies: []          # packages the Decision Agent may add without asking you
+
+linear:
+  states:                             # names of your Linear workflow states
+    ideas: Ideas
+    backlog: Backlog
+    ready: Ready
+    in_progress: In Progress
+    review: In Review
+    done: Done
+    blocked: Blocked
+    failed: Failed
+    canceled: Canceled
+  requireLabel: ""                    # e.g. "autodev" to only touch labeled tickets
+
+concurrency:
+  global: 2
+
+budget:                               # USD, from the SDK's cost estimates
+  dailyUsd: 25
+  monthlyUsd: 300
+  perTicketUsd: 15
+  perRunUsd: 8
+  perDecisionUsd: 1.5
+  onExhausted: resume_next_period     # or: manual (stay paused until `autodev resume`)
+
+models:
+  planning: opus
+  coding: sonnet
+  codingComplex: opus                 # used at/above complexThreshold (ticket estimate)
+  complexThreshold: 4
+  decision: sonnet
+  review: opus
+  classify: haiku
+
+limits:
+  maxAttempts: 3
+  maxFixAttempts: 3
+  maxReviewCycles: 2
+  maxDecisionsPerTicket: 3
+  maxAttemptsPerQuestion: 2
+  agentMaxTurns: 200
+  agentTimeoutMinutes: 90
+  decisionTimeoutMinutes: 15
+  ciTimeoutMinutes: 60
+
+policy:
+  minAutoConfidence: 0.7
+  humanKeywords: []                   # extra regexes that always need you, e.g. ["stripe", "webhook secret"]
+
+sandbox:
+  enabled: true
+  failIfUnavailable: true             # real agents and repository commands always fail closed
+  allowedDomains: [registry.npmjs.org, pypi.org, files.pythonhosted.org, github.com, codeload.github.com, objects.githubusercontent.com]
+
+# featureDevPluginPath: /opt/claude-plugins/feature-dev   # optional: subagents for complex tickets
+
+dashboard: { enabled: true, host: 127.0.0.1, port: 7777 }
+report: { hour: 7 }                   # local hour for the morning report (-1 = off)

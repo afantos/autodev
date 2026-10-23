@@ -1,0 +1,603 @@
+import { z } from 'zod';
+import { resolve } from 'node:path';
+import type { ProjectConfig } from './config.ts';
+import type { Ctx } from './context.ts';
+import { runAgent, RunGateClosed } from './context.ts';
+import { getJob, heartbeat, LeaseLostError, logEvent, releaseLease, setStage, updateJob, now, kvGet, kvSet } from './db.ts';
+import { CODING_SYSTEM, REVIEW_SYSTEM, docsHint, ticketBlock, untrusted } from './agents/prompts.ts';
+import type { AgentRunResult, AgentTool } from './agents/runner.ts';
+import { CodingResultSchema, ReviewSchema, jsonSchema } from './agents/schemas.ts';
+import type { CodingResult, Review } from './agents/schemas.ts';
+import { decisionsForTicket, recordHumanDecision, resolveQuestion } from './decisions.ts';
+import { slugify, tail } from './exec.ts';
+import { similarity } from './planning.ts';
+import { LABEL_SUGGESTED } from './tracker/types.ts';
+import type { Job, PullRequest, Stage, Ticket } from './types.ts';
+import { STAGES } from './types.ts';
+import { scanSecrets, UnsafePushError } from './secrets.ts';
+import { inspectChanges } from './policy.ts';
+export { scanSecrets } from './secrets.ts';
+
+const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
+
+interface Blocker { reason: string; question: string; options: string[]; recommendation: string | null; decisionId: string | null; policyHash?: string }
+
+/** Thrown inside a stage to divert the job; handled centrally in runJob. */
+class Divert extends Error {
+  kind: 'blocked' | 'failed' | 'requeue' | 'wait_ci' | 'canceled';
+  blocker?: Blocker;
+  constructor(kind: Divert['kind'], message: string, blocker?: Blocker) { super(message); this.kind = kind; this.blocker = blocker; }
+}
+
+async function activeTicket(ctx: Ctx, id: string): Promise<Ticket> {
+  const ticket = await ctx.tracker.getTicket(id);
+  if (!ticket || ['canceled', 'backlog', 'ideas', 'done'].includes(ticket.status)) {
+    throw new Divert('canceled', `ticket is ${ticket?.status ?? 'missing'}; stopping (work preserved locally)`);
+  }
+  return ticket;
+}
+
+async function mayContinue(ctx: Ctx, job: Job, signal: AbortSignal) {
+  signal.throwIfAborted();
+  const ticket = await activeTicket(ctx, job.ticket_id);
+  signal.throwIfAborted();
+  return ticket;
+}
+
+function portFor(job: Job): number {
+  // Stable per-job port block so concurrent agents don't collide (10 ports each).
+  let h = 0; for (const c of job.id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return 4100 + (h % 500) * 10;
+}
+
+export function projectEnv(project: ProjectConfig, job: Job): Record<string, string> {
+  const port = portFor(job);
+  const env: Record<string, string> = { PORT: String(port), AUTODEV_PORT_BASE: String(port), AUTODEV_JOB_ID: job.id.slice(0, 8) };
+  for (const [k, v] of Object.entries(project.env)) env[k] = v.replaceAll('{{jobId}}', job.id.slice(0, 8)).replaceAll('{{port}}', String(port));
+  return env;
+}
+
+/**
+ * Execute a job from its last completed stage until it finishes, blocks, fails or waits for CI.
+ * Caller must hold the job lease. Every stage is idempotent so a crash re-runs at most one stage.
+ */
+export async function runJob(ctx: Ctx, jobId: string): Promise<void> {
+  const { db, owner, cfg } = ctx;
+  const leaseMs = cfg.loop.leaseSeconds * 1000;
+  const abort = new AbortController();
+  const hb = setInterval(() => {
+    if (!heartbeat(db, jobId, owner, leaseMs)) { abort.abort(new LeaseLostError(jobId)); clearInterval(hb); }
+  }, cfg.loop.heartbeatSeconds * 1000);
+  let job = getJob(db, jobId)!;
+  const project = cfg.projects.find((p) => p.key === job.project)!;
+  const checkTicket = () => activeTicket(ctx, job.ticket_id);
+  let checking = false;
+  const poll = setInterval(async () => {
+    if (checking || abort.signal.aborted) return;
+    checking = true;
+    try { await checkTicket(); } catch (e) { abort.abort(e); } finally { checking = false; }
+  }, cfg.loop.cancellationPollSeconds * 1000);
+  try {
+    let ticket = await checkTicket();
+    if (ticket.status !== 'in_progress') { await ctx.tracker.setStatus(ticket.id, 'in_progress'); ticket = { ...ticket, status: 'in_progress' }; }
+
+    for (let next = nextStage(job.stage); next; next = nextStage(job.stage)) {
+      abort.signal.throwIfAborted();
+      ticket = await checkTicket();
+      await runStage(ctx, job, ticket, project, next, abort.signal);
+      abort.signal.throwIfAborted();
+      await checkTicket();
+      setStage(db, jobId, next, owner);
+      job = getJob(db, jobId)!;
+    }
+    // All stages complete → awaiting human merge.
+    releaseLease(db, jobId, owner, 'awaiting_merge', { error: null });
+    logEvent(db, 'job.review', `${job.ticket_identifier} ready for human review: ${job.pr_url}`, { jobId, ticketId: job.ticket_id });
+  } catch (e) {
+    let failure = abort.signal.aborted ? abort.signal.reason : e;
+    if (!(failure instanceof LeaseLostError)) {
+      try { await checkTicket(); } catch (latest) { failure = latest; }
+    }
+    await handleDivert(ctx, getJob(db, jobId)!, project, failure);
+  } finally {
+    clearInterval(hb);
+    clearInterval(poll);
+  }
+}
+
+async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConfig, stage: Stage, signal: AbortSignal) {
+  const { db, owner, ws, scm, tracker } = ctx;
+  switch (stage) {
+    case 'claimed':
+      return;
+
+    case 'workspace': {
+      const base = job.base_branch ?? project.baseBranch ?? (await scm.defaultBranch(job.repo));
+      const branch = job.branch ?? `autodev/${job.ticket_identifier.toLowerCase()}-${slugify(ticket.title, 32)}`;
+      const { path, reused } = await ws.ensureWorktree(job.repo, job.ticket_identifier, branch, base);
+      updateJob(db, job.id, { base_branch: base, branch, worktree: path }, owner);
+      Object.assign(job, { base_branch: base, branch, worktree: path });
+      if (!reused) {
+        for (const cmd of project.setup) {
+          const r = await projectCommand(ctx, job, project, cmd, 20 * 60_000, signal);
+          if (r.code !== 0) throw new Divert('failed', `setup command failed: ${cmd}\n${tail(r.stderr || r.stdout, 2000)}`);
+        }
+      }
+      if (job.attempts === 0 && job.fix_attempts === 0 && job.review_cycles === 0 && !reused) {
+        await tracker.comment(ticket.id, `🤖 autodev started work on branch \`${branch}\` (base \`${base}\`).`);
+      }
+      return;
+    }
+
+    case 'implement':
+      await implement(ctx, job, ticket, project, signal);
+      signal.throwIfAborted();
+      await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve implementation before policy checks`);
+      return requireChangeApproval(ctx, job, project);
+
+    case 'validate': {
+      await requireChangeApproval(ctx, job, project);
+      const failures: string[] = [];
+      for (const cmd of project.validate) {
+        const r = await projectCommand(ctx, job, project, cmd, 30 * 60_000, signal);
+        logEvent(db, 'validate', `${cmd} → exit ${r.code}`, { jobId: job.id, ticketId: job.ticket_id, level: r.code ? 'warn' : 'info' });
+        if (r.code !== 0) failures.push(`$ ${cmd}\n(exit ${r.code}${r.timedOut ? ', timed out' : ''})\n${tail(r.stdout + '\n' + r.stderr, 4000)}`);
+      }
+      if (failures.length) return feedbackLoop(ctx, job, 'validation', `The orchestrator ran the project's validation and it failed:\n\n${failures.join('\n\n')}`);
+      return;
+    }
+
+    case 'commit': {
+      await ws.commitAll(job.worktree!, `${job.ticket_identifier}: ${ticket.title}\n\nautodev job ${job.id.slice(0, 8)}`);
+      await requireChangeApproval(ctx, job, project);
+      const ahead = await ws.aheadOf(job.worktree!, job.base_branch!);
+      if (ahead === 0) throw new Divert('blocked', 'the coding agent produced no changes', { reason: 'no changes were produced', question: 'The agent finished without changing anything. Is this ticket already done, or does it need clarification?', options: ['Close as already done', 'Clarify the ticket and move back to Ready'], recommendation: null, decisionId: null });
+      const diff = await ws.diff(job.worktree!, job.base_branch!);
+      const secrets = scanSecrets(diff);
+      if (secrets.length) {
+        throw new Divert('blocked', 'possible secrets in diff', { reason: `possible secrets detected in the diff (${secrets.join(', ')}); not pushing`, question: 'The diff appears to contain credentials. Review the worktree and confirm they are test values or remove them.', options: ['They are test values; continue', 'Remove them and retry'], recommendation: 'Remove them and retry', decisionId: null });
+      }
+      return;
+    }
+
+    case 'push':
+      await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve final changes`);
+      await requireChangeApproval(ctx, job, project);
+      await ws.push(job.worktree!, job.branch!, job.repo, { signal, beforePush: () => mayContinue(ctx, job, signal) });
+      return;
+
+    case 'pr': {
+      let pr = job.pr_number ? await scm.getPr(job.repo, job.pr_number) : await scm.findPr(job.repo, job.branch!);
+      if (pr && pr.state === 'closed') throw new Divert('canceled', `PR #${pr.number} was closed without merging`);
+      if (!pr) {
+        const body = await prBody(ctx, job, ticket, null, 'in progress');
+        await mayContinue(ctx, job, signal);
+        pr = await scm.createPr(job.repo, { head: job.branch!, base: job.base_branch!, title: `${job.ticket_identifier}: ${ticket.title}`, body, draft: true });
+        logEvent(db, 'pr.created', `#${pr.number} ${pr.url}`, { jobId: job.id, ticketId: job.ticket_id });
+      }
+      updateJob(db, job.id, { pr_number: pr.number, pr_url: pr.url }, owner);
+      Object.assign(job, { pr_number: pr.number, pr_url: pr.url });
+      await tracker.attachLink(ticket.id, pr.url, `PR #${pr.number}`).catch(() => {});
+      return;
+    }
+
+    case 'ci': {
+      const pr = await scm.getPr(job.repo, job.pr_number!);
+      const checks = await scm.checks(job.repo, pr, project.requiredChecks);
+      if (checks.state === 'pending') throw new Divert('wait_ci', 'waiting for CI');
+      if (checks.state === 'failure') {
+        return feedbackLoop(ctx, job, 'ci', `GitHub CI failed on ${pr.headSha.slice(0, 8)}:\n${checks.failures.map((f) => `- ${f.name}: ${f.summary}`).join('\n')}\n\nLogs:\n${checks.logExcerpt || '(no logs available)'}`);
+      }
+      updateJob(db, job.id, { summary_json: mergeSummary(job, { ci: checks.state === 'none' ? 'no CI checks reported' : 'all checks passed' }) }, owner);
+      return;
+    }
+
+    case 'review':
+      return review(ctx, job, ticket, project, signal);
+
+    case 'handoff': {
+      const pr = await scm.getPr(job.repo, job.pr_number!);
+      const preview = await scm.previewUrl(job.repo, pr).catch(() => null);
+      if (preview) updateJob(db, job.id, { summary_json: mergeSummary(getJob(db, job.id)!, { preview }) }, owner);
+      await mayContinue(ctx, job, signal);
+      await scm.updatePr(job.repo, pr.number, { body: await prBody(ctx, getJob(db, job.id)!, ticket, preview, 'ready for review') });
+      await mayContinue(ctx, job, signal);
+      await tracker.setStatus(ticket.id, 'review');
+      const s = JSON.parse(job.summary_json ?? '{}');
+      await tracker.comment(ticket.id, `✅ Ready for your review: ${pr.url}${preview ? `\nPreview: ${preview}` : ''}\n\n${s.coding?.summary ?? ''}\n\nAI review: ${s.review?.outcome ?? 'n/a'} — ${s.review?.summary ?? ''}`);
+      return;
+    }
+  }
+}
+
+async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig) {
+  const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
+  if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
+  throw new Divert('blocked', 'mandatory diff policy requires human approval', {
+    reason: result.reasons.join('; '), policyHash: result.hash,
+    question: `Review the local diff (${result.hash.slice(0, 12)}). Remove the flagged changes, or explicitly approve this exact diff with /answer approve.`,
+    options: ['Remove or revise flagged changes', 'Approve this exact diff with /answer approve'],
+    recommendation: 'Remove or revise flagged changes', decisionId: null,
+  });
+}
+
+/** Queue feedback for another implement pass, bounded by maxFixAttempts. */
+function feedbackLoop(ctx: Ctx, job: Job, source: string, feedback: string): never {
+  const max = ctx.cfg.limits.maxFixAttempts;
+  if (job.fix_attempts >= max) {
+    throw new Divert('failed', `${source} still failing after ${max} fix attempts:\n${tail(feedback, 1500)}`);
+  }
+  updateJob(ctx.db, job.id, { fix_attempts: job.fix_attempts + 1, pending_feedback: feedback, stage: 'workspace' }, ctx.owner);
+  logEvent(ctx.db, `fix.${source}`, `queued fix attempt ${job.fix_attempts + 1}/${max}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  throw new Divert('requeue', `${source} failed; retrying with feedback`);
+}
+
+async function projectCommand(ctx: Ctx, job: Job, project: ProjectConfig, cmd: string, timeoutMs: number, signal: AbortSignal) {
+  const env = projectEnv(project, job);
+  return ctx.runCommand(cmd, job.worktree!, env, timeoutMs, signal, { npmCacheDir: project.npmCacheDir ? resolve(ctx.cfg.configDir, project.npmCacheDir) : undefined });
+}
+
+function mergeSummary(job: Job, patch: Record<string, unknown>): string {
+  return JSON.stringify({ ...JSON.parse(job.summary_json ?? '{}'), ...patch });
+}
+
+// ---------------- implement (Coding Agent) ----------------
+
+async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConfig, signal: AbortSignal) {
+  const { cfg, db, owner } = ctx;
+  let blocker: Blocker | null = null;
+  let proposals = 0;
+  const tools: AgentTool[] = [
+    {
+      name: 'request_decision',
+      description: 'Ask the Decision Agent to research and resolve a technical question you cannot answer from docs/code. Returns DECIDED (follow it) or BLOCKED (stop, commit WIP, finish with status blocked).',
+      schema: { question: z.string().describe('One precise question'), context: z.string().describe('What you found so far and why it matters'), options: z.array(z.string()).describe('Options you see') },
+      handler: async (a) => {
+        signal.throwIfAborted();
+        const out = await resolveQuestion(ctx, { job: getJob(db, job.id)!, ticket, project, worktree: job.worktree!, question: String(a.question), context: String(a.context), options: (a.options as string[]) ?? [], signal });
+        if (out.kind === 'answered') return out.text;
+        blocker = { reason: out.reason, question: out.question, options: out.options, recommendation: out.recommendation, decisionId: out.decisionId };
+        return `BLOCKED: ${out.reason}. Stop implementing. Commit your work-in-progress, then finish with status "blocked".`;
+      },
+    },
+    {
+      name: 'propose_ticket',
+      description: 'Propose a follow-up ticket (bug, missing test, tech debt, improvement) outside this ticket\'s scope. It goes to Backlog for human approval.',
+      schema: { title: z.string(), description: z.string(), kind: z.enum(['bug', 'test', 'debt', 'improvement']) },
+      handler: async (a) => {
+        if (proposals >= 3) return 'Proposal limit reached for this ticket; mention further ideas in knownLimitations.';
+        proposals++;
+        return proposeTicket(ctx, job, ticket, String(a.title), `${a.description}\n\nKind: ${a.kind}`);
+      },
+    },
+    {
+      name: 'report_blocker',
+      description: 'Report that you cannot proceed safely without a human (missing access, contradictory requirements, destructive change needed). Then commit WIP and finish with status blocked.',
+      schema: { reason: z.string(), question: z.string(), options: z.array(z.string()), recommendation: z.string().optional() },
+      handler: async (a) => {
+        blocker = { reason: String(a.reason), question: String(a.question), options: (a.options as string[]) ?? [], recommendation: (a.recommendation as string) ?? null, decisionId: null };
+        return 'Blocker recorded. Commit your work-in-progress now and finish with status "blocked".';
+      },
+    },
+  ];
+
+  const complexity = ticket.estimate ?? 3;
+  const model = complexity >= cfg.models.complexThreshold ? cfg.models.codingComplex : cfg.models.coding;
+  const priorDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- Q: ${d.question}\n  A (${d.authority}): ${d.decision}`).join('\n');
+  // Human answers on the [Plan] umbrella issue (e.g. to the plan's open questions) are part of the requirements.
+  const planNotes = ticket.parentId ? (await ctx.tracker.listComments(ticket.parentId).catch(() => [])).filter((c) => !c.byAutomation).map((c) => c.body).join('\n---\n') : '';
+  const feedback = job.pending_feedback;
+  const status = (await ctx.ws.status(job.worktree!)).trim();
+  const ahead = await ctx.ws.aheadOf(job.worktree!, job.base_branch!);
+
+  const fresh = `${docsHint(project)}
+Implement this approved ticket in repository ${job.repo}. You are on branch ${job.branch} (base ${job.base_branch}).
+${ticketBlock(ticket)}
+${planNotes ? `\nHuman answers/notes on the parent plan (authoritative requirements):\n${untrusted('linear-plan-comments', planNotes)}\n` : ''}${priorDecisions ? `\nDecisions already made for this ticket (follow them):\n${priorDecisions}\n` : ''}
+${ahead || status ? `\nNOTE: a previous attempt left work on this branch (${ahead} commit(s) ahead${status ? ', uncommitted changes present' : ''}). Inspect git log/diff/status and continue from it rather than starting over.\n` : ''}
+${feedback ? `\nFeedback to address:\n${untrusted('orchestrator-feedback', feedback)}\n` : ''}
+${complexity >= 3 && cfg.featureDevPluginPath ? 'This is a complex ticket: use the code-explorer and code-architect subagents (Task tool) to map the code and choose an approach before editing.\n' : ''}
+Validation the orchestrator will run after you: ${project.validate.join(' && ') || '(none configured — run the relevant tests yourself)'}.
+When done, commit and return the structured result.`;
+
+  const spec = {
+    role: 'coding' as const, systemAppend: CODING_SYSTEM, cwd: job.worktree!, model, mode: 'write' as const, tools,
+    outputSchema: jsonSchema(CodingResultSchema), maxTurns: cfg.limits.agentMaxTurns, timeoutMs: cfg.limits.agentTimeoutMinutes * 60_000,
+    env: projectEnv(project, job), sandbox: cfg.sandbox, plugins: cfg.featureDevPluginPath && complexity >= 3 ? [cfg.featureDevPluginPath] : undefined,
+    signal,
+  };
+  let res: AgentRunResult;
+  try {
+    // Fix loops resume the previous session (keeps context); fall back to a fresh session if it can't be resumed.
+    if (feedback && job.session_id) {
+      res = await runAgent(ctx, { ...spec, resume: job.session_id, prompt: `Follow-up from the orchestrator. ${untrusted('orchestrator-feedback', feedback)}\nAddress it, re-run relevant checks, commit, and return the structured result.` }, { jobId: job.id, ticketId: ticket.id });
+      if (!res.ok && res.numTurns === 0 && res.errorKind === 'other') res = await runAgent(ctx, { ...spec, prompt: fresh }, { jobId: job.id, ticketId: ticket.id });
+    } else {
+      res = await runAgent(ctx, { ...spec, prompt: fresh }, { jobId: job.id, ticketId: ticket.id });
+    }
+  } catch (e) {
+    if (e instanceof RunGateClosed) throw new Divert('requeue', e.why);
+    throw e;
+  }
+  if (res.sessionId) updateJob(db, job.id, { session_id: res.sessionId }, owner);
+
+  const blk = blocker as Blocker | null;
+  if (blk) throw new Divert('blocked', blk.reason, blk);
+  if (!res.ok) throw new AgentFailure(res);
+
+  const parsed = CodingResultSchema.safeParse(res.structured);
+  const result: CodingResult = parsed.success ? parsed.data : { status: 'completed', summary: res.text.slice(0, 2000), filesChanged: [], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: ['structured result missing'] };
+  if (result.status === 'blocked') throw new Divert('blocked', result.blocker ?? 'agent reported blocked', { reason: result.blocker ?? 'agent reported blocked', question: result.blocker ?? 'The coding agent could not proceed. See its summary.', options: [], recommendation: null, decisionId: null });
+  if (result.status === 'failed') throw new AgentFailure({ ...res, ok: false, errorKind: 'other', error: result.blocker ?? result.summary });
+  updateJob(db, job.id, { pending_feedback: null, summary_json: mergeSummary(job, { coding: result }) }, owner);
+  job.pending_feedback = null;
+}
+
+class AgentFailure extends Error {
+  res: AgentRunResult;
+  constructor(res: AgentRunResult) { super(`agent failed (${res.errorKind}): ${res.error}`); this.res = res; }
+}
+
+export async function proposeTicket(ctx: Ctx, job: Job, source: Ticket, title: string, description: string): Promise<string> {
+  const existing = await ctx.tracker.listTickets({ projectKey: job.project });
+  // Paraphrased repeats from the same source ticket (e.g. successive review passes) use a looser threshold.
+  const sameSource = (t: Ticket) => t.labels.includes(LABEL_SUGGESTED) && t.description.includes(`while working on ${source.identifier}.`);
+  const dup = existing.find((t) => t.status !== 'canceled' && similarity(t.title, title) >= (sameSource(t) ? 0.3 : 0.7));
+  if (dup) return `Not created: similar ticket ${dup.identifier} "${dup.title}" already exists.`;
+  const t = await ctx.tracker.createTicket({
+    projectKey: job.project, title, status: 'backlog', priority: 0, labels: [LABEL_SUGGESTED],
+    description: `${description}\n\n---\nSuggested automatically while working on ${source.identifier}. Stays in Backlog until a human approves it.`,
+  });
+  logEvent(ctx.db, 'ticket.suggested', `${t.identifier}: ${title}`, { jobId: job.id, ticketId: source.id });
+  return `Created ${t.identifier} in Backlog (needs human approval).`;
+}
+
+// ---------------- review (independent) ----------------
+
+async function review(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConfig, signal: AbortSignal) {
+  const { cfg, db, owner, ws } = ctx;
+  const stat = await ws.diff(job.worktree!, job.base_branch!, true);
+  const diff = await ws.diff(job.worktree!, job.base_branch!);
+  const weakened = assertionDelta(diff);
+  const s = JSON.parse(job.summary_json ?? '{}');
+  const prompt = `${docsHint(project)}
+Review branch ${job.branch} against base origin/${job.base_branch} in ${job.repo}.
+${ticketBlock(ticket)}
+
+Diff stat:
+${untrusted('git', stat)}
+
+Decisions already approved for this ticket (from the decision log — authoritative requirements, do not re-question them):
+${decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- (${d.authority}) Q: ${d.question}\n  A: ${d.decision}`).join('\n') || '- none'}
+
+Orchestrator-verified facts:
+- Validation commands passed: ${project.validate.join(', ') || '(none configured)'}
+- CI: ${s.ci ?? 'unknown'}
+${weakened ? `- WARNING: the diff removes more test assertions than it adds in test files (${weakened}). Scrutinize whether tests were weakened.\n` : ''}
+Inspect the full diff yourself (git diff origin/${job.base_branch}...HEAD) and the surrounding code. Return the structured review.`;
+  let res: AgentRunResult;
+  try {
+    res = await runAgent(ctx, {
+      role: 'review', prompt, systemAppend: REVIEW_SYSTEM, cwd: job.worktree!, model: cfg.models.review, mode: 'review',
+      outputSchema: jsonSchema(ReviewSchema), maxTurns: 80, timeoutMs: 30 * 60_000, sandbox: cfg.sandbox,
+      signal,
+    }, { jobId: job.id, ticketId: ticket.id });
+  } catch (e) {
+    if (e instanceof RunGateClosed) throw new Divert('requeue', e.why);
+    throw e;
+  }
+  if (!res.ok) throw new AgentFailure(res);
+  const parsed = ReviewSchema.safeParse(res.structured);
+  if (!parsed.success) throw new AgentFailure({ ...res, ok: false, errorKind: 'structured_output', error: parsed.error.message });
+  const r: Review = parsed.data;
+  updateJob(db, job.id, { summary_json: mergeSummary(job, { review: r }) }, owner);
+  job.summary_json = mergeSummary(job, { review: r });
+  logEvent(db, 'review', `${r.outcome}: ${r.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
+  for (const f of r.followUps.slice(0, 3)) await proposeTicket(ctx, job, ticket, f.title, f.description).catch(() => {});
+  void diff;
+
+  if (r.outcome === 'approved') return;
+  if (r.outcome === 'blocked') {
+    throw new Divert('blocked', 'review needs a human decision', { reason: 'the review agent raised a question that needs a human', question: r.blockingQuestion ?? r.summary, options: [], recommendation: null, decisionId: null });
+  }
+  const findings = r.findings.filter((f) => f.severity !== 'nit').map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.issue}\n  Fix: ${f.suggestion}`).join('\n');
+  const unmet = r.acceptanceCriteria.filter((a) => !a.met).map((a) => `- NOT MET: ${a.criterion} (${a.evidence})`).join('\n');
+  if (job.review_cycles >= cfg.limits.maxReviewCycles) {
+    throw new Divert('blocked', 'review loop exhausted', { reason: `review still requests changes after ${cfg.limits.maxReviewCycles} fix cycles`, question: `Open review findings:\n${findings}\n${unmet}\nHow should we proceed?`, options: ['Accept as-is and review manually', 'Clarify requirements and retry', 'Cancel'], recommendation: null, decisionId: null });
+  }
+  updateJob(db, job.id, { review_cycles: job.review_cycles + 1, pending_feedback: `Independent code review requested changes:\n${r.summary}\n${findings}\n${unmet}`, stage: 'workspace' }, owner);
+  throw new Divert('requeue', `review requested changes (cycle ${job.review_cycles + 1}/${cfg.limits.maxReviewCycles})`);
+}
+
+// ---------------- divert handling ----------------
+
+async function handleDivert(ctx: Ctx, job: Job, project: ProjectConfig, e: unknown) {
+  const { db, owner, tracker, cfg } = ctx;
+  if (e instanceof LeaseLostError) { logEvent(db, 'lease.lost', 'stopping worker; another owner or recovery took over', { jobId: job.id, level: 'warn' }); return; }
+  if (job.lease_owner !== owner) { logEvent(db, 'lease.lost', `not owner anymore; ignoring ${String(e).slice(0, 200)}`, { jobId: job.id, level: 'warn' }); return; }
+  if (e instanceof UnsafePushError) return blockJob(ctx, job, { reason: e.message, question: 'Remove credentials from every outgoing commit before retrying.', options: [], recommendation: null, decisionId: null });
+
+  if (e instanceof Divert) {
+    switch (e.kind) {
+      case 'wait_ci':
+        releaseLease(db, job.id, owner, 'waiting_ci', { heartbeat_at: now() });
+        return;
+      case 'requeue':
+        releaseLease(db, job.id, owner, 'queued', { error: e.message });
+        logEvent(db, 'job.requeued', e.message, { jobId: job.id, ticketId: job.ticket_id });
+        return;
+      case 'canceled':
+        await preserveWork(ctx, job, 'canceled');
+        releaseLease(db, job.id, owner, 'canceled', { error: e.message });
+        logEvent(db, 'job.canceled', e.message, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+        await tracker.comment(job.ticket_id, `⏹️ autodev stopped: ${e.message}`).catch(() => {});
+        return;
+      case 'blocked':
+        return blockJob(ctx, job, e.blocker!);
+      case 'failed':
+        return fail(ctx, job, e.message);
+    }
+  }
+  if (e instanceof AgentFailure) {
+    const k = e.res.errorKind;
+    if (k === 'rate_limited' || k === 'api') {
+      releaseLease(db, job.id, owner, 'queued', { error: e.message, stage: 'workspace' });
+      return;
+    }
+    if (k === 'auth') {
+      db.prepare("INSERT INTO kv (k, v, updated_at) VALUES ('manual_pause', ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run('Claude authentication failed — fix credentials then run `autodev resume`', now());
+      releaseLease(db, job.id, owner, 'queued', { error: e.message, stage: 'workspace' });
+      logEvent(db, 'auth.failed', e.message, { jobId: job.id, level: 'error' });
+      return;
+    }
+    if (k === 'budget') {
+      const t = (db.prepare('SELECT COALESCE(SUM(cost_usd),0) s FROM usage WHERE ticket_id = ?').get(job.ticket_id) as { s: number }).s;
+      if (t >= cfg.budget.perTicketUsd - 0.05) {
+        return blockJob(ctx, job, { reason: `ticket budget $${cfg.budget.perTicketUsd} exhausted ($${t.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null });
+      }
+    }
+  }
+  // Generic failure: bounded retries, then Failed.
+  const attempts = job.attempts + 1;
+  const msg = String((e as Error)?.message ?? e).slice(0, 4000);
+  if (attempts >= cfg.limits.maxAttempts) return fail(ctx, { ...job, attempts }, msg);
+  releaseLease(db, job.id, owner, 'queued', { attempts, error: msg, stage: STAGES.indexOf(job.stage) >= STAGES.indexOf('workspace') ? job.stage : 'claimed', pending_feedback: job.pending_feedback ?? (job.stage === 'workspace' ? `A previous attempt failed: ${msg.slice(0, 1500)}` : null) });
+  logEvent(db, 'job.retry', `attempt ${attempts}/${cfg.limits.maxAttempts} failed: ${msg.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  void project;
+}
+
+/** Preserve WIP locally. Blocked, failed and canceled work is never published. */
+async function preserveWork(ctx: Ctx, job: Job, why: string) {
+  if (!job.worktree || !job.branch) return;
+  try {
+    await ctx.ws.commitAll(job.worktree, `WIP ${job.ticket_identifier} (autodev: ${why})`);
+  } catch (e) {
+    logEvent(ctx.db, 'preserve.failed', String(e).slice(0, 500), { jobId: job.id, level: 'warn' });
+  }
+}
+
+export async function blockJob(ctx: Ctx, job: Job, b: Blocker) {
+  const { db, owner, tracker } = ctx;
+  await preserveWork(ctx, job, 'blocked');
+  if (!b.decisionId) {
+    // Record the open question in the decision log so the answer is kept with it.
+    b.decisionId = recordPending(ctx, job, b);
+  }
+  const body = `🚧 **autodev is blocked** on this ticket.
+
+**Reason:** ${b.reason}
+
+**Question:** ${b.question}
+${b.options.length ? `\n**Options:**\n${b.options.map((o, i) => `${i + 1}. ${o}`).join('\n')}\n` : ''}${b.recommendation ? `\n**Recommendation:** ${b.recommendation}\n` : ''}
+Work so far is saved locally on branch \`${job.branch ?? '(none)'}\`.${job.pr_url ? ` Existing PR: ${job.pr_url} (may not contain the local WIP).` : ''}
+
+To continue: reply with a comment starting with \`/answer\` and move this ticket back to **Ready**. ${b.policyHash ? 'This diff-policy blocker requires an explicit /answer approve to accept the exact reviewed diff; otherwise revise the flagged changes.' : 'Moving it to Ready without an answer accepts the recommendation.'}
+<!-- autodev:decision:${b.decisionId} -->`;
+  await tracker.comment(job.ticket_id, body).catch((err) => logEvent(db, 'linear.error', String(err), { jobId: job.id, level: 'warn' }));
+  await tracker.setStatus(job.ticket_id, 'blocked').catch((err) => logEvent(db, 'linear.error', String(err), { jobId: job.id, level: 'warn' }));
+  releaseLease(db, job.id, owner, 'blocked', { blocked_reason: JSON.stringify({ ...b, blockedAt: now() }), stage: STAGES.indexOf(job.stage) > STAGES.indexOf('workspace') ? 'workspace' : job.stage });
+  logEvent(db, 'job.blocked', `${job.ticket_identifier}: ${b.reason}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+}
+
+function recordPending(ctx: Ctx, job: Job, b: Blocker): string {
+  const id = crypto.randomUUID();
+  ctx.db.prepare(`INSERT INTO decisions (id, ticket_id, ticket_identifier, repo, question, question_hash, context, alternatives_json, decision, authority, status, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?, 'pending', 'pending_human', ?)`)
+    .run(id, job.ticket_id, job.ticket_identifier, job.repo, b.question, `blocker-${id.slice(0, 8)}`, b.reason, JSON.stringify(b.options.map((name) => ({ name, pros: [], cons: [] }))), b.recommendation, now());
+  return id;
+}
+
+async function fail(ctx: Ctx, job: Job, message: string) {
+  const { db, owner, tracker } = ctx;
+  await preserveWork(ctx, job, 'failed');
+  releaseLease(db, job.id, owner, 'failed', { error: message, attempts: job.attempts });
+  await tracker.comment(job.ticket_id, `❌ autodev could not complete this ticket.\n\n\`\`\`\n${message.slice(0, 2500)}\n\`\`\`\nWork so far is on branch \`${job.branch ?? '(none)'}\`. Move back to **Ready** to retry from scratch.`).catch(() => {});
+  await tracker.setStatus(job.ticket_id, 'failed').catch(() => {});
+  logEvent(db, 'job.failed', `${job.ticket_identifier}: ${message.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'error' });
+}
+
+/**
+ * Called when a human moves a Blocked ticket back to Ready. Takes the latest human comment after the block
+ * (prefer `/answer …`), records the decision, and re-queues the job with the answer as feedback.
+ */
+export async function resumeBlocked(ctx: Ctx, job: Job, explicitAnswer?: string): Promise<void> {
+  const b = JSON.parse(job.blocked_reason ?? '{}') as Blocker & { blockedAt?: number };
+  let answer = explicitAnswer;
+  if (!answer) {
+    const comments = await ctx.tracker.listComments(job.ticket_id);
+    const after = comments.filter((c) => !c.byAutomation && Date.parse(c.createdAt) >= (b.blockedAt ?? 0) - 1000);
+    const explicit = [...after].reverse().find((c) => c.body.trim().startsWith('/answer'));
+    const latest = explicit ?? after[after.length - 1];
+    answer = latest ? latest.body.trim().replace(/^\/answer\s*/, '') : b.recommendation ? `Proceed with the recommendation: ${b.recommendation}` : 'Proceed using your best judgment within the approved requirements.';
+  }
+  const ticket = await ctx.tracker.getTicket(job.ticket_id);
+  const approved = !!b.policyHash && /^\s*(approve|accept)(?:\s|$)/i.test(answer);
+  if (approved) kvSet(ctx.db, `policy-approved:${job.id}:${b.policyHash}`, 'human');
+  recordHumanDecision(ctx, b.decisionId ?? null, answer, { ticket: ticket ?? undefined, repo: job.repo, question: b.question });
+  updateJob(ctx.db, job.id, {
+    status: 'queued', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, decision_count: Math.max(0, job.decision_count - 1),
+    pending_feedback: `A human answered the blocking question.\nQuestion: ${b.question}\nAnswer: ${answer}\nContinue the implementation accordingly.`,
+    ...(approved ? { stage: 'implement' as const } : {}),
+  });
+  await ctx.tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});
+  logEvent(ctx.db, 'job.unblocked', `${job.ticket_identifier}: human answer recorded`, { jobId: job.id, ticketId: job.ticket_id });
+}
+
+/** CLI path: answer a blocked ticket directly (recorded as a human decision). */
+export async function answerBlocked(ctx: Ctx, job: Job, answer: string): Promise<void> {
+  await resumeBlocked(ctx, job, answer);
+  await ctx.tracker.comment(job.ticket_id, `💬 Answer recorded via CLI: ${answer}`).catch(() => {});
+}
+
+// ---------------- helpers ----------------
+
+/** "removed N vs added M" when a diff deletes more assertions than it adds in test files; '' otherwise. */
+export function assertionDelta(diff: string): string {
+  let file = ''; let removed = 0; let added = 0;
+  for (const l of diff.split('\n')) {
+    if (l.startsWith('+++ ')) { file = l.slice(4); continue; }
+    if (!/(test|spec)/i.test(file)) continue;
+    if (/\b(expect|assert\w*|should)\b/.test(l)) {
+      if (l.startsWith('-') && !l.startsWith('---')) removed++;
+      else if (l.startsWith('+')) added++;
+    }
+  }
+  return removed > added ? `removed ${removed} vs added ${added}` : '';
+}
+
+async function prBody(ctx: Ctx, job: Job, ticket: Ticket, preview: string | null, state: string): Promise<string> {
+  const s = JSON.parse(job.summary_json ?? '{}') as { coding?: CodingResult; review?: Review; ci?: string };
+  const decisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved');
+  const files = job.worktree && job.base_branch ? await ctx.ws.changedFiles(job.worktree, job.base_branch).catch(() => []) : [];
+  const project = ctx.cfg.projects.find((p) => p.key === job.project)!;
+  return `Linear: [${ticket.identifier}](${ticket.url}) — ${ticket.title}
+Status: **${state}** · autodev job \`${job.id.slice(0, 8)}\`${preview ? `\nPreview: ${preview}` : ''}
+
+## Summary
+${s.coding?.summary ?? '_in progress_'}
+
+## Files changed
+${files.length ? files.map((f) => `- \`${f}\``).join('\n') : '_pending_'}
+
+## Technical decisions
+${[...(s.coding?.decisions ?? []).map((d) => `- ${d}`), ...decisions.map((d) => `- ${d.question} → **${d.decision}** (${d.authority}${d.adr_path ? `, ADR \`${d.adr_path}\`` : ''})`)].join('\n') || '- none'}
+
+## Tests
+${(s.coding?.testsAdded ?? []).map((t) => `- added: ${t}`).join('\n')}
+${project.validate.map((c) => `- \`${c}\` ✅ (run by orchestrator)`).join('\n')}
+- CI: ${s.ci ?? 'pending'}
+
+## AI review
+${s.review ? `**${s.review.outcome}** — ${s.review.summary}\n${s.review.findings.map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''} ${f.issue}`).join('\n')}` : '_pending_'}
+
+## Known limitations
+${(s.coding?.knownLimitations ?? []).map((l) => `- ${l}`).join('\n') || '- none reported'}
+
+## How to test
+${preview ? `Open the preview: ${preview}` : `\`git fetch origin && git switch ${job.branch}\`, then: ${project.setup.concat(project.validate).map((c) => `\`${c}\``).join(', ') || 'run the app'}.`}
+
+---
+🤖 Generated by autodev using [Claude Code](https://claude.com/claude-code). Merge authority stays with a human.`;
+}
+
+export type { PullRequest };

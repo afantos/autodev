@@ -1,0 +1,35 @@
+#cloud-config
+# Ubuntu 24.04 VM bootstrap for autodev. Review before use; nothing here is applied automatically.
+# Recommended size for 2 concurrent agents: 4 vCPU / 8–16 GB RAM / 80 GB disk (e.g. Hetzner CPX31 or CCX23, DO 4vCPU/8GB).
+package_update: true
+packages: [git, curl, ca-certificates, build-essential, bubblewrap, socat, sqlite3, jq, ufw]
+users:
+  - name: autodev
+    shell: /bin/bash
+    lock_passwd: true
+    # no sudo: the agent user cannot change the system
+write_files:
+  # Ubuntu 24.04 AppArmor restricts unprivileged namespaces. Grant this
+  # capability to bubblewrap only; do not disable the host-wide restriction.
+  - path: /etc/apparmor.d/bwrap
+    permissions: '0644'
+    content: |
+      abi <abi/4.0>,
+      include <tunables/global>
+      profile bwrap /usr/bin/bwrap flags=(unconfined) {
+        userns,
+        include if exists <local/bwrap>
+      }
+runcmd:
+  # Node 24 LTS
+  - curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+  - apt-get install -y nodejs
+  # GitHub CLI is NOT installed on purpose: agents must not have it.
+  - install -d -o autodev -g autodev /opt/autodev /opt/autodev/instance /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm
+  - apparmor_parser -r /etc/apparmor.d/bwrap
+  - ufw default deny incoming
+  - ufw allow OpenSSH
+  - ufw --force enable
+  # Tailscale for private dashboard access from your phone (run `tailscale up` manually afterwards)
+  - curl -fsSL https://tailscale.com/install.sh | sh
+final_message: "Base system ready. Continue with docs/SETUP.md §5 (clone app, write .env, enable service)."
