@@ -1,6 +1,5 @@
 import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { runOk } from '../exec.ts';
 import type { AgentRunner, AgentRunResult, AgentRunSpec } from './runner.ts';
 
 export type FakeBehavior = (spec: AgentRunSpec, call: number) => Promise<Partial<AgentRunResult>>;
@@ -9,7 +8,7 @@ const base = (): AgentRunResult => ({ ok: true, structured: null, text: '', sess
 
 /**
  * Deterministic stand-in for Claude used by tests and `runner: fake` simulations. No AI spend.
- * Default behavior: the coding agent appends a line to CHANGES.md and commits; reviewers approve;
+ * Default behavior: the coding agent appends a line to CHANGES.md (the orchestrator commits it); reviewers approve;
  * decisions resolve as an internal_structure choice.
  */
 export class FakeRunner implements AgentRunner {
@@ -29,8 +28,6 @@ export const DEFAULTS: Partial<Record<AgentRunSpec['role'], FakeBehavior>> = {
   coding: async (spec) => {
     const m = spec.prompt.match(/# ([A-Z0-9]+-\d+): (.*)/);
     appendFileSync(join(spec.cwd, 'CHANGES.md'), `- ${m?.[1] ?? 'ticket'}: ${m?.[2] ?? 'change'}\n`);
-    await runOk('git', ['add', '-A'], { cwd: spec.cwd });
-    await runOk('git', ['-c', 'user.name=fake', '-c', 'user.email=f@example.com', 'commit', '-m', `fake: ${m?.[1] ?? 'change'}`], { cwd: spec.cwd });
     return { structured: { status: 'completed', summary: `Implemented ${m?.[2] ?? 'ticket'} (fake)`, filesChanged: ['CHANGES.md'], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
   },
   review: async () => ({ structured: { outcome: 'approved', summary: 'Looks good (fake review).', acceptanceCriteria: [], findings: [], followUps: [] } }),

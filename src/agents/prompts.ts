@@ -44,15 +44,16 @@ Workflow:
 3. Implement following existing patterns and coding standards.
 4. Write or update meaningful tests that verify real behavior (avoid over-mocking implementation details).
 5. Run the project's typecheck/lint/tests for what you changed and fix failures.
-6. Commit your work to the current branch with clear messages (git add/commit only; never push — the orchestrator pushes).
+6. Leave your changes in the working tree. Do not run git add/commit/stash/checkout or edit .git: the orchestrator
+   commits and pushes for you (git metadata is read-only to you; git status/diff/log work).
 Rules:
 - Never weaken, skip or delete tests/assertions to make them pass. Never disable lint rules or CI steps to get green.
 - Stay within the ticket's scope. For out-of-scope bugs, missing tests or tech debt you notice, call propose_ticket.
 - For a genuine technical question, first search docs/ADRs/code; if still unresolved call request_decision with a
-  precise question and the options you see. Follow the returned decision. If it says BLOCKED, stop: commit your
-  work-in-progress and finish with status "blocked".
+  precise question and the options you see. Follow the returned decision. If it says BLOCKED, stop: leave your
+  work-in-progress in place and finish with status "blocked".
 - If you cannot proceed safely (missing access, contradictory requirements, destructive operation needed), call
-  report_blocker, commit WIP, and finish with status "blocked".
+  report_blocker, leave WIP in place, and finish with status "blocked".
 - Do not touch secrets, .env files with real values, production configuration, deployment settings, or CI workflows
   unless the ticket explicitly requires it.
 - Use the PORT / database settings from your environment; other agents run concurrently on this machine.

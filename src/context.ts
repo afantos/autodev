@@ -1,6 +1,6 @@
-import { hostname } from 'node:os';
-import { join, resolve, sep } from 'node:path';
-import { readFileSync, realpathSync } from 'node:fs';
+import { homedir, hostname } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
+import { realpathSync } from 'node:fs';
 import type { Config } from './config.ts';
 import { secret } from './config.ts';
 import type { Db } from './db.ts';
@@ -34,7 +34,38 @@ export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 
   const tracker = overrides.tracker ?? (cfg.tracker === 'linear' ? new LinearTracker(cfg, secret('LINEAR_API_KEY')!) : new LocalTracker(db));
   const scm = overrides.scm ?? (cfg.scm === 'github' ? new GitHubScm(secret('GITHUB_TOKEN')!) : new LocalScm(db, cfg.dataDir, cfg.localCi));
   const runner = overrides.runner ?? new ClaudeRunner();
-  return { cfg, db, tracker, scm, runner, ws: new Workspaces(cfg.dataDir, scm), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
+  return { cfg, db, tracker, scm, runner, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
+}
+
+/** Trees agents may never read: the orchestrator's home (credentials), config (.env) and state. */
+export function protectedRoots(cfg: Config): string[] {
+  return [...new Set([homedir(), cfg.configDir, cfg.dataDir].filter(Boolean).map(p => canonicalPath(p)))];
+}
+
+/** Symlink-resolved absolute path, also for paths that don't exist yet (resolves the nearest existing ancestor). */
+export function canonicalPath(p: string): string {
+  let head = resolve(p);
+  const tail: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(head), ...tail.reverse()); } catch { /* not there yet */ }
+    const parent = dirname(head);
+    if (parent === head) return resolve(p);
+    tail.push(basename(head));
+    head = parent;
+  }
+}
+
+/**
+ * A worktree under a denied tree cannot resolve its own cwd inside the sandbox (getcwd needs its
+ * ancestors), so this layout is refused outright rather than half-working.
+ */
+export function assertOutsideProtected(cwd: string, roots: string[]) {
+  const real = canonicalPath(cwd);
+  for (const root of roots) {
+    if (real === root || real.startsWith(root + sep)) {
+      throw new Error(`agent workspace ${real} is inside protected directory ${root}; set workspaceDir outside HOME, the config directory and dataDir`);
+    }
+  }
 }
 
 export class RunGateClosed extends Error {
@@ -50,22 +81,15 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   spec.signal?.throwIfAborted();
   const job = meta.jobId ? getJob(ctx.db, meta.jobId) : undefined;
   const repository = job?.repo ?? spec.repository;
-  const gitReadPaths: string[] = []; const gitWritePaths: string[] = [];
+  const protectedPaths = protectedRoots(ctx.cfg);
+  assertOutsideProtected(spec.cwd, protectedPaths);
+  const gitReadPaths: string[] = [];
   if (repository) {
     if (!ctx.cfg.projects.some(p => p.repo === repository)) throw new Error('agent repository is not configured');
-    const common = realpathSync(join(ctx.ws.repoDir(repository), '.git'));
-    const pointer = readFileSync(join(spec.cwd, '.git'), 'utf8').trim();
-    if (!pointer.startsWith('gitdir: ')) throw new Error('invalid worktree metadata');
-    const metadata = realpathSync(resolve(spec.cwd, pointer.slice(8)));
-    if (!metadata.startsWith(join(common, 'worktrees') + sep)) throw new Error('worktree metadata outside its configured clone');
-    gitReadPaths.push(common);
-    if (spec.mode === 'write' && job?.branch) {
-      const ref = resolve(common, 'refs', 'heads', job.branch);
-      const log = resolve(common, 'logs', 'refs', 'heads', job.branch);
-      if (!ref.startsWith(join(common, 'refs', 'heads') + sep) || !log.startsWith(join(common, 'logs', 'refs', 'heads') + sep)) throw new Error('invalid job branch');
-      // Permit this branch's index/HEAD/objects, never shared hooks or config.
-      gitWritePaths.push(metadata, join(common, 'objects'), ref, `${ref}.lock`, log, `${log}.lock`);
-    }
+    // Agents may read their worktree's git metadata (git status/diff/log) but never write it: the
+    // orchestrator makes all commits with hardened git after verifying these pointers.
+    const rec = ctx.ws.verifiedRecord(spec.cwd);
+    gitReadPaths.push(rec.commonDir, rec.gitDir);
   }
   const gate = reserveBudget(ctx.db, ctx.cfg, ctx.owner, meta, spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd);
   if (!gate.ok) throw new RunGateClosed(gate.reason!);
@@ -73,7 +97,7 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   logEvent(ctx.db, `agent.${spec.role}.start`, `model=${spec.model} budget=$${maxBudgetUsd.toFixed(2)}${spec.resume ? ' (resume)' : ''}`, { jobId: meta.jobId, ticketId: meta.ticketId });
   // A thrown runner error or process crash leaves the reservation in place;
   // actual spend is unknown and must not be silently made available again.
-  const res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths: [ctx.cfg.configDir, ctx.cfg.dataDir], gitReadPaths, gitWritePaths });
+  const res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths, gitReadPaths });
   tx(ctx.db, () => {
     recordUsage(ctx.db, {
       jobId: meta.jobId, ticketId: meta.ticketId, role: spec.role, model: spec.model, costUsd: res.costUsd,

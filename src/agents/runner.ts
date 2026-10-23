@@ -1,6 +1,8 @@
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import type { Options, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { ZodRawShape } from 'zod';
+import { realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import type { AgentRole } from '../types.ts';
 
 export interface AgentTool {
@@ -39,7 +41,6 @@ export interface AgentRunSpec {
   protectedPaths?: string[];
   repository?: string;
   gitReadPaths?: string[];
-  gitWritePaths?: string[];
 }
 
 export type AgentErrorKind = 'rate_limited' | 'budget' | 'max_turns' | 'timeout' | 'auth' | 'api' | 'structured_output' | 'other';
@@ -93,6 +94,41 @@ export const DENY_ALWAYS = [
 const READ_TOOLS = ['Read', 'Grep', 'Glob', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git diff:*)', 'Bash(git grep:*)', 'Bash(git status:*)', 'Bash(ls:*)', 'Bash(wc:*)'];
 const WRITE_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash', 'TodoWrite', 'Task'];
 
+/**
+ * OS sandbox for the agent's Bash commands. Whole trees are denied (HOME, config, state) and the worktree
+ * lives outside all of them, so ordinary commands can resolve their cwd. Git metadata is readable for
+ * status/diff/log but nothing outside the worktree is writable, and the worktree's .git pointer is not.
+ */
+export function agentSandbox(spec: Pick<AgentRunSpec, 'cwd' | 'mode' | 'sandbox' | 'protectedPaths' | 'gitReadPaths'>): NonNullable<Options['sandbox']> {
+  return {
+    enabled: true,
+    failIfUnavailable: true,
+    autoAllowBashIfSandboxed: spec.mode === 'write',
+    allowUnsandboxedCommands: false,
+    network: { allowedDomains: spec.sandbox?.allowedDomains ?? [], strictAllowlist: true },
+    filesystem: {
+      denyRead: [...(spec.protectedPaths ?? [])],
+      allowRead: [spec.cwd, ...(spec.gitReadPaths ?? []), runtimeRoot()],
+      allowWrite: [],
+      denyWrite: [join(spec.cwd, '.git')],
+    },
+    credentials: { envVars: [{ name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'CLAUDE_CODE_OAUTH_TOKEN', mode: 'deny' }] },
+  };
+}
+
+/** The Node runtime may live under a denied HOME (nvm); re-allow just its install tree. */
+function runtimeRoot(): string {
+  return dirname(dirname(realpathSync(process.execPath)));
+}
+
+/** Tool configuration that never touches the (denied) HOME: no user git/npm config, caches in the worktree's sibling. */
+export function commandToolEnv(cwd: string): Record<string, string> {
+  return {
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    NPM_CONFIG_USERCONFIG: '/dev/null', npm_config_cache: join(cwd, '.autodev-cache', 'npm'), npm_config_update_notifier: 'false',
+  };
+}
+
 export function classifyError(msg: string): AgentErrorKind {
   if (/rate.?limit|usage limit|limit reached|429|quota/i.test(msg)) return 'rate_limited';
   if (/401|403|unauthori[sz]ed|authentication|invalid api key|not logged in|login/i.test(msg)) return 'auth';
@@ -140,7 +176,7 @@ export class ClaudeRunner implements AgentRunner {
       maxTurns: spec.maxTurns,
       maxBudgetUsd: spec.maxBudgetUsd,
       abortController: abort,
-      env: agentEnv(spec.env),
+      env: agentEnv({ ...commandToolEnv(spec.cwd), ...spec.env }),
       settingSources: [], // conventions are read explicitly; repository hooks/settings cannot widen permissions
       settings: { permissions: { blockReadsOutsideWorkingDirectories: true } },
       systemPrompt: { type: 'preset', preset: 'claude_code', append: spec.systemAppend },
@@ -149,21 +185,7 @@ export class ClaudeRunner implements AgentRunner {
       plugins: spec.plugins?.map((path) => ({ type: 'local' as const, path })),
     };
     if (spec.outputSchema) options.outputFormat = { type: 'json_schema', schema: spec.outputSchema };
-    if (spec.sandbox?.enabled) {
-      options.sandbox = {
-        enabled: true,
-        failIfUnavailable: true,
-        autoAllowBashIfSandboxed: spec.mode === 'write',
-        allowUnsandboxedCommands: false,
-        network: { allowedDomains: spec.sandbox.allowedDomains, strictAllowlist: true },
-        filesystem: {
-          denyRead: [...(process.env.HOME ? [process.env.HOME] : []), ...(spec.protectedPaths ?? [])],
-          allowRead: [spec.cwd, ...(spec.gitReadPaths ?? [])],
-          allowWrite: spec.mode === 'write' ? spec.gitWritePaths ?? [] : [],
-        },
-        credentials: { envVars: [{ name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'CLAUDE_CODE_OAUTH_TOKEN', mode: 'deny' }] },
-      };
-    }
+    options.sandbox = agentSandbox(spec);
 
     try {
       for await (const m of query({ prompt: spec.prompt, options })) {

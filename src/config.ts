@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { resolve, dirname, isAbsolute } from 'node:path';
+import { resolve, dirname, isAbsolute, join, basename } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
 
@@ -37,6 +37,12 @@ const ProjectSchema = z.object({
 
 const ConfigSchema = z.object({
   dataDir: z.string().default('./data'),
+  /**
+   * Repository clones and job worktrees. Must be outside HOME, the config directory and dataDir: agents are
+   * denied those whole trees, and a worktree beneath a denied directory cannot even resolve its own cwd.
+   * Default: a sibling of the config directory (e.g. /opt/autodev/instance → /opt/autodev/instance-work).
+   */
+  workspaceDir: z.string().optional(),
   tracker: z.enum(['linear', 'local']).default('linear'),
   scm: z.enum(['github', 'local']).default('github'),
   runner: z.enum(['claude', 'fake']).default('claude'),
@@ -127,7 +133,7 @@ const ConfigSchema = z.object({
   localCi: z.string().optional(),
 });
 
-export type Config = z.infer<typeof ConfigSchema> & { configDir: string };
+export type Config = Omit<z.infer<typeof ConfigSchema>, 'workspaceDir'> & { configDir: string; workspaceDir: string };
 export type ProjectConfig = z.infer<typeof ProjectSchema>;
 
 export function loadConfig(path: string): Config {
@@ -139,12 +145,15 @@ export function loadConfig(path: string): Config {
 export function parseConfig(raw: unknown, configDir: string): Config {
   const cfg = ConfigSchema.parse(raw);
   const dataDir = isAbsolute(cfg.dataDir) ? cfg.dataDir : resolve(configDir, cfg.dataDir);
+  const workspaceDir = cfg.workspaceDir
+    ? (isAbsolute(cfg.workspaceDir) ? cfg.workspaceDir : resolve(configDir, cfg.workspaceDir))
+    : join(dirname(resolve(configDir)), `${basename(resolve(configDir))}-work`);
   const keys = new Set<string>();
   for (const p of cfg.projects) {
     if (keys.has(p.key)) throw new Error(`duplicate project key ${p.key}`);
     keys.add(p.key);
   }
-  return { ...cfg, dataDir, configDir };
+  return { ...cfg, dataDir, configDir, workspaceDir };
 }
 
 export function projectFor(cfg: Config, key: string): ProjectConfig {

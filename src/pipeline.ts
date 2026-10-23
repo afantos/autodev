@@ -15,6 +15,7 @@ import { LABEL_SUGGESTED } from './tracker/types.ts';
 import type { Job, PullRequest, Stage, Ticket } from './types.ts';
 import { STAGES } from './types.ts';
 import { scanSecrets, UnsafePushError } from './secrets.ts';
+import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges } from './policy.ts';
 export { scanSecrets } from './secrets.ts';
 
@@ -250,14 +251,14 @@ async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectCon
   const tools: AgentTool[] = [
     {
       name: 'request_decision',
-      description: 'Ask the Decision Agent to research and resolve a technical question you cannot answer from docs/code. Returns DECIDED (follow it) or BLOCKED (stop, commit WIP, finish with status blocked).',
+      description: 'Ask the Decision Agent to research and resolve a technical question you cannot answer from docs/code. Returns DECIDED (follow it) or BLOCKED (stop, leave WIP in place, finish with status blocked).',
       schema: { question: z.string().describe('One precise question'), context: z.string().describe('What you found so far and why it matters'), options: z.array(z.string()).describe('Options you see') },
       handler: async (a) => {
         signal.throwIfAborted();
         const out = await resolveQuestion(ctx, { job: getJob(db, job.id)!, ticket, project, worktree: job.worktree!, question: String(a.question), context: String(a.context), options: (a.options as string[]) ?? [], signal });
         if (out.kind === 'answered') return out.text;
         blocker = { reason: out.reason, question: out.question, options: out.options, recommendation: out.recommendation, decisionId: out.decisionId };
-        return `BLOCKED: ${out.reason}. Stop implementing. Commit your work-in-progress, then finish with status "blocked".`;
+        return `BLOCKED: ${out.reason}. Stop implementing. Leave your work-in-progress in place and finish with status "blocked".`;
       },
     },
     {
@@ -272,11 +273,11 @@ async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectCon
     },
     {
       name: 'report_blocker',
-      description: 'Report that you cannot proceed safely without a human (missing access, contradictory requirements, destructive change needed). Then commit WIP and finish with status blocked.',
+      description: 'Report that you cannot proceed safely without a human (missing access, contradictory requirements, destructive change needed). Then leave WIP in place and finish with status blocked.',
       schema: { reason: z.string(), question: z.string(), options: z.array(z.string()), recommendation: z.string().optional() },
       handler: async (a) => {
         blocker = { reason: String(a.reason), question: String(a.question), options: (a.options as string[]) ?? [], recommendation: (a.recommendation as string) ?? null, decisionId: null };
-        return 'Blocker recorded. Commit your work-in-progress now and finish with status "blocked".';
+        return 'Blocker recorded. Leave your work-in-progress in place and finish with status "blocked".';
       },
     },
   ];
@@ -298,7 +299,7 @@ ${ahead || status ? `\nNOTE: a previous attempt left work on this branch (${ahea
 ${feedback ? `\nFeedback to address:\n${untrusted('orchestrator-feedback', feedback)}\n` : ''}
 ${complexity >= 3 && cfg.featureDevPluginPath ? 'This is a complex ticket: use the code-explorer and code-architect subagents (Task tool) to map the code and choose an approach before editing.\n' : ''}
 Validation the orchestrator will run after you: ${project.validate.join(' && ') || '(none configured — run the relevant tests yourself)'}.
-When done, commit and return the structured result.`;
+When done, leave the changes in the working tree (the orchestrator commits them) and return the structured result.`;
 
   const spec = {
     role: 'coding' as const, systemAppend: CODING_SYSTEM, cwd: job.worktree!, model, mode: 'write' as const, tools,
@@ -310,7 +311,7 @@ When done, commit and return the structured result.`;
   try {
     // Fix loops resume the previous session (keeps context); fall back to a fresh session if it can't be resumed.
     if (feedback && job.session_id) {
-      res = await runAgent(ctx, { ...spec, resume: job.session_id, prompt: `Follow-up from the orchestrator. ${untrusted('orchestrator-feedback', feedback)}\nAddress it, re-run relevant checks, commit, and return the structured result.` }, { jobId: job.id, ticketId: ticket.id });
+      res = await runAgent(ctx, { ...spec, resume: job.session_id, prompt: `Follow-up from the orchestrator. ${untrusted('orchestrator-feedback', feedback)}\nAddress it, re-run relevant checks, leave changes in the working tree, and return the structured result.` }, { jobId: job.id, ticketId: ticket.id });
       if (!res.ok && res.numTurns === 0 && res.errorKind === 'other') res = await runAgent(ctx, { ...spec, prompt: fresh }, { jobId: job.id, ticketId: ticket.id });
     } else {
       res = await runAgent(ctx, { ...spec, prompt: fresh }, { jobId: job.id, ticketId: ticket.id });
@@ -415,6 +416,10 @@ async function handleDivert(ctx: Ctx, job: Job, project: ProjectConfig, e: unkno
   const { db, owner, tracker, cfg } = ctx;
   if (e instanceof LeaseLostError) { logEvent(db, 'lease.lost', 'stopping worker; another owner or recovery took over', { jobId: job.id, level: 'warn' }); return; }
   if (job.lease_owner !== owner) { logEvent(db, 'lease.lost', `not owner anymore; ignoring ${String(e).slice(0, 200)}`, { jobId: job.id, level: 'warn' }); return; }
+  if (e instanceof WorktreeTamperedError) {
+    logEvent(db, 'security.worktree_tampered', e.message, { jobId: job.id, ticketId: job.ticket_id, level: 'error' });
+    return blockJob(ctx, job, { reason: `security: ${e.message}`, question: 'Something in this job (agent or repository code) modified git metadata. Inspect the worktree before doing anything else; do not retry until it is understood.', options: ['Discard the worktree and retry from scratch', 'Cancel the ticket'], recommendation: 'Discard the worktree and retry from scratch', decisionId: null });
+  }
   if (e instanceof UnsafePushError) return blockJob(ctx, job, { reason: e.message, question: 'Remove credentials from every outgoing commit before retrying.', options: [], recommendation: null, decisionId: null });
 
   if (e instanceof Divert) {

@@ -9,7 +9,6 @@ import { PLANNING_SYSTEM, docsHint, untrusted } from './agents/prompts.ts';
 import { PlanSchema, jsonSchema } from './agents/schemas.ts';
 import type { Plan, PlanTicket } from './agents/schemas.ts';
 import { recentDecisions } from './decisions.ts';
-import { runOk } from './exec.ts';
 import type { Priority, Ticket } from './types.ts';
 import { LABEL_MANAGED, LABEL_PLAN } from './tracker/types.ts';
 
@@ -19,13 +18,20 @@ export function getPlan(ctx: Ctx, id: string): PlanRow | undefined {
   return ctx.db.prepare('SELECT * FROM plans WHERE id = ? OR id LIKE ?').get(id, `${id}%`) as unknown as PlanRow | undefined;
 }
 
+/** Empty scratch directory for repo-less agent calls; never inside the protected config/state trees. */
+function classifyDir(ctx: Ctx): string {
+  const dir = join(ctx.cfg.workspaceDir, 'scratch');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 /** Route an idea to a project: explicit key, single project, or a cheap classification call. */
 async function pickProject(ctx: Ctx, idea: string, projectKey?: string): Promise<string> {
   if (projectKey) return projectKey;
   if (ctx.cfg.projects.length === 1) return ctx.cfg.projects[0].key;
   const list = ctx.cfg.projects.map((p) => `- ${p.key}: ${p.repo}`).join('\n');
   const res = await runAgent(ctx, {
-    role: 'classify', model: ctx.cfg.models.classify, mode: 'readonly', cwd: ctx.cfg.dataDir, maxTurns: 2, timeoutMs: 120_000,
+    role: 'classify', model: ctx.cfg.models.classify, mode: 'readonly', cwd: classifyDir(ctx), maxTurns: 2, timeoutMs: 120_000,
     systemAppend: 'Classify which project an idea belongs to. Answer only with the structured output.',
     prompt: `Projects:\n${list}\n\nIdea:\n${untrusted('user-idea', idea)}\n\nWhich project key? Use "unknown" if unclear.`,
     outputSchema: jsonSchema(z.object({ projectKey: z.string(), confidence: z.number() })), maxBudgetUsd: 0.1,
@@ -50,10 +56,9 @@ export async function draftPlan(ctx: Ctx, idea: string, projectKey?: string): Pr
   const id = randomUUID();
   ctx.db.prepare(`INSERT INTO plans (id, project, idea, status, created_at, updated_at) VALUES (?,?,?,'drafting',?,?)`).run(id, key, idea, now(), now());
 
-  const repoDir = await ctx.ws.ensureClone(project.repo);
+  await ctx.ws.ensureClone(project.repo);
   const base = project.baseBranch ?? (await ctx.scm.defaultBranch(project.repo));
-  const wt = join(ctx.cfg.dataDir, 'worktrees', `_plan-${id.slice(0, 8)}`);
-  await ctx.ws.withRepoLock(project.repo, () => runOk('git', ['worktree', 'add', '--detach', wt, `origin/${base}`], { cwd: repoDir }));
+  const wt = await ctx.ws.addDetachedWorktree(project.repo, `_plan-${id.slice(0, 8)}`, `origin/${base}`);
   try {
     const existing = await ctx.tracker.listTickets({ projectKey: key });
     const decisions = recentDecisions(ctx, project.repo).map((d) => `- Q: ${d.question} → ${d.decision}`).join('\n') || '(none)';
@@ -93,7 +98,7 @@ Research the codebase thoroughly, then return the structured plan. Reference rea
     logEvent(ctx.db, 'plan.drafted', `${plan.tickets.length} tickets for "${idea.slice(0, 80)}" (${key})`);
     return { id, plan, markdown, path };
   } finally {
-    await ctx.ws.withRepoLock(project.repo, () => runOk('git', ['worktree', 'remove', '--force', wt], { cwd: repoDir })).catch(() => {});
+    await ctx.ws.removeWorktreeForce(project.repo, wt).catch(() => {});
   }
 }
 

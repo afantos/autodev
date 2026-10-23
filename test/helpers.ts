@@ -44,12 +44,14 @@ export interface Env {
 export function makeEnv(opts: { behaviors?: Partial<Record<AgentRunSpec['role'], FakeBehavior>>; config?: Record<string, unknown>; project?: Record<string, unknown> } = {}): Env {
   const root = mkdtempSync(join(tmpdir(), 'autodev-test-'));
   const repo = makeRepo(root);
+  // Production layout: config, state and workspaces are separate trees (agents are denied the first two).
+  mkdirSync(join(root, 'config'), { recursive: true });
   const cfg = parseConfig({
-    dataDir: join(root, 'data'), tracker: 'local', scm: 'local', runner: 'fake',
+    dataDir: join(root, 'data'), workspaceDir: join(root, 'work'), tracker: 'local', scm: 'local', runner: 'fake',
     projects: [{ key: 'demo', repo, validate: ['test -f CHANGES.md', '! grep -q BROKEN CHANGES.md'], ...opts.project }],
     concurrency: { global: 2 }, sandbox: { enabled: false }, report: { hour: -1 },
     ...opts.config,
-  }, root);
+  }, join(root, 'config'));
   const db = openDb(join(cfg.dataDir, 'autodev.db'));
   const tracker = new LocalTracker(db);
   const fixtureCommand: Ctx['runCommand'] = (cmd, cwd, env, timeoutMs, signal) => run(cmd, [], { cwd, env: commandEnv(env), timeoutMs, signal, shell: true });
@@ -64,4 +66,13 @@ export function makeEnv(opts: { behaviors?: Partial<Record<AgentRunSpec['role'],
 
 export function job(env: Env, identifier: string) {
   return env.ctx.db.prepare('SELECT * FROM jobs WHERE ticket_identifier = ? ORDER BY created_at DESC').get(identifier) as Record<string, any>;
+}
+
+/** Whether the production command sandbox can run here (nested sandboxes are refused in some hosts). */
+export async function sandboxAvailable(root: string): Promise<{ ok: boolean; why: string }> {
+  const dir = join(root, 'sandbox-probe');
+  mkdirSync(dir, { recursive: true });
+  const { runSandboxed } = await import('../src/command-sandbox.ts');
+  const r = await runSandboxed('true', dir, {}, 5000);
+  return { ok: r.code === 0, why: (r.stderr || `exit ${r.code}`).trim() };
 }

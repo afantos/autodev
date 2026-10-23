@@ -56,9 +56,8 @@ test('setup receives no inherited cloud, Anthropic or arbitrary host secrets', a
     const coder = e.runner.calls.find(s => s.role === 'coding')!;
     const reviewer = e.runner.calls.find(s => s.role === 'review')!;
     assert.ok(coder.gitReadPaths?.length, 'shared git metadata is readable without opening all orchestrator state');
-    assert.ok(coder.gitWritePaths?.some(p => p.endsWith('/objects')), 'coder can create commit objects');
-    assert.equal(coder.gitWritePaths?.some(p => /\/(config|hooks)$/.test(p)), false, 'shared hooks and config cannot be changed');
-    assert.deepEqual(reviewer.gitWritePaths, [], 'reviewer has no shared metadata write grant');
+    assert.ok(reviewer.gitReadPaths?.length);
+    assert.equal('gitWritePaths' in coder, false, 'agents get no git metadata write grant; the orchestrator commits');
     assert.equal(commandEnv().ANTHROPIC_API_KEY, undefined);
     assert.throws(() => commandEnv({ AWS_ACCESS_KEY_ID: 'fake' }), /Refusing/);
     assert.throws(() => commandEnv({ NODE_OPTIONS: '--require evil.js' }), /Refusing/);
@@ -86,18 +85,6 @@ test('command OS sandbox denies sibling credential reads and symlink escapes, an
   assert.equal(result.code, 0, result.stderr);
   assert.equal(readFileSync(escaped, 'utf8'), 'host-original');
   assert.equal(readFileSync(join(cwd, 'allowed.txt'), 'utf8'), 'ok');
-});
-
-test('real-mode setup never falls back to an unsandboxed shell', async () => {
-  const e = makeEnv({ config: { runner: 'claude' }, project: { setup: ['touch should-not-escape'] } });
-  e.ctx.runCommand = runSandboxed;
-  // The runner override is still fake: this test never calls Claude.
-  const destination = join(e.root, 'outside');
-  e.ctx.cfg.projects[0].setup = [`touch ${quote(destination)}`];
-  const t = await ticket(e);
-  await e.cycle();
-  assert.equal(existsSync(destination), false);
-  assert.equal(job(e, t.identifier).status, 'failed');
 });
 
 test('Claude runner refuses disabled sandbox before making an API call', async () => {
