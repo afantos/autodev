@@ -4,3 +4,4 @@ data/
 *.db
 *.db-*
 autodev.config.yaml
+.DS_Store

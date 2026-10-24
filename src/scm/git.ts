@@ -35,6 +35,30 @@ export function gitEnv(home: string): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * True if the clone's config enables extensions.worktreeConfig, or could through an include we can't verify.
+ * Parses the raw file (no git execution): section names and keys are case-insensitive; bare keys mean true.
+ */
+export function worktreeConfigMayBeEnabled(configPath: string): boolean {
+  let text: string;
+  try { text = readFileSync(configPath, 'utf8'); } catch { return true; }
+  let section = '';
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/[#;].*$/, '').trim();
+    if (!line) continue;
+    const header = line.match(/^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]$/);
+    if (header) { section = header[1].toLowerCase(); if (section === 'include' || section === 'includeif') return true; continue; }
+    if (line.startsWith('[')) return true; // unparseable header: refuse to assume
+    if (section !== 'extensions') continue;
+    const [key, ...rest] = line.split('=');
+    if (key.trim().toLowerCase() !== 'worktreeconfig') continue;
+    const value = rest.join('=').trim().toLowerCase().replace(/^"|"$/g, '');
+    // Only explicit false values disable it; anything else (true, yes, on, non-zero, unknown) counts as enabled.
+    if (rest.length === 0 || !['false', 'no', 'off', '0', ''].includes(value)) return true;
+  }
+  return false;
+}
+
 export class WorktreeTamperedError extends Error {
   constructor(path: string, why: string) { super(`worktree git metadata was modified (${why}) in ${path}; refusing to run git there`); }
 }
@@ -122,7 +146,14 @@ export class Workspaces {
     let common: string | null = null;
     try { common = commondir ? realpathSync(resolve(rec.gitDir, commondir)) : null; } catch { /* missing */ }
     if (common !== rec.commonDir) throw new WorktreeTamperedError(abs, 'commondir changed');
-    if (existsSync(join(rec.gitDir, 'config.worktree'))) throw new WorktreeTamperedError(abs, 'per-worktree config present');
+    // Claude Code's sandbox may create an empty config.worktree placeholder to mount git config read-only.
+    // Accept exactly that: a zero-byte regular file (never a symlink, directory or content) while
+    // per-worktree config is disabled in the shared clone. Anything else stays a tamper signal.
+    const perWorktree = lstatSync(join(rec.gitDir, 'config.worktree'), { throwIfNoEntry: false });
+    if (perWorktree) {
+      if (perWorktree.isSymbolicLink() || !perWorktree.isFile() || perWorktree.size !== 0) throw new WorktreeTamperedError(abs, 'per-worktree config present');
+      if (worktreeConfigMayBeEnabled(join(rec.commonDir, 'config'))) throw new WorktreeTamperedError(abs, 'per-worktree config enabled');
+    }
     return rec;
   }
 
