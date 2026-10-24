@@ -72,7 +72,9 @@ export interface SecondReviewOutcome {
 export interface Pricing {
   inputUsdPerMTok: number;
   cachedInputUsdPerMTok: number;
-  cacheWriteUsdPerMTok: number;
+  /** Cache writes: 30-minute at 1.25x input, 12-hour at 2.5x input. Requests disable caching; these only bound the reservation. */
+  cacheWrite30mUsdPerMTok: number;
+  cacheWrite12hUsdPerMTok: number;
   outputUsdPerMTok: number;
   longContextThresholdTokens: number;
   longContextInputMultiplier: number;
@@ -81,14 +83,29 @@ export interface Pricing {
 
 export interface Usage { inputTokens: number; cachedTokens: number; outputTokens: number }
 
-/** Provider usage → Usage, or null if anything needed for billing is missing, partial or implausible. */
-export function parseUsage(raw: unknown): Usage | null {
+/**
+ * Provider usage → Usage, or null when billing can't be reconstructed from it: missing, partial or implausible counts,
+ * any cache writes (reported in input_tokens_details.cache_write_tokens or its ttl_30m/ttl_12h breakdown), or a
+ * response processed at a tier other than Standard ("default"). Requests pin Standard and disable caching, so any of
+ * these is unexpected; the caller then keeps its worst-case reservation instead of settling.
+ */
+export function parseUsage(raw: unknown, serviceTier?: unknown): Usage | null {
   if (!raw || typeof raw !== 'object') return null;
-  const u = raw as { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: { cached_tokens?: unknown } | null };
+  if (serviceTier !== undefined && serviceTier !== null && serviceTier !== 'default') return null;
+  const u = raw as { input_tokens?: unknown; output_tokens?: unknown; input_tokens_details?: Record<string, unknown> | null };
   const ok = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
   if (!ok(u.input_tokens) || !ok(u.output_tokens)) return null;
-  const cached = u.input_tokens_details?.cached_tokens ?? 0;
+  const details = u.input_tokens_details ?? {};
+  if (typeof details !== 'object') return null;
+  const cached = details.cached_tokens ?? 0;
   if (!ok(cached) || cached > u.input_tokens) return null;
+  const writes = details.cache_write_tokens ?? 0;
+  if (!ok(writes) || writes > 0) return null;
+  const breakdown = details.cache_write_tokens_details;
+  if (breakdown !== undefined && breakdown !== null) {
+    if (typeof breakdown !== 'object') return null;
+    for (const v of Object.values(breakdown as Record<string, unknown>)) if (!ok(v) || v > 0) return null;
+  }
   return { inputTokens: u.input_tokens, cachedTokens: cached, outputTokens: u.output_tokens };
 }
 
@@ -102,11 +119,11 @@ export function priceUsage(p: Pricing, u: Usage): number {
 
 /**
  * Upper bound for a request of at most `maxInputTokens` input tokens: long-context multipliers whenever the bound can
- * cross the threshold, and every input token at the highest input-side rate (uncached or cache write).
+ * cross the threshold, and every input token at the highest input-side rate (uncached, cached or either cache-write TTL).
  */
 export function worstCaseUsd(p: Pricing, maxInputTokens: number, maxOutputTokens: number): number {
   const long = maxInputTokens > p.longContextThresholdTokens;
-  const inRate = Math.max(p.inputUsdPerMTok, p.cacheWriteUsdPerMTok, p.cachedInputUsdPerMTok) * (long ? p.longContextInputMultiplier : 1);
+  const inRate = Math.max(p.inputUsdPerMTok, p.cachedInputUsdPerMTok, p.cacheWrite30mUsdPerMTok, p.cacheWrite12hUsdPerMTok) * (long ? p.longContextInputMultiplier : 1);
   const outRate = p.outputUsdPerMTok * (long ? p.longContextOutputMultiplier : 1);
   return (maxInputTokens * inRate + maxOutputTokens * outRate) / 1e6;
 }
@@ -192,13 +209,17 @@ export class OpenAiReviewer implements SecondReviewer {
         input: secondReviewPrompt(input),
         max_output_tokens: this.opts.maxOutputTokens,
         store: false,
+        // Pin Standard processing (not the project's default tier) and turn off implicit caching: with explicit mode and no
+        // breakpoints there are no cache writes, so the reported usage is fully priceable.
+        service_tier: 'default',
+        prompt_cache_options: { mode: 'explicit' },
         text: { format: { type: 'json_schema', name: 'merge_review', strict: true, schema: SECOND_REVIEW_JSON_SCHEMA } },
       }),
     });
     const body = await res.json().catch(() => null) as OpenAiResponse | null;
     if (!res.ok || !body) throw new Error(`OpenAI API ${res.status}: ${body?.error?.message ?? res.statusText}`);
     // Missing, null or partial usage is UNKNOWN (no costUsd attached), never zero: the caller keeps its reservation.
-    const parsedUsage = parseUsage(body.usage);
+    const parsedUsage = parseUsage(body.usage, body.service_tier);
     const costUsd = parsedUsage ? priceUsage(this.opts.pricing, parsedUsage) : null;
     const inputTokens = parsedUsage?.inputTokens ?? 0;
     const outputTokens = parsedUsage?.outputTokens ?? 0;
@@ -221,5 +242,6 @@ interface OpenAiResponse {
   error?: { message?: string } | null;
   incomplete_details?: { reason?: string } | null;
   usage?: unknown;
+  service_tier?: unknown;
   output?: { type?: string; content?: { type: string; text?: string; refusal?: string }[] }[];
 }

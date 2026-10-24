@@ -122,11 +122,13 @@ const ConfigSchema = z.object({
     /**
      * Standard-tier pricing (USD per 1M tokens) and the long-context rule, from the model's official pricing page
      * (gpt-6.1-sol, checked 2026-10-24): >272K input tokens bills the whole request at 2x input/cache and 1.5x output.
+     * Cache writes are 1.25x (30m) / 2.5x (12h) input; requests disable caching, so they only bound the reservation.
      */
     pricing: z.object({
       inputUsdPerMTok: z.number().nonnegative().default(2),
       cachedInputUsdPerMTok: z.number().nonnegative().default(0.1),
-      cacheWriteUsdPerMTok: z.number().nonnegative().default(2.5),
+      cacheWrite30mUsdPerMTok: z.number().nonnegative().default(2.5),
+      cacheWrite12hUsdPerMTok: z.number().nonnegative().default(5),
       outputUsdPerMTok: z.number().nonnegative().default(10),
       longContextThresholdTokens: z.number().int().positive().default(272_000),
       longContextInputMultiplier: z.number().min(1).default(2),

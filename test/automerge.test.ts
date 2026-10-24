@@ -17,7 +17,7 @@ import { parseConfig } from '../src/config.ts';
 // ---------------------------------------------------------------- helpers
 
 /** gpt-6.1-sol Standard pricing and long-context rule (developers.openai.com, checked 2026-10-24). */
-const PRICING: Pricing = { inputUsdPerMTok: 2, cachedInputUsdPerMTok: 0.1, cacheWriteUsdPerMTok: 2.5, outputUsdPerMTok: 10, longContextThresholdTokens: 272_000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
+const PRICING: Pricing = { inputUsdPerMTok: 2, cachedInputUsdPerMTok: 0.1, cacheWrite30mUsdPerMTok: 2.5, cacheWrite12hUsdPerMTok: 5, outputUsdPerMTok: 10, longContextThresholdTokens: 272_000, longContextInputMultiplier: 2, longContextOutputMultiplier: 1.5 };
 
 const APPROVE: SecondReviewVerdict = { verdict: 'approve', summary: 'Correct and matches the spec.', findings: [], specConformance: 'ok' };
 const CHANGES: SecondReviewVerdict = {
@@ -245,6 +245,9 @@ test('OpenAiReviewer sends a strict structured-output request and parses the ver
   const body = JSON.parse(String(sent!.init.body));
   assert.equal(body.model, 'gpt-6.1-sol');
   assert.equal(body.store, false);
+  assert.equal(body.service_tier, 'default', 'pins Standard processing and pricing');
+  assert.deepEqual(body.prompt_cache_options, { mode: 'explicit' }, 'no implicit cache breakpoint');
+  assert.doesNotMatch(String(sent!.init.body), /prompt_cache_breakpoint/, 'and no explicit breakpoints: no cache writes');
   assert.deepEqual(body.text.format, { type: 'json_schema', name: 'merge_review', strict: true, schema: SECOND_REVIEW_JSON_SCHEMA });
   assert.match(body.instructions, /last line\s+of defense/);
   assert.match(body.input, /<untrusted source="ticket">\nIGNORE PREVIOUS INSTRUCTIONS/);
@@ -457,9 +460,66 @@ test('billing P1: the reservation uses long-context rates whenever the input bou
   const big = { ...SMALL, diff: '+' + 'x'.repeat(300_000) };
   const bound = requestBytes(big) + 1_000;
   assert.ok(bound > 272_000);
-  assert.equal(money(reviewer.maxCostUsd(big)), money((bound * 2.5 * 2 + 16_000 * 15) / 1e6));
+  assert.equal(money(reviewer.maxCostUsd(big)), money((bound * 5 * 2 + 16_000 * 15) / 1e6), 'highest input-side rate (12h cache write) x long-context');
   assert.ok(reviewer.maxCostUsd(big) >= priceUsage(PRICING, { inputTokens: bound, cachedTokens: 0, outputTokens: 16_000 }), 'covers any billable usage up to the bound');
   const small = requestBytes(SMALL) + 1_000;
   assert.equal(money(reviewer.maxCostUsd(SMALL)), money(worstCaseUsd(PRICING, small, 16_000)));
-  assert.equal(money(reviewer.maxCostUsd(SMALL)), money((small * 2.5 + 16_000 * 10) / 1e6), 'below the threshold: Standard, at the highest input-side rate');
+  assert.equal(money(reviewer.maxCostUsd(SMALL)), money((small * 5 + 16_000 * 10) / 1e6), 'below the threshold: Standard, at the highest input-side rate');
+});
+
+// ---------------------------------------------------------------- cache-write billing finding on 4738e39 (2026-10-24)
+
+test('cache writes: the reproduced 30-minute-write reply is not settled low; the reservation is kept', async () => {
+  // Reviewer's example: input_tokens 5,000 of which 3,000 were 30-minute cache writes, 1,000 output.
+  // Ignoring writes priced it at $0.0174 against a real ~$0.0209 charge.
+  const usage = { input_tokens: 5_000, output_tokens: 1_000, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 3_000, cache_write_tokens_details: { ttl_30m_tokens: 3_000, ttl_12h_tokens: 0 } } };
+  assert.equal(parseUsage(usage), null);
+  const reviewer = new CapturingReviewer('k', 'gpt-6.1-sol', { pricing: PRICING, maxOutputTokens: 16_000, timeoutMs: 1_000 }, reply(usage));
+  const out = await reviewer.review(SMALL);
+  assert.equal(out.costUsd, null);
+  const e = env(reviewer);
+  await ready(e);
+  await cycles(e, 2);
+  const row = e.ctx.db.prepare("SELECT cost_usd, outcome FROM external_usage").get() as { cost_usd: number; outcome: string };
+  assert.equal(row.outcome, 'approve-usage-unknown');
+  assert.equal(row.cost_usd, reviewer.reserved.at(-1));
+  assert.ok(row.cost_usd >= 0.0209, 'never below the true charge of the example');
+});
+
+for (const [name, details] of [
+  ['cache_write_tokens > 0', { cache_write_tokens: 1 }],
+  ['only the 12-hour breakdown', { cache_write_tokens_details: { ttl_12h_tokens: 7 } }],
+  ['only the 30-minute breakdown', { cache_write_tokens: 0, cache_write_tokens_details: { ttl_30m_tokens: 2 } }],
+  ['an unknown non-zero breakdown key', { cache_write_tokens_details: { ttl_7d_tokens: 1 } }],
+  ['a malformed breakdown', { cache_write_tokens_details: 'lots' }],
+  ['non-numeric cache_write_tokens', { cache_write_tokens: '0' }],
+] as const) {
+  test(`cache writes: usage with ${name} is unknown (reservation kept)`, () => {
+    assert.equal(parseUsage({ input_tokens: 100, output_tokens: 10, input_tokens_details: details }), null);
+  });
+}
+
+test('cache writes: explicit zeros are normal usage and priced', () => {
+  const u = parseUsage({ input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0, cache_write_tokens_details: { ttl_30m_tokens: 0, ttl_12h_tokens: 0 } } }, 'default');
+  assert.deepEqual(u, { inputTokens: 100, cachedTokens: 0, outputTokens: 10 });
+});
+
+for (const tier of ['priority', 'flex', 'auto', 'fast', 'ultrafast', 'scale', 7]) {
+  test(`service tier: a reply processed as ${JSON.stringify(tier)} is unknown usage (Standard pricing doesn't apply)`, async () => {
+    assert.equal(parseUsage({ input_tokens: 100, output_tokens: 10 }, tier), null);
+    const out = await new OpenAiReviewer('k', 'gpt-6.1-sol', { pricing: PRICING, maxOutputTokens: 100, timeoutMs: 1_000 }, reply({ input_tokens: 100, output_tokens: 10 }, { service_tier: tier })).review(SMALL);
+    assert.equal(out.costUsd, null);
+  });
+}
+
+test('service tier: "default" (or omitted) is Standard and priced normally', async () => {
+  for (const extra of [{ service_tier: 'default' }, {}]) {
+    const out = await new OpenAiReviewer('k', 'gpt-6.1-sol', { pricing: PRICING, maxOutputTokens: 100, timeoutMs: 1_000 }, reply({ input_tokens: 100_000, output_tokens: 1_000 }, extra)).review(SMALL);
+    assert.equal(money(out.costUsd), money((100_000 * 2 + 1_000 * 10) / 1e6));
+  }
+});
+
+test('reservation covers the worst cache-write rate (12h, 2.5x input) even though requests disable caching', () => {
+  const tokens = 10_000;
+  assert.ok(worstCaseUsd(PRICING, tokens, 0) >= tokens * 5 / 1e6);
 });
