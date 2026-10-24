@@ -159,9 +159,10 @@ export class LinearTracker implements Tracker {
       let after: string | null = null;
       for (let page = 0; page < 20; page++) {
         const d: { issues: { nodes: RawIssue[]; pageInfo: { hasNextPage: boolean; endCursor: string } } } = await this.gql(
-          `query($k:String!, $s:[String!], $after:String){ issues(first: 100, after: $after, filter:{ team:{ key:{ eq:$k } }${stateNames ? ', state:{ name:{ in:$s } }' : ''} }){
+          // Linear rejects declared-but-unused variables, so $s is declared only when the state filter uses it.
+          `query($k:String!${stateNames ? ', $s:[String!]' : ''}, $after:String){ issues(first: 100, after: $after, filter:{ team:{ key:{ eq:$k } }${stateNames ? ', state:{ name:{ in:$s } }' : ''} }){
              nodes { ${ISSUE_FIELDS} } pageInfo { hasNextPage endCursor } } }`,
-          { k: key, s: stateNames, after });
+          stateNames ? { k: key, s: stateNames, after } : { k: key, after });
         for (const i of d.issues.nodes) {
           const t = this.toTicket(i);
           if (!t.projectKey) continue;
