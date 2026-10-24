@@ -9,7 +9,7 @@ import { DEFAULTS } from '../src/agents/fake.ts';
 import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, SECOND_REVIEW_SYSTEM, effectiveVerdict, parseUsage, priceUsage, requestBytes, worstCaseUsd } from '../src/agents/second-review.ts';
 import type { Pricing } from '../src/agents/second-review.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
-import { externalSpentSince, getJob, kvGet, spentSince } from '../src/db.ts';
+import { externalSpentSince, getJob, kvGet, kvSet, spentSince } from '../src/db.ts';
 import { answerBlocked } from '../src/pipeline.ts';
 import { createCtx } from '../src/context.ts';
 import { parseConfig } from '../src/config.ts';
@@ -584,4 +584,57 @@ test('the reviewer prompt targets bugs and regressions and tells the model not t
   assert.match(SECOND_REVIEW_SYSTEM, /narrowly scoped lint suppression/);
   assert.match(SECOND_REVIEW_SYSTEM, /Mechanical gates have ALREADY passed/);
   assert.deepEqual([...SECOND_REVIEW_JSON_SCHEMA.properties.findings.items.required].includes('category'), true);
+});
+
+// ---------------------------------------------------------------- stale cached verdicts (review of 6701c87)
+
+/** A verdict cached by c5d5476 and earlier: findings had no category. */
+const LEGACY_REJECTION = { verdict: 'request_changes', summary: 'Unbounded loop.', findings: [{ severity: 'major', file: 'CHANGES.md', line: 1, issue: 'Loops forever on Infinity', suggestion: 'Validate bounds first' }], specConformance: 'violates limits' };
+
+test('P1: a cached pre-category major-bug rejection is never downgraded into a merge; it is reviewed again', async () => {
+  const reviewer = new FakeReviewer([CHANGES]); // the fresh review finds the same bug, now categorized
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}`, JSON.stringify(LEGACY_REJECTION));
+  await e.cycle();
+  assert.equal(approval(e, j.pr_number), null, 'no approval from a stale cache');
+  assert.notEqual((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
+  assert.equal(reviewer.inputs.length, 1, 'the reviewer was asked again');
+  assert.equal(reviewer.inputs[0]!.candidateSha, j.candidate_sha);
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'second_review.cache_invalidated'").get());
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'automerge.rework'").get(), 'the real bug sends it back for rework');
+});
+
+test('P1: after an invalidated cache, a fresh approval merges (one new review, not zero)', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}`, JSON.stringify(LEGACY_REJECTION));
+  await cycles(e, 2);
+  assert.equal(reviewer.inputs.length, 1);
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
+});
+
+for (const [name, cached] of [['unparseable JSON', '{not json'], ['a different shape', JSON.stringify({ ok: true })], ['an unknown category', JSON.stringify({ ...LEGACY_REJECTION, findings: [{ ...LEGACY_REJECTION.findings[0], category: 'performance' }] })]] as const) {
+  test(`P1: a cached verdict with ${name} is discarded and reviewed again`, async () => {
+    const reviewer = new FakeReviewer([CHANGES]);
+    const e = env(reviewer);
+    const t = await ready(e);
+    await e.cycle();
+    const j = job(e, t.identifier);
+    kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}`, cached);
+    await e.cycle();
+    assert.equal(reviewer.inputs.length, 1);
+    assert.equal(approval(e, j.pr_number), null);
+  });
+}
+
+test('P1 (defense in depth): a major finding with a missing or unknown category blocks; only style/docs/other downgrade', () => {
+  const v = (category: unknown) => ({ verdict: 'approve', summary: '', specConformance: '', findings: [{ severity: 'major', category, file: 'a', line: null, issue: 'i', suggestion: 's' }] }) as unknown as SecondReviewVerdict;
+  for (const c of [undefined, null, '', 'performance', 'Bug']) assert.equal(effectiveVerdict(v(c)).decision, 'request_changes', `category ${JSON.stringify(c)}`);
+  for (const c of ['style', 'docs', 'other']) assert.equal(effectiveVerdict(v(c)).decision, 'approve', `category ${c}`);
 });

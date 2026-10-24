@@ -3,7 +3,7 @@ import type { Ctx } from './context.ts';
 import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, settleExternalUsage, tx, updateJob } from './db.ts';
 import { startOfDay, startOfMonth } from './budget.ts';
 import { inspectChanges } from './policy.ts';
-import { effectiveVerdict, requestBytes } from './agents/second-review.ts';
+import { SecondReviewSchema, effectiveVerdict, requestBytes } from './agents/second-review.ts';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
 
@@ -79,7 +79,20 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
   // 5. Independent second review, once per candidate sha.
   const verdictKey = `second-review:${job.id}:${sha}`;
-  let verdict = kvGet(db, verdictKey) ? JSON.parse(kvGet(db, verdictKey)!) as SecondReviewVerdict : null;
+  // A cached verdict is reused only if it still validates against the current schema. Verdicts cached by an older
+  // version (e.g. findings without a category) are discarded and the review runs again: never reinterpret them.
+  let verdict: SecondReviewVerdict | null = null;
+  const cached = kvGet(db, verdictKey);
+  if (cached) {
+    let raw: unknown = null;
+    try { raw = JSON.parse(cached); } catch { /* unreadable → invalid */ }
+    const parsed = SecondReviewSchema.safeParse(raw);
+    if (parsed.success) verdict = parsed.data;
+    else {
+      kvSet(db, verdictKey, null);
+      logEvent(db, 'second_review.cache_invalidated', `${job.ticket_identifier}: cached verdict for ${sha.slice(0, 12)} doesn't match the current schema; reviewing again`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    }
+  }
   if (!verdict) {
     const input = {
       repo: job.repo, ticket, baseSha: job.base_sha!, candidateSha: sha,

@@ -166,13 +166,16 @@ a security finding (blocker). Return only the structured verdict.`;
 export const BLOCKING_CATEGORIES = ['bug', 'regression', 'spec', 'security', 'tests'] as const;
 
 /**
- * The merge decision, enforced in code rather than trusted to the model's own verdict: a blocker finding, or a major one in a
- * blocking category, blocks; nothing else does. A "request_changes" verdict with only minor/non-blocking findings is
+ * The merge decision, enforced in code rather than trusted to the model's own verdict: a blocker finding, or a major one
+ * that isn't explicitly style/docs/other (missing or unknown categories count as blocking), blocks; nothing else does. A "request_changes" verdict with only minor/non-blocking findings is
  * downgraded to approve (its notes are kept), and an "approve" verdict that lists a blocking finding is treated as
  * request_changes.
  */
 export function effectiveVerdict(v: SecondReviewVerdict): { decision: 'approve' | 'request_changes'; blocking: SecondReviewVerdict['findings']; notes: SecondReviewVerdict['findings']; overridden: boolean } {
-  const isBlocking = (f: SecondReviewVerdict['findings'][number]) => f.severity === 'blocker' || (f.severity === 'major' && (BLOCKING_CATEGORIES as readonly string[]).includes(f.category));
+  // Defense in depth: a major finding whose category isn't a known non-blocking one (style, docs, other), including a
+  // missing or unrecognized category, blocks. Only an explicit non-blocking category can downgrade a major finding.
+  const NON_BLOCKING: readonly string[] = ['style', 'docs', 'other'];
+  const isBlocking = (f: SecondReviewVerdict['findings'][number]) => f.severity === 'blocker' || (f.severity === 'major' && !NON_BLOCKING.includes(f.category as string));
   const blocking = v.findings.filter(isBlocking);
   const notes = v.findings.filter((f) => !isBlocking(f));
   const decision = blocking.length ? 'request_changes' : 'approve';
