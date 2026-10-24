@@ -116,6 +116,16 @@ reach the dashboard privately.
 
 ## 5. Install on the VM
 
+**Credential-free preparation.** As root, run `deploy/prepare-host.sh <bundle-or-repo> <commit>`. It:
+- checks the host: Ubuntu 24.04, Node 24, bubblewrap, the `bwrap` AppArmor profile, the userns restriction enabled, and an `autodev` user without sudo;
+- installs the app root-owned and read-only at the exact commit;
+- creates the instance and workspace directories;
+- installs `deploy/droplet.config.yaml` and `deploy/env.template` (placeholders only) if they are absent;
+- installs the systemd unit without enabling or starting it;
+- validates the config schema.
+
+Then fill in the `DECISION` fields and `.env` (mode 0600), and run `linear-check` before enabling the service. The manual flow below is the equivalent long form.
+
 ```bash
 sudo -u autodev -i
 git clone https://github.com/<you>/autodev /opt/autodev/app && cd /opt/autodev/app && npm ci --omit=dev

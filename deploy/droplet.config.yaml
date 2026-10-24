@@ -1,0 +1,68 @@
+# autodev configuration for the DigitalOcean droplet (autodev-1).
+# Installed to /opt/autodev/instance/autodev.config.yaml. Contains NO secrets: credentials come only from
+# /opt/autodev/instance/.env. Every value marked DECISION is a placeholder awaiting your choice; the service
+# must stay disabled until they are filled in.
+
+dataDir: ./data                          # /opt/autodev/instance/data (state DB, records; agents denied)
+workspaceDir: /opt/autodev/instance-work # clones, worktrees, candidate snapshots (outside HOME/config/data)
+
+tracker: linear
+scm: github
+runner: claude
+
+projects:
+  - key: first-project                   # DECISION: short id used in branch names
+    repo: OWNER/REPO                     # DECISION: first GitHub repo to onboard (owner/name)
+    linear:
+      teamKey: TEAM                      # DECISION: Linear team key for this repo
+      # projectName: ""                  # DECISION (optional): scope to one Linear project
+    setup: ["npm ci --offline --no-audit"]   # command networking is disabled inside the sandbox
+    # npmCacheDir: /opt/autodev/instance/cache/npm   # operator-seeded cache for offline installs
+    validate: ["npm test"]               # DECISION: the repo's own typecheck/lint/test commands
+    requiredChecks: []                   # [] = every reported GitHub check must pass
+    env:
+      NODE_ENV: test
+    maxConcurrent: 1
+    stackedBranches: false
+    approvedDependencies: []
+
+linear:
+  states:                                # must match your Linear workflow state names
+    ideas: Ideas
+    backlog: Backlog
+    ready: Ready
+    in_progress: In Progress
+    review: In Review
+    done: Done
+    blocked: Blocked
+    failed: Failed
+    canceled: Canceled
+  requireLabel: autodev                  # only tickets carrying this label are touched (safe default)
+
+concurrency:
+  global: 1                              # first supervised runs: one agent at a time
+
+budget:                                  # DECISION: AI spend limits (USD, SDK estimates; the provider-side limit is the hard stop)
+  dailyUsd: 5
+  monthlyUsd: 50
+  perTicketUsd: 3
+  perRunUsd: 1.5
+  perDecisionUsd: 0.5
+  onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically
+
+models:
+  planning: opus
+  coding: sonnet
+  codingComplex: opus
+  complexThreshold: 4
+  decision: sonnet
+  review: opus
+  classify: haiku
+
+sandbox:
+  enabled: true
+  failIfUnavailable: true
+  allowedDomains: [registry.npmjs.org]
+
+dashboard: { enabled: false, host: 127.0.0.1, port: 7777 }   # not exposed; enable later with a token
+report: { hour: -1 }                     # DECISION: morning report hour (needs a notification target)
