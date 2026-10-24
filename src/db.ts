@@ -278,9 +278,16 @@ export function spentSince(db: Db, sinceMs: number): number {
   return r.s;
 }
 
-export function recordExternalUsage(db: Db, u: { provider: string; model: string; jobId?: string | null; ticketId?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; outcome?: string }) {
-  db.prepare('INSERT INTO external_usage (ts, provider, model, job_id, ticket_id, cost_usd, input_tokens, output_tokens, outcome) VALUES (?,?,?,?,?,?,?,?,?)')
+export function recordExternalUsage(db: Db, u: { provider: string; model: string; jobId?: string | null; ticketId?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; outcome?: string }): number {
+  const r = db.prepare('INSERT INTO external_usage (ts, provider, model, job_id, ticket_id, cost_usd, input_tokens, output_tokens, outcome) VALUES (?,?,?,?,?,?,?,?,?)')
     .run(now(), u.provider, u.model, u.jobId ?? null, u.ticketId ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.outcome ?? null);
+  return Number(r.lastInsertRowid);
+}
+
+/** Settle a pending (worst-case) row with the provider-reported usage. */
+export function settleExternalUsage(db: Db, id: number, u: { model: string; costUsd: number; inputTokens: number; outputTokens: number; outcome: string }) {
+  db.prepare('UPDATE external_usage SET model = ?, cost_usd = ?, input_tokens = ?, output_tokens = ?, outcome = ? WHERE id = ?')
+    .run(u.model, u.costUsd, u.inputTokens, u.outputTokens, u.outcome, id);
 }
 
 export function externalSpentSince(db: Db, provider: string, sinceMs: number): number {

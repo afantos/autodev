@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeEnv, job } from './helpers.ts';
 import { DEFAULTS } from '../src/agents/fake.ts';
-import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA } from '../src/agents/second-review.ts';
+import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, requestBytes } from '../src/agents/second-review.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
 import { externalSpentSince, getJob, kvGet, spentSince } from '../src/db.ts';
 import { answerBlocked } from '../src/pipeline.ts';
@@ -27,10 +27,15 @@ class FakeReviewer implements SecondReviewer {
   inputs: SecondReviewInput[] = [];
   verdicts: SecondReviewVerdict[];
   worst: number;
+  /** Runs inside review(), e.g. to move the ticket or retarget the PR while the review is in flight. */
+  during?: () => Promise<void> | void;
+  fail?: Error;
   constructor(verdicts: SecondReviewVerdict[], worst = 0.2) { this.verdicts = verdicts; this.worst = worst; }
   maxCostUsd() { return this.worst; }
   async review(input: SecondReviewInput) {
     this.inputs.push(input);
+    await this.during?.();
+    if (this.fail) throw this.fail;
     const verdict = this.verdicts.length > 1 ? this.verdicts.shift()! : this.verdicts[0]!;
     return { verdict, model: this.model, costUsd: 0.07, inputTokens: 20_000, outputTokens: 1_000 };
   }
@@ -258,4 +263,127 @@ test('config: autoMerge requires secondReview.enabled', () => {
   const cfg = parseConfig({ tracker: 'local', scm: 'local', runner: 'fake', dataDir: join(root, 'd'), workspaceDir: join(root, 'w'), projects: [{ key: 'demo', repo: root, autoMerge: true }], sandbox: { enabled: false } }, root);
   assert.throws(() => createCtx(cfg), /autoMerge but secondReview\.enabled is false/);
   void readFileSync;
+});
+
+// ---------------------------------------------------------------- review findings on 360474d (2026-10-24)
+
+for (const moved of ['canceled', 'backlog', 'done'] as const) {
+  test(`finding 1: a ticket moved to ${moved} is never auto-merged and never marked Done by autodev`, async () => {
+    const reviewer = new FakeReviewer([APPROVE]);
+    const e = env(reviewer);
+    const t = await ready(e);
+    await e.cycle();
+    const j = job(e, t.identifier);
+    await e.tracker.setStatus(t.id, moved);
+    await cycles(e, 3);
+    assert.equal(reviewer.inputs.length, 0);
+    assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
+    assert.equal(approval(e, j.pr_number), null);
+    assert.equal((await e.tracker.getTicket(t.id))!.status, moved);
+    assert.equal(job(e, t.identifier).status, 'awaiting_merge');
+  });
+}
+
+test('finding 1: a ticket canceled while the second review runs is not merged', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  reviewer.during = () => e.tracker.setStatus(t.id, 'canceled');
+  await e.cycle();
+  const j = job(e, t.identifier);
+  assert.equal(reviewer.inputs.length, 1);
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
+  assert.equal(approval(e, j.pr_number), null);
+  assert.equal((await e.tracker.getTicket(t.id))!.status, 'canceled');
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'automerge.skipped'").get());
+});
+
+test('finding 2: a PR retargeted to another branch is held, and neither branch changes', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  git(e.repo, 'branch', 'release', 'main');
+  const before = { main: git(e.repo, 'rev-parse', 'main').trim(), release: git(e.repo, 'rev-parse', 'release').trim() };
+  await e.scm.updatePr(e.repo, j.pr_number, { base: 'release' });
+  await cycles(e, 2);
+  assert.equal(reviewer.inputs.length, 0);
+  assert.equal(approval(e, j.pr_number), null);
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
+  assert.deepEqual({ main: git(e.repo, 'rev-parse', 'main').trim(), release: git(e.repo, 'rev-parse', 'release').trim() }, before);
+  assert.match(await comments(e, t.id), /now targets `release`, but autodev validated it against `main`/);
+});
+
+test('finding 2: a PR retargeted while the second review runs is held, not merged', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  git(e.repo, 'branch', 'release', 'main');
+  const release = git(e.repo, 'rev-parse', 'release').trim();
+  reviewer.during = () => e.scm.updatePr(e.repo, j.pr_number, { base: 'release' });
+  await e.cycle();
+  assert.equal(reviewer.inputs.length, 1);
+  assert.equal(approval(e, j.pr_number), null);
+  assert.equal(git(e.repo, 'rev-parse', 'release').trim(), release);
+  assert.match(await comments(e, t.id), /retargeted to `release` during review/);
+});
+
+test('finding 3: the worst case is reserved in the ledger while a review runs, then settled to the reported cost', async () => {
+  const reviewer = new FakeReviewer([APPROVE], 0.9);
+  const e = env(reviewer, { config: { secondReview: { enabled: true, dailyUsd: 1 } } });
+  let duringSpend = -1;
+  reviewer.during = () => { duringSpend = externalSpentSince(e.ctx.db, 'openai', 0); };
+  const t = await ready(e);
+  await cycles(e, 2);
+  assert.equal(duringSpend, 0.9, 'the reservation counts against the cap while the call is in flight');
+  assert.equal(externalSpentSince(e.ctx.db, 'openai', 0), 0.07, 'settled to the provider-reported cost');
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'merged');
+});
+
+test('finding 3: a second review that would exceed the cap is not started (even partially)', async () => {
+  const reviewer = new FakeReviewer([APPROVE], 0.6);
+  const e = env(reviewer, { config: { secondReview: { enabled: true, dailyUsd: 1 } } });
+  // Two PRs; after the first review settles at $0.07, the second's worst case ($0.6) still fits: 0.67 <= 1.
+  // A third would not: prove the gate uses the reserved worst case, not an optimistic estimate.
+  e.ctx.db.prepare("INSERT INTO external_usage (ts, provider, model, cost_usd, outcome) VALUES (?, 'openai', 'gpt-6.1-sol', 0.5, 'approve')").run(Date.now());
+  const t = await ready(e);
+  await cycles(e, 3);
+  assert.equal(reviewer.inputs.length, 0, '0.5 spent + 0.6 worst case > 1: must wait');
+  assert.equal(externalSpentSince(e.ctx.db, 'openai', 0), 0.5);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'open');
+});
+
+test('finding 3: a failure with unknown usage keeps the worst-case charge; a failure with known usage records it', async () => {
+  const reviewer = new FakeReviewer([APPROVE], 0.4);
+  reviewer.fail = new Error('socket hang up');
+  const e = env(reviewer);
+  const t = await ready(e);
+  await cycles(e, 2);
+  assert.equal(externalSpentSince(e.ctx.db, 'openai', 0), 0.4, 'unknown usage is charged at the reserved worst case');
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM external_usage WHERE outcome = 'error-usage-unknown'").get());
+  reviewer.fail = Object.assign(new Error('invalid verdict'), { costUsd: 0.03, inputTokens: 9_000, outputTokens: 500 });
+  await e.cycle();
+  assert.equal(Number(externalSpentSince(e.ctx.db, 'openai', 0).toFixed(2)), 0.43);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'open');
+});
+
+test('finding 3: OpenAiReviewer bounds input by UTF-8 bytes (multi-byte text can be several tokens per character)', () => {
+  const r = new OpenAiReviewer('k', 'gpt-6.1-sol', { inputUsdPerMTok: 2, outputUsdPerMTok: 10, maxOutputTokens: 16_000, timeoutMs: 1_000 });
+  const input = { repo: 'o/r', ticket: { identifier: 'X-1', title: 't', description: '' } as never, baseSha: 'a', candidateSha: 'b', docs: [], diffStat: '', diff: '+' + '日本語'.repeat(50_000) };
+  const bytes = requestBytes(input);
+  assert.ok(bytes >= Buffer.byteLength(input.diff));
+  assert.ok(r.maxCostUsd(input) >= (bytes * 2 + 16_000 * 10) / 1e6);
+  const charsOver3 = (Math.ceil((input.diff.length) / 3) * 2 + 16_000 * 10) / 1e6;
+  assert.ok(r.maxCostUsd(input) > charsOver3 * 2, 'the old chars/3 estimate under-counted multi-byte input');
+});
+
+test('finding 3: OpenAiReviewer attaches usage to non-JSON output so it is recorded, not lost', async () => {
+  const r = new OpenAiReviewer('k', 'gpt-6.1-sol', { inputUsdPerMTok: 2, outputUsdPerMTok: 10, maxOutputTokens: 100, timeoutMs: 1_000 },
+    (async () => new Response(JSON.stringify({ status: 'completed', usage: { input_tokens: 1_000, output_tokens: 100 }, output: [{ content: [{ type: 'output_text', text: 'not json' }] }] }), { status: 200 })) as unknown as typeof fetch);
+  await assert.rejects(r.review({ repo: 'o/r', ticket: { identifier: 'X-1', title: 't', description: '' } as never, baseSha: 'a', candidateSha: 'b', docs: [], diffStat: '', diff: '' }),
+    (e: Error & { costUsd?: number }) => /not JSON/.test(e.message) && e.costUsd === (1_000 * 2 + 100 * 10) / 1e6);
 });

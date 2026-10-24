@@ -67,8 +67,8 @@ export interface SecondReviewer {
   readonly provider: string;
   readonly model: string;
   review(input: SecondReviewInput, signal?: AbortSignal): Promise<SecondReviewOutcome>;
-  /** Worst-case USD for one review of `inputChars` characters (budget gate). */
-  maxCostUsd?(inputChars: number): number;
+  /** Upper bound in USD for one review of `input` (budget gate). Required: reviews are never started unbounded. */
+  maxCostUsd(input: SecondReviewInput): number;
 }
 
 export const SECOND_REVIEW_SYSTEM = `You are the independent merge reviewer for an autonomous development system. A different AI wrote and
@@ -107,6 +107,11 @@ ${untrusted('diff', input.diff)}
 Decide: approve for merge, or request changes. For each finding give the file, line (or null) and a concrete fix.`;
 }
 
+/** UTF-8 size of everything sent: instructions, prompt (ticket, docs, diff) and the output schema. */
+export function requestBytes(input: SecondReviewInput): number {
+  return Buffer.byteLength(SECOND_REVIEW_SYSTEM) + Buffer.byteLength(secondReviewPrompt(input)) + Buffer.byteLength(JSON.stringify(SECOND_REVIEW_JSON_SCHEMA));
+}
+
 /** OpenAI Responses API with strict structured output. No SDK dependency: one HTTPS call via fetch. */
 export class OpenAiReviewer implements SecondReviewer {
   readonly provider = 'openai';
@@ -118,9 +123,14 @@ export class OpenAiReviewer implements SecondReviewer {
     this.apiKey = apiKey; this.model = model; this.opts = opts; this.fetchImpl = fetchImpl;
   }
 
-  /** Worst-case cost of one call, for the budget gate (input estimated conservatively at 3 characters per token). */
-  maxCostUsd(inputChars: number): number {
-    return (Math.ceil(inputChars / 3) * this.opts.inputUsdPerMTok + this.opts.maxOutputTokens * this.opts.outputUsdPerMTok) / 1e6;
+  /**
+   * Upper bound on the cost of one call, for the budget gate. Every token covers at least one UTF-8 byte, so the request's
+   * byte length bounds input tokens (plus a margin for message framing); output, including reasoning, is capped by
+   * max_output_tokens.
+   */
+  maxCostUsd(input: SecondReviewInput): number {
+    const inputTokens = requestBytes(input) + 1_000;
+    return (inputTokens * this.opts.inputUsdPerMTok + this.opts.maxOutputTokens * this.opts.outputUsdPerMTok) / 1e6;
   }
 
   async review(input: SecondReviewInput, signal?: AbortSignal): Promise<SecondReviewOutcome> {
@@ -144,11 +154,14 @@ export class OpenAiReviewer implements SecondReviewer {
     const outputTokens = body.usage?.output_tokens ?? 0;
     const costUsd = (inputTokens * this.opts.inputUsdPerMTok + outputTokens * this.opts.outputUsdPerMTok) / 1e6;
     if (body.status && body.status !== 'completed') throw Object.assign(new Error(`OpenAI response ${body.status}${body.incomplete_details?.reason ? ` (${body.incomplete_details.reason})` : ''}`), { costUsd, inputTokens, outputTokens });
+    const usage = { costUsd, inputTokens, outputTokens };
     const text = (body.output ?? []).flatMap((o) => o.content ?? []).filter((c) => c.type === 'output_text').map((c) => c.text ?? '').join('');
     const refusal = (body.output ?? []).flatMap((o) => o.content ?? []).find((c) => c.type === 'refusal');
-    if (refusal) throw Object.assign(new Error(`OpenAI refused: ${refusal.refusal ?? ''}`), { costUsd, inputTokens, outputTokens });
-    const parsed = SecondReviewSchema.safeParse(JSON.parse(text));
-    if (!parsed.success) throw Object.assign(new Error(`OpenAI returned an invalid verdict: ${parsed.error.message}`), { costUsd, inputTokens, outputTokens });
+    if (refusal) throw Object.assign(new Error(`OpenAI refused: ${refusal.refusal ?? ''}`), usage);
+    let json: unknown;
+    try { json = JSON.parse(text); } catch { throw Object.assign(new Error('OpenAI returned an invalid verdict: output is not JSON'), usage); }
+    const parsed = SecondReviewSchema.safeParse(json);
+    if (!parsed.success) throw Object.assign(new Error(`OpenAI returned an invalid verdict: ${parsed.error.message}`), usage);
     return { verdict: parsed.data, model: body.model ?? this.model, costUsd, inputTokens, outputTokens };
   }
 }

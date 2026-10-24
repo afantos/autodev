@@ -124,7 +124,7 @@ const ConfigSchema = z.object({
     outputUsdPerMTok: z.number().nonnegative().default(10),
     maxOutputTokens: z.number().int().positive().default(16_000),
     /** Cap on supplied docs + diff (characters); larger diffs go to a human instead of being truncated. */
-    maxInputChars: z.number().int().positive().default(600_000),
+    maxInputChars: z.number().int().positive().default(600_000), // bytes of the full request
     timeoutSeconds: z.number().positive().default(900),
   }).prefault({}),
   policy: z.object({

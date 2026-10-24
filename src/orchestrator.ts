@@ -133,7 +133,8 @@ export class Orchestrator {
           updateJob(db, job.id, { status: 'closed', error: 'PR closed without merge' });
           await tracker.comment(t.id, `PR #${pr.number} was closed without merging. Branch \`${job.branch}\` is preserved. Move to Ready with a comment to rework.`).catch(() => {});
           logEvent(db, 'job.closed', `${job.ticket_identifier}: PR closed unmerged`, { jobId: job.id, ticketId: t.id, level: 'warn' });
-        } else if (t.status !== 'ready') {
+        } else if (t.status === 'review') {
+          // Auto-merge only from Review: a ticket a human moved (Canceled, Backlog, Done...) is never merged.
           const project = ctx.cfg.projects.find((p) => p.key === job.project);
           if (project?.autoMerge) {
             const outcome = await autoMergeStep(ctx, job, t, project).catch((e) => {

@@ -1,8 +1,9 @@
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
-import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, updateJob } from './db.ts';
+import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, settleExternalUsage, tx, updateJob } from './db.ts';
 import { startOfDay, startOfMonth } from './budget.ts';
 import { inspectChanges } from './policy.ts';
+import { requestBytes } from './agents/second-review.ts';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
 
@@ -39,8 +40,11 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     return 'requeued';
   };
 
+  // Only a ticket a human hasn't moved elsewhere (Canceled, Backlog, Done, back to Ready...) may merge.
+  if (ticket.status !== 'review') return 'skipped';
   const pr = await scm.getPr(job.repo, job.pr_number);
   if (pr.state !== 'open') return 'skipped';
+  if (pr.baseBranch !== job.base_branch) return hold(`The PR now targets \`${pr.baseBranch}\`, but autodev validated it against \`${job.base_branch}\`. It won't merge a retargeted PR.`);
   if (!sha || pr.headSha !== sha) return hold(`The PR head (${pr.headSha.slice(0, 12)}) is not the candidate autodev validated (${(sha ?? 'none').slice(0, 12)}). Something was pushed outside autodev.`);
   if (job.validated_sha !== sha || job.reviewed_sha !== sha) return hold('The candidate lacks recorded validation or Claude review approval.');
   try {
@@ -83,28 +87,36 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       diffStat: await ws.diff(job.worktree, job.base_branch, true),
       diff: await ws.diff(job.worktree, job.base_branch),
     };
-    const chars = input.docs.reduce((n, d) => n + d.content.length, 0) + input.diff.length + input.ticket.description.length;
-    if (chars > cfg.secondReview.maxInputChars) return hold(`The change is too large for the second review (${chars} characters; limit ${cfg.secondReview.maxInputChars}).`);
-    const worst = reviewer.maxCostUsd?.(chars) ?? 1;
-    const day = externalSpentSince(db, reviewer.provider, startOfDay());
-    const month = externalSpentSince(db, reviewer.provider, startOfMonth());
-    if (day + worst > cfg.secondReview.dailyUsd || month + worst > cfg.secondReview.monthlyUsd) {
+    const worst = reviewer.maxCostUsd(input);
+    const bytes = requestBytes(input);
+    if (bytes > cfg.secondReview.maxInputChars) return hold(`The change is too large for the second review (${bytes} bytes; limit ${cfg.secondReview.maxInputChars}).`);
+    // Reserve the worst case as a pending ledger row before calling: it counts against the caps while the call runs and
+    // stays at the worst case if the process dies or the provider's usage is unknown, so spend is never under-recorded.
+    const reservation = tx(db, () => {
+      const day = externalSpentSince(db, reviewer.provider, startOfDay());
+      const month = externalSpentSince(db, reviewer.provider, startOfMonth());
+      if (day + worst > cfg.secondReview.dailyUsd || month + worst > cfg.secondReview.monthlyUsd) return { ok: false as const, day, month };
+      return { ok: true as const, id: recordExternalUsage(db, { provider: reviewer.provider, model: reviewer.model, jobId: job.id, ticketId: job.ticket_id, costUsd: worst, outcome: 'pending' }) };
+    });
+    if (!reservation.ok) {
       const key = `second-review-budget:${startOfDay()}`;
       if (!kvGet(db, key)) {
         kvSet(db, key, '1');
-        logEvent(db, 'second_review.budget', `second-review budget reached (today $${day.toFixed(2)}/$${cfg.secondReview.dailyUsd}, month $${month.toFixed(2)}/$${cfg.secondReview.monthlyUsd}); waiting`, { level: 'warn' });
+        logEvent(db, 'second_review.budget', `second-review budget reached (today $${reservation.day.toFixed(2)}/$${cfg.secondReview.dailyUsd}, month $${reservation.month.toFixed(2)}/$${cfg.secondReview.monthlyUsd}, next review up to $${worst.toFixed(2)}); waiting`, { level: 'warn' });
       }
       return 'waiting';
     }
     try {
       const out = await reviewer.review(input);
-      recordExternalUsage(db, { provider: reviewer.provider, model: out.model, jobId: job.id, ticketId: job.ticket_id, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict });
+      settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict });
       verdict = out.verdict;
       kvSet(db, verdictKey, JSON.stringify(verdict));
       logEvent(db, 'second_review', `${job.ticket_identifier}: ${verdict.verdict} (${out.model}, $${out.costUsd.toFixed(3)}): ${verdict.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
     } catch (e) {
       const err = e as Error & { costUsd?: number; inputTokens?: number; outputTokens?: number };
-      if (err.costUsd) recordExternalUsage(db, { provider: reviewer.provider, model: reviewer.model, jobId: job.id, ticketId: job.ticket_id, costUsd: err.costUsd, inputTokens: err.inputTokens, outputTokens: err.outputTokens, outcome: 'error' });
+      // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.
+      if (typeof err.costUsd === 'number') settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: err.costUsd, inputTokens: err.inputTokens ?? 0, outputTokens: err.outputTokens ?? 0, outcome: 'error' });
+      else settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: 'error-usage-unknown' });
       const failKey = `second-review-failures:${job.id}:${sha}`;
       const failures = Number(kvGet(db, failKey) ?? 0) + 1;
       kvSet(db, failKey, String(failures));
@@ -120,7 +132,19 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
   }
 
-  // All gates passed: approve exactly this sha as the reviewer account, then squash-merge pinned to it.
+  // All gates passed. Re-check everything that can change while the review ran, immediately before acting.
+  const latest = await tracker.getTicket(ticket.id);
+  if (!latest || latest.status !== 'review') {
+    logEvent(db, 'automerge.skipped', `${job.ticket_identifier}: ticket moved to ${latest?.status ?? 'missing'} during review; not merging`, { jobId: job.id, ticketId: job.ticket_id });
+    return 'skipped';
+  }
+  const now = await scm.getPr(job.repo, pr.number);
+  if (now.state !== 'open') return 'skipped';
+  if (now.baseBranch !== job.base_branch) return hold(`The PR was retargeted to \`${now.baseBranch}\` during review; autodev validated it against \`${job.base_branch}\`.`);
+  if (now.headSha !== sha) return hold(`The PR head changed during review (${now.headSha.slice(0, 12)} ≠ ${sha.slice(0, 12)}).`);
+  if ((await scm.branchSha(job.repo, job.base_branch)) !== job.base_sha) return 'waiting'; // base moved: refreshed next pass
+
+  // Approve exactly this sha as the reviewer account, then squash-merge pinned to it.
   const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: clean\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})`;
   await scm.markReady(job.repo, pr);
   await scm.approve(job.repo, pr.number, sha, body);
