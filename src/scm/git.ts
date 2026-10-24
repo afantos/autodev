@@ -4,6 +4,7 @@ import { run, runOk } from '../exec.ts';
 import type { Scm } from './types.ts';
 import { scanSecrets, UnsafePushError } from '../secrets.ts';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Db } from '../db.ts';
 
 /**
@@ -58,12 +59,32 @@ export class Workspaces {
   private clones = new Map<string, string>();
   constructor(dataDir: string, workspaceDir: string, scm: Scm, db: Db) { this.dataDir = dataDir; this.workspaceDir = workspaceDir; this.scm = scm; this.db = db; }
 
-  /** Serialize operations that touch a repo's shared clone (refs, packed-refs, worktree metadata). */
+  /** Async contexts that currently hold a repo lock (so nested git calls re-enter instead of deadlocking). */
+  private held = new AsyncLocalStorage<ReadonlySet<string>>();
+
+  /**
+   * Test seam only (never reachable from configuration): awaited after a reference-clone git command and
+   * before its ref snapshot is recorded, i.e. while the clone is legitimately mid-update under the lock.
+   */
+  testHooks: { afterCloneCommand?: (args: string[]) => Promise<void> } = {};
+
+  /**
+   * Serialize operations that touch a repo's shared clone (refs, packed-refs, worktree metadata).
+   * Re-entrant within one async context. Every ref verification also runs under this lock, so a check
+   * never observes another worker's in-progress (legitimate) update as tampering.
+   */
   withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+    const held = this.held.getStore();
+    if (held?.has(repo)) return fn();
     const prev = this.locks.get(repo) ?? Promise.resolve();
-    const next = prev.catch(() => {}).then(fn);
+    const next = prev.catch(() => {}).then(() => this.held.run(new Set([...(held ?? []), repo]), fn));
     this.locks.set(repo, next.catch(() => {}));
     return next;
+  }
+
+  /** Verify the reference clone's refs against the last orchestrator snapshot, under the repo lock. */
+  verifyRefsLocked(repo: string): Promise<void> {
+    return this.withRepoLock(repo, async () => this.verifyRefs(repo));
   }
 
   repoDir(repo: string) { const dir = join(this.workspaceDir, 'repos', repo.replace(/[^A-Za-z0-9._-]+/g, '__')); this.clones.set(resolve(dir), repo); return dir; }
@@ -76,8 +97,8 @@ export class Workspaces {
   gitDirArgs(cwd: string): string[] {
     const abs = resolve(cwd);
     if (this.isWorktreePath(abs)) {
+      // Ref verification happens in runGit, under the repo lock.
       const rec = this.verifiedRecord(abs);
-      this.verifyRefs(rec.repo);
       return [`--git-dir=${this.trustedState(abs).git_dir}`, `--work-tree=${rec.worktree}`];
     }
     // Disposable reference clones are used for worktree creation, never policy/scan/push ranges.
@@ -191,19 +212,36 @@ export class Workspaces {
     writeFileSync(join(real, '.git'), `gitdir: ${gitDir}\n`);
   }
 
-  async git(cwd: string, args: string[], auth = false, timeoutMs = 300_000, signal?: AbortSignal) {
-    const repo = this.clones.get(resolve(cwd));
-    if (repo) this.verifyRefs(repo);
-    const result = await runOk('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs, signal });
-    if (repo) this.saveRefs(repo);
-    return result;
+  git(cwd: string, args: string[], auth = false, timeoutMs = 300_000, signal?: AbortSignal) {
+    return this.runGit(cwd, args, (dirArgs) => runOk('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...dirArgs, ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs, signal }));
   }
-  async gitRaw(cwd: string, args: string[], auth = false) {
-    const repo = this.clones.get(resolve(cwd));
-    if (repo) this.verifyRefs(repo);
-    const result = await run('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs: 300_000 });
-    if (repo) this.saveRefs(repo);
-    return result;
+  gitRaw(cwd: string, args: string[], auth = false) {
+    return this.runGit(cwd, args, (dirArgs) => run('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...dirArgs, ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs: 300_000 }));
+  }
+
+  /**
+   * Reference-clone commands run entirely under the repo lock: verify refs, run, then record the new snapshot
+   * (also after a failed command, whose partial ref changes are still the orchestrator's own). A failed
+   * pre-check records nothing, so tampering stays detected. Worktree commands use the private store and only
+   * need a quiescent, locked ref check first.
+   */
+  private async runGit<T>(cwd: string, args: string[], exec: (dirArgs: string[]) => Promise<T>): Promise<T> {
+    const abs = resolve(cwd);
+    const clone = this.clones.get(abs);
+    if (clone) {
+      return this.withRepoLock(clone, async () => {
+        this.verifyRefs(clone);
+        try {
+          return await exec(this.gitDirArgs(cwd));
+        } finally {
+          await this.testHooks.afterCloneCommand?.(args);
+          this.saveRefs(clone);
+        }
+      });
+    }
+    const dirArgs = this.gitDirArgs(cwd);
+    if (this.isWorktreePath(abs)) await this.verifyRefsLocked(this.verifiedRecord(abs).repo);
+    return exec(dirArgs);
   }
 
   ensureClone(repo: string): Promise<string> {
@@ -280,7 +318,11 @@ export class Workspaces {
     return true;
   }
 
-  async headSha(path: string): Promise<string> { this.verifiedRecord(path); this.verifyRefs(this.verifiedRecord(path).repo); return this.trustedState(path).head_sha; }
+  async headSha(path: string): Promise<string> {
+    const rec = this.verifiedRecord(path);
+    await this.verifyRefsLocked(rec.repo);
+    return this.trustedState(path).head_sha;
+  }
 
   async aheadOf(path: string, base: string): Promise<number> {
     const state = this.trustedState(path);

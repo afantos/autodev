@@ -1,10 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { macosSandboxProfile } from '../src/command-sandbox.ts';
-import { classifySandbox } from '../src/sandbox-diagnostics.ts';
+import { macosSandboxProfile, runSandboxed } from '../src/command-sandbox.ts';
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { classifySandbox, probeNetworkIsolation } from '../src/sandbox-diagnostics.ts';
 import { run } from '../src/exec.ts';
 import type { ExecResult } from '../src/exec.ts';
-import { makeEnv, job } from './helpers.ts';
+import { makeEnv, job, sandboxAvailable } from './helpers.ts';
 import { updateJob } from '../src/db.ts';
 
 const result = (code: number, stdout = '', stderr = ''): ExecResult => ({ code, stdout, stderr, timedOut: false, truncated: false, signal: null });
@@ -76,4 +79,38 @@ test('requeued work also checks the host runtime before paying for another codin
   await e.cycle();
   assert.equal(job(e, t.identifier).status, 'blocked');
   assert.equal(e.runner.calls.length, calls);
+});
+
+// ---------------------------------------------------------------- network isolation (listener-based)
+
+test('network probe: an unsandboxed command reaches the host listener and is reported as not isolated', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'net-unsandboxed-'));
+  const r = await probeNetworkIsolation((cmd, dir) => run(cmd, [], { cwd: dir, shell: true, timeoutMs: 15_000 }), cwd);
+  assert.equal(r.isolated, false);
+  assert.match(String(r.reason), /reached a host listener/);
+  assert.ok(r.acceptedDuringProbe >= 1, 'the listener saw the connection');
+  assert.ok(Object.values(r.hostReachBefore).every(Boolean), 'positive control reached the listener');
+});
+
+test('network probe: a sandbox that never ran the probe is not accepted as isolation', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'net-notrun-'));
+  const r = await probeNetworkIsolation(async () => result(1, '', 'launcher missing'), cwd);
+  assert.equal(r.isolated, false);
+  assert.match(String(r.reason), /did not run/);
+});
+
+test('network probe: the real OS sandbox cannot reach a listener the host can reach', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'net-real-'));
+  const ready = await sandboxAvailable(root);
+  if (!ready.ok) {
+    assert.notEqual(process.env.AUTODEV_REQUIRE_SANDBOX_TEST, '1', `Required OS sandbox unavailable: ${ready.why}`);
+    t.skip(`OS sandbox unavailable in this environment: ${ready.why}`); return;
+  }
+  const cwd = join(root, 'work'); mkdirSync(cwd);
+  const r = await probeNetworkIsolation((cmd, dir) => runSandboxed(cmd, dir, {}, 15_000), cwd);
+  assert.equal(r.isolated, true, String(r.reason));
+  assert.ok(Object.values(r.hostReachBefore).every(Boolean) && Object.values(r.hostReachAfter).every(Boolean), 'host reached its listener before and after');
+  assert.equal(r.acceptedDuringProbe, 0, 'the listener accepted nothing from the sandbox');
+  for (const t of r.targets) assert.notEqual(r.sandbox[t], 'CONNECTED', t);
+  assert.ok(r.targets.length >= 1);
 });

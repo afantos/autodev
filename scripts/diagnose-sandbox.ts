@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { commandEnv, macosSandboxProfile, runSandboxed } from '../src/command-sandbox.ts';
-import { diagnoseSandbox } from '../src/sandbox-diagnostics.ts';
+import { diagnoseSandbox, probeNetworkIsolation } from '../src/sandbox-diagnostics.ts';
 import { run, shellQuote } from '../src/exec.ts';
 
 const output = realpathSync(mkdtempSync(join(tmpdir(), 'autodev-sandbox-diagnostic-')));
@@ -47,21 +47,20 @@ if (diagnosis.status === 'ready') {
   const secret = join(output, 'synthetic.env'); const outside = join(output, 'host-marker');
   writeFileSync(secret, 'SYNTHETIC_DIAGNOSTIC_ONLY'); writeFileSync(outside, 'unchanged');
   writeFileSync(join(cwd, '.git'), 'gitdir: /synthetic-unused\n');
-  const probe = `const fs=require('node:fs'),assert=require('node:assert/strict'),net=require('node:net');
+  const probe = `const fs=require('node:fs'),assert=require('node:assert/strict');
 const denied=fn=>{try{fn();assert.fail('operation unexpectedly allowed')}catch(e){assert.ok(['EACCES','EPERM','ENOENT','EROFS','EBUSY'].includes(e.code),e.message)}};
 denied(()=>fs.readFileSync(${JSON.stringify(secret)}));
 fs.symlinkSync(${JSON.stringify(secret)},'secret-link');denied(()=>fs.readFileSync('secret-link'));
 denied(()=>fs.writeFileSync('.git','changed'));denied(()=>fs.unlinkSync('.git'));denied(()=>fs.renameSync('.git','.git-renamed'));
 try{fs.writeFileSync(${JSON.stringify(outside)},'changed')}catch{};
 fs.writeFileSync('ordinary-write.txt','ok');
-const socket=net.connect({host:'127.0.0.1',port:9});
-socket.setTimeout(1000,()=>{socket.destroy();process.exitCode=1});
-socket.on('connect',()=>{socket.destroy();process.exitCode=1});
-socket.on('error',e=>{assert.ok(['EPERM','EACCES'].includes(e.code),'network was not denied: '+e.code);console.log('AUTODEV_BOUNDARIES_READY')});`;
+console.log('AUTODEV_BOUNDARIES_READY');`;
   const boundaries = await runSandboxed(`${shellQuote(process.execPath)} -e ${shellQuote(probe)}`, cwd, {}, 5000, undefined, inputs);
   const hostUnchanged = readFileSync(outside, 'utf8') === 'unchanged' && readFileSync(join(cwd, '.git'), 'utf8') === 'gitdir: /synthetic-unused\n';
-  report.runtime = { node, npm, boundaries, hostUnchanged };
-  report.ok = node.code === 0 && node.stdout === 'AUTODEV_NODE_READY' && npm.code === 0 && boundaries.code === 0 && boundaries.stdout.includes('AUTODEV_BOUNDARIES_READY') && hostUnchanged;
+  // Network: a real host listener must be reachable from the host and unreachable from the sandbox.
+  const network = await probeNetworkIsolation((cmd, dir) => runSandboxed(cmd, dir, {}, 15_000, undefined, inputs), cwd);
+  report.runtime = { node, npm, boundaries, hostUnchanged, network };
+  report.ok = node.code === 0 && node.stdout === 'AUTODEV_NODE_READY' && npm.code === 0 && boundaries.code === 0 && boundaries.stdout.includes('AUTODEV_BOUNDARIES_READY') && hostUnchanged && network.isolated;
 } else report.ok = false;
 
 if (process.platform === 'darwin' && tags.length) {
