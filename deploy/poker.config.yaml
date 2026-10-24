@@ -16,13 +16,17 @@ projects:
       teamKey: DEV
     setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
     npmCacheDir: /opt/autodev/instance/cache/npm     # operator-seeded from poker's package-lock.json
-    validate: ["npm run typecheck", "npm run lint", "npm test"]
+    validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # = poker's `npm run check`
     requiredChecks: ["checks"]                       # GitHub Actions job in .github/workflows/ci.yml
     env:
       NODE_ENV: test
     maxConcurrent: 1
     stackedBranches: false
-    approvedDependencies: []
+    # Approved 2026-10-24 (poker ADRs 0002, 0007). Lockfile changes still always go to human review.
+    approvedDependencies: [ws, react, react-dom, vite, "@types/ws", "@types/react", "@types/react-dom"]
+    # Import boundaries (poker ADR 0006) and CI are human-only; .github/ and manifests are covered by the base policy.
+    humanReviewPaths: ['^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
+    protectTests: true                               # removed/changed assertions and new skips go to a human
 
 linear:
   states:                                # must match your Linear workflow state names

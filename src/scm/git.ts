@@ -387,7 +387,7 @@ export class Workspaces {
 
   async diff(path: string, base: string, stat = false): Promise<string> {
     const state = this.trustedState(path);
-    return this.git(path, ['diff', '--no-ext-diff', '--no-textconv', ...(stat ? ['--stat'] : []), `${state.base_sha}...${state.head_sha}`]);
+    return this.git(path, ['diff', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', ...(stat ? ['--stat'] : []), `${state.base_sha}...${state.head_sha}`]);
   }
 
   async changedFiles(path: string, base: string): Promise<string[]> {

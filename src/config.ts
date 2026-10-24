@@ -30,6 +30,10 @@ const ProjectSchema = z.object({
   stackedBranches: z.boolean().default(false),
   /** Dependencies (npm/pypi names) the decision agent may auto-approve. */
   approvedDependencies: z.array(z.string()).default([]),
+  /** Repo-relative path regexes whose changes always need human review (e.g. lint boundary rules). */
+  humanReviewPaths: z.array(z.string()).default([]),
+  /** Send removed/changed assertions and newly skipped tests in test files to human review. */
+  protectTests: z.boolean().default(false),
   /** Docs the agents should read first (paths relative to repo root). */
   docs: z.array(z.string()).default(['CLAUDE.md', 'AGENTS.md', 'README.md', 'docs/adr', 'CONTRIBUTING.md']),
   adrDir: z.string().default('docs/adr'),

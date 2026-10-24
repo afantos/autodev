@@ -72,6 +72,11 @@ export function authorize(d: Decision, question: string, project: ProjectConfig,
   return { authority: reasons.length ? 'human' : 'auto', reasons };
 }
 
+const TEST_FILE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
+// Heuristics, deliberately conservative: legitimate test edits also go to a human, which is the intended trade-off.
+const WEAKENING_REMOVED = /\bassert\b|\bexpect\s*\(|\b(?:test|it|describe|suite)\s*\(/;
+const WEAKENING_ADDED = /\.(?:skip|only|todo)\s*\(|\b(?:skip|only|todo)\s*:\s*(?:true|['"`])|\bt\.(?:skip|todo)\s*\(/;
+
 /** Mandatory check of committed changes against the trusted integration branch.
  * Semantic checks are conservative heuristics; they do not replace human review.
  */
@@ -108,12 +113,24 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
       reasons.push(`${file}: security, product policy or deployment configuration changed`);
     }
     if (removed.includes(file) && !/\.(md|txt|snap)$/.test(file)) reasons.push(`${file}: source or configuration file removed`);
+    for (const pattern of project.humanReviewPaths) if (new RegExp(pattern).test(file)) reasons.push(`${file}: protected path (/${pattern}/) changed`);
   }
   // Exclude documentation from semantic keyword rules, but inspect every code hunk.
-  let file = ''; const added: string[] = [];
+  let file = ''; let header = false; const added: string[] = [];
   for (const line of diff.split('\n')) {
-    if (line.startsWith('+++ b/')) file = line.slice(6);
-    if (line.startsWith('+') && !line.startsWith('+++') && !/\.(md|txt|snap)$/.test(file)) added.push(line.slice(1));
+    // File headers only appear between `diff --git` and the first hunk; content lines may also start with ---/+++.
+    if (line.startsWith('diff --git ')) { header = true; continue; }
+    if (header) {
+      if (line.startsWith('--- a/')) file = line.slice(6);
+      if (line.startsWith('+++ b/')) file = line.slice(6);
+      if (line.startsWith('@@')) header = false;
+      continue;
+    }
+    if (line.startsWith('+') && !/\.(md|txt|snap)$/.test(file)) added.push(line.slice(1));
+    if (project.protectTests && TEST_FILE.test(file)) {
+      if (line.startsWith('-') && WEAKENING_REMOVED.test(line)) reasons.push(`${file}: test assertion or test case removed or changed`);
+      if (line.startsWith('+') && WEAKENING_ADDED.test(line)) reasons.push(`${file}: test skipped, focused or marked todo`);
+    }
   }
   const text = added.join('\n');
   for (const [pattern, reason] of HUMAN_PATTERNS) if (pattern.test(text)) reasons.push(`diff touches ${reason}`);
