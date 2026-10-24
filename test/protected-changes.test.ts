@@ -25,6 +25,7 @@ function seedMain(repo: string, files: Record<string, string>) {
   git(dir, 'push', '-q', 'origin', 'HEAD:main');
 }
 
+const childEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT'));
 const TEST_SRC = "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\ntest('adds', () => {\n  assert.equal(1 + 1, 2);\n});\n";
 
 function env(project: Record<string, unknown>, edit: (cwd: string) => void) {
@@ -56,7 +57,7 @@ test('removing or changing an existing assertion blocks when protectTests is on'
   seedMain(e.repo, { 'test/add.test.js': TEST_SRC });
   const t = await ticket(e); await e.cycle();
   assert.equal(job(e, t.identifier).status, 'blocked');
-  assert.match(job(e, t.identifier).blocked_reason, /test\/add\.test\.js: existing test code modified or removed/);
+  assert.match(job(e, t.identifier).blocked_reason, /test\/add\.test\.js: existing test file changed/);
 });
 
 for (const [name, replacement] of [
@@ -102,7 +103,7 @@ async function blockedWith(project: Record<string, unknown>, base: Record<string
 test('gap: replacing the argument of an unchanged multiline assert.ok( with true blocks', () =>
   blockedWith({ protectTests: true }, { 'test/deck.test.js': MULTILINE },
     (cwd) => writeFileSync(join(cwd, 'test', 'deck.test.js'), MULTILINE.replace('deck.length === 52', 'true')),
-    /existing test code modified or removed/));
+    /existing test file changed/));
 
 test('gap: a new test with { skip: 1 === 1 } blocks', () =>
   blockedWith({ protectTests: true }, { 'test/deck.test.js': MULTILINE },
@@ -112,7 +113,7 @@ test('gap: a new test with { skip: 1 === 1 } blocks', () =>
 test('gap: an early return inserted inside an existing test blocks', () =>
   blockedWith({ protectTests: true }, { 'test/deck.test.js': MULTILINE },
     (cwd) => writeFileSync(join(cwd, 'test', 'deck.test.js'), MULTILINE.replace("test('deck is full', () => {\n", "test('deck is full', () => {\n  return;\n")),
-    /lines inserted inside existing test code/));
+    /existing test file changed/));
 
 test('gap: process.exit appended to a test file blocks', () =>
   blockedWith({ protectTests: true }, { 'test/deck.test.js': MULTILINE },
@@ -134,10 +135,31 @@ test('gap: workspace manifests are protected by humanReviewPaths', () =>
     (cwd) => writeFileSync(join(cwd, 'packages', 'engine', 'package.json'), '{"name":"@x/engine","scripts":{"test":"true"}}\n'),
     /packages\/engine\/package\.json: (protected path|manifest changed)/));
 
-test('allowed: appending a new test and adding an import to an existing test file', async () => {
-  const e = env({ protectTests: true }, (cwd) => writeFileSync(join(cwd, 'test', 'deck.test.js'),
-    MULTILINE.replace("import assert from 'node:assert/strict';\n", "import assert from 'node:assert/strict';\nimport { Deck } from '../src/deck.js';\n") +
-    "\ntest('draws one', () => {\n  assert.equal(new Deck().draw(1).length, 1);\n});\n"));
+test('gap: a block comment opened in the header and closed at EOF blocks (assertions would silently never run)', async () => {
+  const failing = TEST_SRC.replace('assert.equal(1 + 1, 2)', 'assert.equal(1 + 1, 3)');
+  const commented = failing.replace("test('adds'", "/*\ntest('adds'") + '*/\n';
+  // The bypass is real: with the failing test commented out, Node exits 0 (execFileSync would throw otherwise).
+  const dir = mkdtempSync(join(tmpdir(), 'bypass-'));
+  writeFileSync(join(dir, 'add.test.mjs'), failing);
+  assert.throws(() => execFileSync(process.execPath, ['--test', join(dir, 'add.test.mjs')], { stdio: 'ignore', env: childEnv }), 'the uncommented failing test must fail');
+  writeFileSync(join(dir, 'add.test.mjs'), commented);
+  assert.doesNotThrow(() => execFileSync(process.execPath, ['--test', join(dir, 'add.test.mjs')], { stdio: 'ignore', env: childEnv }));
+  await blockedWith({ protectTests: true }, { 'test/add.test.js': TEST_SRC },
+    // Exactly the reproduced edit: only `/*` inserted in the header and `*/` appended at EOF.
+    (cwd) => writeFileSync(join(cwd, 'test', 'add.test.js'), TEST_SRC.replace("test('adds'", "/*\ntest('adds'") + '*/\n'),
+    /test\/add\.test\.js: existing test file changed/);
+});
+
+test('conservative: even an appended test or a new import in an existing test file needs review', () =>
+  blockedWith({ protectTests: true }, { 'test/deck.test.js': MULTILINE },
+    (cwd) => writeFileSync(join(cwd, 'test', 'deck.test.js'),
+      MULTILINE.replace("import assert from 'node:assert/strict';\n", "import assert from 'node:assert/strict';\nimport { Deck } from '../src/deck.js';\n") +
+      "\ntest('draws one', () => {\n  assert.equal(new Deck().draw(1).length, 1);\n});\n"),
+    /test\/deck\.test\.js: existing test file changed/));
+
+test('allowed: new tests in a new test file, next to an unchanged existing one', async () => {
+  const e = env({ protectTests: true }, (cwd) => writeFileSync(join(cwd, 'test', 'draw.test.js'),
+    "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\ntest('draws one', () => {\n  assert.equal([1].slice(0, 1).length, 1);\n});\n"));
   seedMain(e.repo, { 'test/deck.test.js': MULTILINE });
   const t = await ticket(e); await e.cycle();
   assert.equal(job(e, t.identifier).status, 'awaiting_merge', job(e, t.identifier).blocked_reason ?? job(e, t.identifier).error);
@@ -150,12 +172,14 @@ test('allowed: an approved dependency added to package.json passes the manifest 
   assert.equal(job(e, t.identifier).status, 'awaiting_merge', job(e, t.identifier).blocked_reason ?? job(e, t.identifier).error);
 });
 
-test('testWeakening: hunk positions decide header/EOF insertions versus edits inside tests', () => {
+test('testWeakening: every change to an existing test file is flagged; new files are only pattern-scanned', () => {
   const old = "import a from 'a';\n\ntest('x', () => {\n  a();\n});\n";
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -1,0 +2,1 @@', "+import b from 'b';"], old), [], 'insert in header');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -5,0 +6,2 @@', '+', "+test('y', () => {});"], old), [], 'append at EOF');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -3,0 +4,1 @@', '+  return;'], old), ['t.test.js: lines inserted inside existing test code']);
-  assert.ok(testWeakening('t.test.js', ['@@ -4 +4 @@', '-  a();', '+  a(true);'], old).includes('t.test.js: existing test code modified or removed'));
-  assert.ok(testWeakening('t.test.js', ['@@ -5 +5,2 @@', '-});', '\\ No newline at end of file', '+});', "+test('y', () => {});"], old.slice(0, -1)).includes('t.test.js: existing test code modified or removed'), 'no-newline EOF edits stay ambiguous');
+  const changed = ['t.test.js: existing test file changed'];
+  assert.deepEqual(testWeakening('t.test.js', ['@@ -1,0 +2,1 @@', '+/*'], old), changed, 'insertion in the header');
+  assert.deepEqual(testWeakening('t.test.js', ['@@ -5,0 +6,1 @@', '+*/'], old), changed, 'insertion at EOF');
+  assert.deepEqual(testWeakening('t.test.js', ['@@ -3,0 +4,1 @@', '+  return;'], old), changed, 'insertion inside a test');
+  assert.deepEqual(testWeakening('t.test.js', ['@@ -4 +4 @@', '-  a();', '+  a(true);'], old), changed, 'line edit');
+  assert.deepEqual(testWeakening('t.test.js', ['@@ -4 +3,0 @@', '-  a();'], old), changed, 'line removal');
+  assert.deepEqual(testWeakening('new.test.js', ['@@ -0,0 +1,1 @@', "+test('ok', () => {});"], null), [], 'clean new file');
   assert.deepEqual(testWeakening('new.test.js', ['@@ -0,0 +1,2 @@', "+test('ok', () => {});", "+test.todo('later');"], null), ['new.test.js: added test code skips, focuses or marks a test todo']);
 });

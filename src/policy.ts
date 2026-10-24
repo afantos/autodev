@@ -81,36 +81,18 @@ const WEAKENING_ADDED: [RegExp, string][] = [
   [/\bassert(?:\s*\.\s*\w+)*\s*=(?!=)|\b(?:mock\s*\.\s*method|Object\s*\.\s*(?:defineProperty|assign|setPrototypeOf))\s*\(\s*assert\b/, 'replaces assertion functions'],
   [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
 ];
-/** Leading lines of a test file before its first statement: imports, comments, blank lines. */
-const HEADER_LINE = /^\s*(?:$|import\b|\/\/|\/\*|\*|['"]use strict['"])/;
-
 /**
- * Conservative test-weakening check for one file's hunks. Any modified or removed line of an existing test file,
- * and any insertion other than in its import header or at its end, is ambiguous and goes to a human. Every added
- * line, in new and existing test files alike, is scanned for code that disables tests or replaces assertions.
+ * Conservative test-weakening check for one file's hunks. Any change to an existing test file goes to a human:
+ * position-based exceptions (import header, end of file) were bypassable, e.g. a block comment opened
+ * before an existing test and closed after it.
+ * New test files are allowed, but every added line is scanned for code that disables tests or replaces assertions.
  */
 export function testWeakening(file: string, lines: string[], oldText: string | null): string[] {
   const out = new Set<string>();
+  if (oldText !== null && lines.some((l) => (l.startsWith('+') || l.startsWith('-')))) out.add(`${file}: existing test file changed`);
   for (const l of lines) {
     if (!l.startsWith('+')) continue;
     for (const [re, why] of WEAKENING_ADDED) if (re.test(l.slice(1))) out.add(`${file}: added test code ${why}`);
-  }
-  if (oldText === null) return [...out];
-  const old = oldText.split('\n');
-  if (old.at(-1) === '') old.pop();
-  const headerEnd = old.findIndex((l) => !HEADER_LINE.test(l)); // 0-based index of the first statement
-  const lastHeader = headerEnd === -1 ? old.length : headerEnd;
-  let cur = 0; // old lines consumed so far
-  for (const l of lines) {
-    const h = /^@@ -(\d+)(?:,(\d+))? \+/.exec(l);
-    if (h) { cur = h[2] === '0' ? Number(h[1]) : Number(h[1]) - 1; continue; }
-    if (l.startsWith('\\')) continue;
-    if (l.startsWith('-')) { out.add(`${file}: existing test code modified or removed`); cur++; continue; }
-    if (l.startsWith('+')) {
-      if (!(cur <= lastHeader || cur >= old.length)) out.add(`${file}: lines inserted inside existing test code`);
-      continue;
-    }
-    cur++;
   }
   return [...out];
 }
