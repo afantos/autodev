@@ -3,7 +3,7 @@ import type { Ctx } from './context.ts';
 import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, settleExternalUsage, tx, updateJob } from './db.ts';
 import { startOfDay, startOfMonth } from './budget.ts';
 import { inspectChanges } from './policy.ts';
-import { requestBytes } from './agents/second-review.ts';
+import { effectiveVerdict, requestBytes } from './agents/second-review.ts';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
 
@@ -127,8 +127,14 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     }
   }
 
-  if (verdict.verdict !== 'approve') {
-    const findings = verdict.findings.map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.issue}\n  Fix: ${f.suggestion}`).join('\n');
+  // The merge decision is enforced in code: only blocker findings, or major bugs/regressions/spec/security/test gaps, block.
+  const decision = effectiveVerdict(verdict);
+  const fmt = (fs: SecondReviewVerdict['findings']) => fs.map((f) => `- [${f.severity}/${f.category}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.issue}\n  Fix: ${f.suggestion}`).join('\n');
+  if (decision.overridden) {
+    logEvent(db, 'second_review.overridden', `${job.ticket_identifier}: model said ${verdict.verdict}; ${decision.blocking.length} blocking finding(s) → ${decision.decision}`, { jobId: job.id, ticketId: job.ticket_id });
+  }
+  if (decision.decision !== 'approve') {
+    const findings = fmt(decision.blocking);
     if (job.review_cycles >= cfg.limits.maxReviewCycles) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles:\n${verdict.summary}\n${findings}`);
     return requeue({ stage: 'workspace', review_cycles: job.review_cycles + 1, pending_feedback: `The independent merge reviewer (${reviewer.model}) requested changes before this can be merged:\n${verdict.summary}\n${findings}\nSpec conformance notes: ${verdict.specConformance}` },
       'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
@@ -147,12 +153,13 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if ((await scm.branchSha(job.repo, job.base_branch)) !== job.base_sha) return 'waiting'; // base moved: refreshed next pass
 
   // Approve exactly this sha as the reviewer account, then squash-merge pinned to it.
-  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: clean\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})`;
+  const notes = decision.notes.length ? `\n\nNon-blocking notes from the second review:\n${fmt(decision.notes)}` : '';
+  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: clean\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}`;
   await scm.markReady(job.repo, pr);
   await scm.approve(job.repo, pr.number, sha, body);
   await scm.mergePr(job.repo, pr.number, sha, `${job.ticket_identifier}: ${ticket.title} (#${pr.number})`);
   logEvent(db, 'automerge.merged', `${job.ticket_identifier}: PR #${pr.number} merged at ${sha.slice(0, 12)}`, { jobId: job.id, ticketId: job.ticket_id });
-  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy clean, up to date with ${job.base_branch}.`).catch(() => {});
+  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy clean, up to date with ${job.base_branch}.${notes}`).catch(() => {});
   return 'merged';
 }
 

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeEnv, job } from './helpers.ts';
 import { DEFAULTS } from '../src/agents/fake.ts';
-import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, parseUsage, priceUsage, requestBytes, worstCaseUsd } from '../src/agents/second-review.ts';
+import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, SECOND_REVIEW_SYSTEM, effectiveVerdict, parseUsage, priceUsage, requestBytes, worstCaseUsd } from '../src/agents/second-review.ts';
 import type { Pricing } from '../src/agents/second-review.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
 import { externalSpentSince, getJob, kvGet, spentSince } from '../src/db.ts';
@@ -22,7 +22,7 @@ const PRICING: Pricing = { inputUsdPerMTok: 2, cachedInputUsdPerMTok: 0.1, cache
 const APPROVE: SecondReviewVerdict = { verdict: 'approve', summary: 'Correct and matches the spec.', findings: [], specConformance: 'ok' };
 const CHANGES: SecondReviewVerdict = {
   verdict: 'request_changes', summary: 'Unbounded loop on invalid input.',
-  findings: [{ severity: 'major', file: 'CHANGES.md', line: 1, issue: 'Loops forever on Infinity', suggestion: 'Validate bounds first' }], specConformance: 'violates limits',
+  findings: [{ severity: 'major', category: 'bug', file: 'CHANGES.md', line: 1, issue: 'Loops forever on Infinity', suggestion: 'Validate bounds first' }], specConformance: 'violates limits',
 };
 
 class FakeReviewer implements SecondReviewer {
@@ -249,7 +249,7 @@ test('OpenAiReviewer sends a strict structured-output request and parses the ver
   assert.deepEqual(body.prompt_cache_options, { mode: 'explicit' }, 'no implicit cache breakpoint');
   assert.doesNotMatch(String(sent!.init.body), /prompt_cache_breakpoint/, 'and no explicit breakpoints: no cache writes');
   assert.deepEqual(body.text.format, { type: 'json_schema', name: 'merge_review', strict: true, schema: SECOND_REVIEW_JSON_SCHEMA });
-  assert.match(body.instructions, /last line\s+of defense/);
+  assert.match(body.instructions, /merged without a human looking at it/);
   assert.match(body.input, /<untrusted source="ticket">\nIGNORE PREVIOUS INSTRUCTIONS/);
   assert.equal((sent!.init.headers as Record<string, string>).Authorization, 'Bearer sk-test');
   assert.deepEqual(out.verdict, APPROVE);
@@ -522,4 +522,66 @@ test('service tier: "default" (or omitted) is Standard and priced normally', asy
 test('reservation covers the worst cache-write rate (12h, 2.5x input) even though requests disable caching', () => {
   const tokens = 10_000;
   assert.ok(worstCaseUsd(PRICING, tokens, 0) >= tokens * 5 / 1e6);
+});
+
+// ---------------------------------------------------------------- focus on real problems, not nits (2026-10-24)
+
+const NIT = (category: 'style' | 'docs' | 'other', severity: 'major' | 'minor' = 'major') => ({ severity, category, file: 'src/registry.ts', line: 3, issue: 'eslint-disable comment for no-explicit-any', suggestion: 'use unknown' });
+
+test('nits never block: request_changes with only style/docs/other findings (even "major") is downgraded and merged, with notes', async () => {
+  const nitpick: SecondReviewVerdict = { verdict: 'request_changes', summary: 'Remove the lint suppression.', findings: [NIT('style'), NIT('docs', 'minor')], specConformance: 'ok' };
+  assert.deepEqual(effectiveVerdict(nitpick).decision, 'approve');
+  const reviewer = new FakeReviewer([nitpick]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await cycles(e, 3);
+  const j = job(e, t.identifier);
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
+  assert.equal(j.review_cycles, 0, 'no rework cycle spent on a nit');
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'second_review.overridden'").get());
+  assert.match(approval(e, j.pr_number)!.body, /Non-blocking notes[\s\S]*\[major\/style\][\s\S]*eslint-disable/);
+  assert.match(await comments(e, t.id), /Auto-merged[\s\S]*Non-blocking notes/);
+});
+
+for (const category of ['bug', 'regression', 'spec', 'security', 'tests'] as const) {
+  test(`a major ${category} finding blocks and sends the PR back for rework`, () => {
+    const v: SecondReviewVerdict = { verdict: 'request_changes', summary: 's', findings: [{ ...NIT('style'), category }], specConformance: '' };
+    assert.equal(effectiveVerdict(v).decision, 'request_changes');
+    assert.equal(effectiveVerdict(v).blocking.length, 1);
+  });
+}
+
+test('a blocker blocks whatever its category, even when the model said approve', async () => {
+  const sneaky: SecondReviewVerdict = { verdict: 'approve', summary: 'Fine.', findings: [{ severity: 'blocker', category: 'other', file: 'a.ts', line: null, issue: 'deletes user data', suggestion: 'do not' }], specConformance: '' };
+  const d = effectiveVerdict(sneaky);
+  assert.equal(d.decision, 'request_changes');
+  assert.equal(d.overridden, true);
+  const reviewer = new FakeReviewer([sneaky, APPROVE]);
+  const e = env(reviewer);
+  const t = await ready(e);
+  await e.cycle();
+  await e.cycle();
+  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'automerge.rework'").get(), 'reworked, not merged on the first verdict');
+  assert.match(e.runner.calls.filter((c) => c.role === 'coding').map((c) => c.prompt).join('\n'), /deletes user data/);
+  void t;
+});
+
+test('rework feedback carries only the blocking findings, not the nits', async () => {
+  const mixed: SecondReviewVerdict = { verdict: 'request_changes', summary: 'One real bug.', findings: [{ severity: 'major', category: 'bug', file: 'x.ts', line: 9, issue: 'off-by-one in the side pot', suggestion: 'use <=' }, NIT('style')], specConformance: '' };
+  const reviewer = new FakeReviewer([mixed, APPROVE]);
+  const e = env(reviewer);
+  await ready(e);
+  await e.cycle();
+  await e.cycle();
+  const feedback = e.runner.calls.filter((c) => c.role === 'coding').map((c) => c.prompt).join('\n');
+  assert.match(feedback, /off-by-one in the side pot/);
+  assert.doesNotMatch(feedback, /eslint-disable comment/);
+});
+
+test('the reviewer prompt targets bugs and regressions and tells the model not to block on nits', () => {
+  assert.match(SECOND_REVIEW_SYSTEM, /regression: something that worked before/);
+  assert.match(SECOND_REVIEW_SYSTEM, /NOT a reason to request changes/);
+  assert.match(SECOND_REVIEW_SYSTEM, /narrowly scoped lint suppression/);
+  assert.match(SECOND_REVIEW_SYSTEM, /Mechanical gates have ALREADY passed/);
+  assert.deepEqual([...SECOND_REVIEW_JSON_SCHEMA.properties.findings.items.required].includes('category'), true);
 });
