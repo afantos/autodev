@@ -25,7 +25,7 @@ runcmd:
   - curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   - apt-get install -y nodejs
   # GitHub CLI is NOT installed on purpose: agents must not have it.
-  - install -d -o autodev -g autodev /opt/autodev /opt/autodev/instance /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm
+  - install -d -o autodev -g autodev /opt/autodev /opt/autodev/instance /opt/autodev/instance-work /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm
   - apparmor_parser -r /etc/apparmor.d/bwrap
   - ufw default deny incoming
   - ufw allow OpenSSH

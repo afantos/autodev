@@ -116,8 +116,10 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       const base = job.base_branch ?? project.baseBranch ?? (await scm.defaultBranch(job.repo));
       const branch = job.branch ?? `autodev/${job.ticket_identifier.toLowerCase()}-${slugify(ticket.title, 32)}`;
       const { path, reused } = await ws.ensureWorktree(job.repo, job.ticket_identifier, branch, base);
-      updateJob(db, job.id, { base_branch: base, branch, worktree: path }, owner);
-      Object.assign(job, { base_branch: base, branch, worktree: path });
+      const state = ws.trustedState(path);
+      const pinned = { base_branch: base, branch, worktree: path, base_sha: state.base_sha, candidate_sha: state.head_sha };
+      updateJob(db, job.id, pinned, owner);
+      Object.assign(job, pinned);
       if (!reused) {
         for (const cmd of project.setup) {
           const r = await projectCommand(ctx, job, project, cmd, 20 * 60_000, signal);
@@ -134,22 +136,39 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       await implement(ctx, job, ticket, project, signal);
       signal.throwIfAborted();
       await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve implementation before policy checks`);
+      const captured = { candidate_sha: await ws.headSha(job.worktree!), validated_sha: null, reviewed_sha: null, candidate_worktree: null };
+      updateJob(db, job.id, captured, owner);
+      Object.assign(job, captured);
       return requireChangeApproval(ctx, job, project);
 
     case 'validate': {
+      await ws.assertCandidate(job.worktree!, candidate(job));
       await requireChangeApproval(ctx, job, project);
+      const view = await ws.candidateSnapshot(job.worktree!, candidate(job));
+      updateJob(db, job.id, { candidate_worktree: view }, owner);
+      job.candidate_worktree = view;
+      const validationJob = { ...job, worktree: view };
+      for (const cmd of project.setup) {
+        const r = await projectCommand(ctx, validationJob, project, cmd, 20 * 60_000, signal);
+        if (r.code !== 0) return feedbackLoop(ctx, job, 'validation setup', tail(r.stderr || r.stdout, 2000));
+        await ws.assertSnapshot(view, job.worktree!, candidate(job));
+      }
       const failures: string[] = [];
       for (const cmd of project.validate) {
-        const r = await projectCommand(ctx, job, project, cmd, 30 * 60_000, signal);
+        const r = await projectCommand(ctx, validationJob, project, cmd, 30 * 60_000, signal);
         logEvent(db, 'validate', `${cmd} → exit ${r.code}`, { jobId: job.id, ticketId: job.ticket_id, level: r.code ? 'warn' : 'info' });
         if (r.code !== 0) failures.push(`$ ${cmd}\n(exit ${r.code}${r.timedOut ? ', timed out' : ''})\n${tail(r.stdout + '\n' + r.stderr, 4000)}`);
+        await ws.assertCandidate(job.worktree!, candidate(job));
+        await ws.assertSnapshot(view, job.worktree!, candidate(job));
       }
       if (failures.length) return feedbackLoop(ctx, job, 'validation', `The orchestrator ran the project's validation and it failed:\n\n${failures.join('\n\n')}`);
+      updateJob(db, job.id, { validated_sha: candidate(job) }, owner);
       return;
     }
 
     case 'commit': {
-      await ws.commitAll(job.worktree!, `${job.ticket_identifier}: ${ticket.title}\n\nautodev job ${job.id.slice(0, 8)}`);
+      await ws.assertCandidate(job.worktree!, candidate(job));
+      if (job.validated_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'candidate was not validated');
       await requireChangeApproval(ctx, job, project);
       const ahead = await ws.aheadOf(job.worktree!, job.base_branch!);
       if (ahead === 0) throw new Divert('blocked', 'the coding agent produced no changes', { reason: 'no changes were produced', question: 'The agent finished without changing anything. Is this ticket already done, or does it need clarification?', options: ['Close as already done', 'Clarify the ticket and move back to Ready'], recommendation: null, decisionId: null });
@@ -162,9 +181,10 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
     }
 
     case 'push':
-      await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve final changes`);
+      if (job.validated_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'push candidate was not validated');
+      await ws.assertCandidate(job.worktree!, candidate(job));
       await requireChangeApproval(ctx, job, project);
-      await ws.push(job.worktree!, job.branch!, job.repo, { signal, beforePush: () => mayContinue(ctx, job, signal) });
+      await ws.push(job.worktree!, job.branch!, job.repo, { signal, expectedSha: candidate(job), beforePush: () => mayContinue(ctx, job, signal) });
       return;
 
     case 'pr': {
@@ -176,6 +196,7 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
         pr = await scm.createPr(job.repo, { head: job.branch!, base: job.base_branch!, title: `${job.ticket_identifier}: ${ticket.title}`, body, draft: true });
         logEvent(db, 'pr.created', `#${pr.number} ${pr.url}`, { jobId: job.id, ticketId: job.ticket_id });
       }
+      assertPrCandidate(job, pr);
       updateJob(db, job.id, { pr_number: pr.number, pr_url: pr.url }, owner);
       Object.assign(job, { pr_number: pr.number, pr_url: pr.url });
       await tracker.attachLink(ticket.id, pr.url, `PR #${pr.number}`).catch(() => {});
@@ -184,6 +205,7 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
 
     case 'ci': {
       const pr = await scm.getPr(job.repo, job.pr_number!);
+      assertPrCandidate(job, pr);
       const checks = await scm.checks(job.repo, pr, project.requiredChecks);
       if (checks.state === 'pending') throw new Divert('wait_ci', 'waiting for CI');
       if (checks.state === 'failure') {
@@ -197,7 +219,11 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       return review(ctx, job, ticket, project, signal);
 
     case 'handoff': {
+      await ws.assertCandidate(job.worktree!, candidate(job));
+      await ws.assertSnapshot(job.candidate_worktree!, job.worktree!, candidate(job));
+      if (job.reviewed_sha !== candidate(job) || job.validated_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'handoff candidate lacks validation or review');
       const pr = await scm.getPr(job.repo, job.pr_number!);
+      assertPrCandidate(job, pr);
       const preview = await scm.previewUrl(job.repo, pr).catch(() => null);
       if (preview) updateJob(db, job.id, { summary_json: mergeSummary(getJob(db, job.id)!, { preview }) }, owner);
       await mayContinue(ctx, job, signal);
@@ -211,7 +237,18 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
   }
 }
 
+function candidate(job: Job): string {
+  if (!job.candidate_sha || !job.base_sha) throw new WorktreeTamperedError(job.worktree ?? job.id, 'job has no trusted candidate/base hashes');
+  return job.candidate_sha;
+}
+
+function assertPrCandidate(job: Job, pr: PullRequest) {
+  if (pr.headSha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'remote PR HEAD differs from the validated candidate');
+}
+
 async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig) {
+  const state = ctx.ws.trustedState(job.worktree!);
+  if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
   const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
   throw new Divert('blocked', 'mandatory diff policy requires human approval', {
@@ -357,16 +394,22 @@ export async function proposeTicket(ctx: Ctx, job: Job, source: Ticket, title: s
 
 async function review(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConfig, signal: AbortSignal) {
   const { cfg, db, owner, ws } = ctx;
+  await ws.assertCandidate(job.worktree!, candidate(job));
+  if (!job.candidate_worktree) throw new WorktreeTamperedError(job.worktree!, 'missing validated candidate snapshot');
+  await ws.assertSnapshot(job.candidate_worktree, job.worktree!, candidate(job));
   const stat = await ws.diff(job.worktree!, job.base_branch!, true);
   const diff = await ws.diff(job.worktree!, job.base_branch!);
   const weakened = assertionDelta(diff);
   const s = JSON.parse(job.summary_json ?? '{}');
   const prompt = `${docsHint(project)}
-Review branch ${job.branch} against base origin/${job.base_branch} in ${job.repo}.
+Review candidate ${candidate(job)} against trusted base ${job.base_sha} in ${job.repo}.
 ${ticketBlock(ticket)}
 
 Diff stat:
 ${untrusted('git', stat)}
+
+Full diff from the orchestrator's protected object store:
+${untrusted('git-diff', diff)}
 
 Decisions already approved for this ticket (from the decision log — authoritative requirements, do not re-question them):
 ${decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- (${d.authority}) Q: ${d.question}\n  A: ${d.decision}`).join('\n') || '- none'}
@@ -375,11 +418,11 @@ Orchestrator-verified facts:
 - Validation commands passed: ${project.validate.join(', ') || '(none configured)'}
 - CI: ${s.ci ?? 'unknown'}
 ${weakened ? `- WARNING: the diff removes more test assertions than it adds in test files (${weakened}). Scrutinize whether tests were weakened.\n` : ''}
-Inspect the full diff yourself (git diff origin/${job.base_branch}...HEAD) and the surrounding code. Return the structured review.`;
+Review this supplied diff and the surrounding files in this candidate snapshot. It has no .git metadata; use the supplied hashes and diff as the authoritative candidate. Return the structured review.`;
   let res: AgentRunResult;
   try {
     res = await runAgent(ctx, {
-      role: 'review', prompt, systemAppend: REVIEW_SYSTEM, cwd: job.worktree!, model: cfg.models.review, mode: 'review',
+      role: 'review', prompt, systemAppend: REVIEW_SYSTEM, cwd: job.candidate_worktree, model: cfg.models.review, mode: 'review', fileOnly: true,
       outputSchema: jsonSchema(ReviewSchema), maxTurns: 80, timeoutMs: 30 * 60_000, sandbox: cfg.sandbox,
       signal,
     }, { jobId: job.id, ticketId: ticket.id });
@@ -387,6 +430,8 @@ Inspect the full diff yourself (git diff origin/${job.base_branch}...HEAD) and t
     if (e instanceof RunGateClosed) throw new Divert('requeue', e.why);
     throw e;
   }
+  await ws.assertCandidate(job.worktree!, candidate(job));
+  await ws.assertSnapshot(job.candidate_worktree, job.worktree!, candidate(job));
   if (!res.ok) throw new AgentFailure(res);
   const parsed = ReviewSchema.safeParse(res.structured);
   if (!parsed.success) throw new AgentFailure({ ...res, ok: false, errorKind: 'structured_output', error: parsed.error.message });
@@ -397,7 +442,7 @@ Inspect the full diff yourself (git diff origin/${job.base_branch}...HEAD) and t
   for (const f of r.followUps.slice(0, 3)) await proposeTicket(ctx, job, ticket, f.title, f.description).catch(() => {});
   void diff;
 
-  if (r.outcome === 'approved') return;
+  if (r.outcome === 'approved') { updateJob(db, job.id, { reviewed_sha: candidate(job) }, owner); return; }
   if (r.outcome === 'blocked') {
     throw new Divert('blocked', 'review needs a human decision', { reason: 'the review agent raised a question that needs a human', question: r.blockingQuestion ?? r.summary, options: [], recommendation: null, decisionId: null });
   }

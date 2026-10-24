@@ -34,6 +34,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_ticket ON jobs(ticket_id)
   WHERE status IN ('queued','running','waiting_ci','awaiting_merge','blocked');
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 
+-- Authoritative object stores and hashes are outside the agent-visible workspace.
+CREATE TABLE IF NOT EXISTS git_states (
+  worktree TEXT PRIMARY KEY, git_dir TEXT NOT NULL, base_sha TEXT NOT NULL,
+  head_sha TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY,
   ticket_id TEXT, ticket_identifier TEXT, repo TEXT NOT NULL,
@@ -104,6 +110,10 @@ export function openDb(path: string): Db {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(SCHEMA);
+  const columns = new Set((db.prepare('PRAGMA table_info(jobs)').all() as { name: string }[]).map(c => c.name));
+  for (const name of ['base_sha', 'candidate_sha', 'validated_sha', 'reviewed_sha', 'candidate_worktree']) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} TEXT`);
+  }
   return db;
 }
 
@@ -224,7 +234,7 @@ export function expiredLeases(db: Db): Job[] {
   return db.prepare(`SELECT * FROM jobs WHERE status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?)`).all(now()) as unknown as Job[];
 }
 
-const JOB_COLS = new Set(['status', 'stage', 'branch', 'base_branch', 'worktree', 'pr_number', 'pr_url', 'session_id', 'attempts', 'fix_attempts', 'review_cycles', 'decision_count', 'lease_owner', 'lease_expires_at', 'heartbeat_at', 'cost_usd', 'pending_feedback', 'blocked_reason', 'error', 'summary_json']);
+const JOB_COLS = new Set(['status', 'stage', 'branch', 'base_branch', 'worktree', 'pr_number', 'pr_url', 'session_id', 'attempts', 'fix_attempts', 'review_cycles', 'decision_count', 'lease_owner', 'lease_expires_at', 'heartbeat_at', 'cost_usd', 'pending_feedback', 'blocked_reason', 'error', 'summary_json', 'base_sha', 'candidate_sha', 'validated_sha', 'reviewed_sha', 'candidate_worktree']);
 
 /** Update job fields. If `owner` is given, the update only applies while that owner holds the lease. */
 export function updateJob(db: Db, id: string, patch: Partial<Job>, owner?: string): boolean {

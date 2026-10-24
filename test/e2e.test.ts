@@ -104,7 +104,7 @@ test('fix attempts are bounded → Failed, work preserved on the branch', async 
   const j = job(env, t.identifier);
   assert.equal(j.status, 'failed');
   assert.equal((await env.tracker.getTicket(t.id))!.status, 'failed');
-  assert.match(execFileSync('git', ['show', 'HEAD:CHANGES.md'], { cwd: j.worktree }).toString(), /BROKEN/, 'WIP preserved locally');
+  assert.match(await env.ctx.ws.git(j.worktree, ['show', `${await env.ctx.ws.headSha(j.worktree)}:CHANGES.md`]), /BROKEN/, 'WIP preserved in the protected object store');
 });
 
 const callTool = (spec: AgentRunSpec, name: string, args: Record<string, unknown>) => spec.tools!.find((x) => x.name === name)!.handler(args);

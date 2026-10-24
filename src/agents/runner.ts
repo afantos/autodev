@@ -41,6 +41,8 @@ export interface AgentRunSpec {
   protectedPaths?: string[];
   repository?: string;
   gitReadPaths?: string[];
+  /** Review a separate candidate file snapshot, with no agent-visible git repository. */
+  fileOnly?: boolean;
 }
 
 export type AgentErrorKind = 'rate_limited' | 'budget' | 'max_turns' | 'timeout' | 'auth' | 'api' | 'structured_output' | 'other';
@@ -96,8 +98,9 @@ const WRITE_TOOLS = ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'MultiEdit', 'Note
 
 /**
  * OS sandbox for the agent's Bash commands. Whole trees are denied (HOME, config, state) and the worktree
- * lives outside all of them, so ordinary commands can resolve their cwd. Git metadata is readable for
- * status/diff/log but nothing outside the worktree is writable, and the worktree's .git pointer is not.
+ * lives outside all of them. Coding agents can read a disposable git reference checkout. The SDK may
+ * implicitly grant writes to some git metadata despite allowWrite=[], so that checkout is untrusted;
+ * authoritative objects/hashes stay in protected state and are never granted to the agent.
  */
 export function agentSandbox(spec: Pick<AgentRunSpec, 'cwd' | 'mode' | 'sandbox' | 'protectedPaths' | 'gitReadPaths'>): NonNullable<Options['sandbox']> {
   return {
@@ -125,6 +128,7 @@ function runtimeRoot(): string {
 export function commandToolEnv(cwd: string): Record<string, string> {
   return {
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_OPTIONAL_LOCKS: '0',
     NPM_CONFIG_USERCONFIG: '/dev/null', npm_config_cache: join(cwd, '.autodev-cache', 'npm'), npm_config_update_notifier: 'false',
   };
 }

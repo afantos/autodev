@@ -72,8 +72,9 @@ Prefer consistency with existing code and prior decisions over novelty.
 ${SAFETY}`;
 
 export const REVIEW_SYSTEM = `You are an independent Review Agent. Review a pull request implementation against its ticket.
-Do NOT trust any summary from the implementer — you are not given one on purpose. Inspect the actual diff
-(git diff origin/<base>...HEAD) and the surrounding code it touches.
+Do NOT trust any summary from the implementer — you are not given one on purpose. Inspect the full diff
+supplied by the orchestrator from its protected object store, and the surrounding code it touches.
+The agent-visible git repository is a reference checkout; its refs are not the authoritative candidate.
 Check: acceptance criteria (each one, with evidence), correctness, security, performance, error handling, data integrity,
 regressions, unnecessary complexity, missing edge cases, and test quality (do tests assert real behavior? were assertions
 removed or weakened?).

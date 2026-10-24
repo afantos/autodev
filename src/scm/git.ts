@@ -1,20 +1,24 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import { run, runOk } from '../exec.ts';
 import type { Scm } from './types.ts';
 import { scanSecrets, UnsafePushError } from '../secrets.ts';
+import { createHash } from 'node:crypto';
+import type { Db } from '../db.ts';
 
 /**
  * Settings forced on every orchestrator git command. Repository content (and anything an agent or a
  * validation command wrote into a worktree) must never be able to make the orchestrator execute code.
  */
 const HARDENING = [
+  '--no-replace-objects',
   '-c', 'core.hooksPath=/dev/null',     // no hooks (post-commit/reference-transaction ignore --no-verify)
   '-c', 'core.fsmonitor=false',         // fsmonitor runs a configured command on status/add
   '-c', 'core.untrackedCache=false',
   '-c', 'protocol.ext.allow=never',
   '-c', 'submodule.recurse=false',
   '-c', 'credential.helper=',
+  '-c', 'core.replaceRefs=false',
 ];
 
 /** Minimal environment: no orchestrator secrets, no user/system git config. */
@@ -36,18 +40,23 @@ export class WorktreeTamperedError extends Error {
 
 /** Trusted record of a worktree's git locations, written by the orchestrator before any agent runs. */
 interface WorktreeRecord { repo: string; worktree: string; gitDir: string; commonDir: string }
+export interface GitState { worktree: string; git_dir: string; base_sha: string; head_sha: string }
+interface CandidateRecord { source: string; path: string; sha: string; files: Record<string, string> }
 
 /**
- * One cached clone per repo and one worktree per job, under workspaceDir. The orchestrator never lets git
- * discover its repository from a worktree: every command gets explicit --git-dir/--work-tree taken from
- * the trusted record in dataDir, after verifying the on-disk pointers still match.
+ * Agent-visible reference clones/worktrees live under workspaceDir and are untrusted.
+ * Each worktree also has an independent private repository under dataDir. Orchestrator
+ * commands verify the public pointers/refs, then use the private git directory and index.
+ * Authoritative base/head hashes are held in SQLite; agent-writable objects are never imported.
  */
 export class Workspaces {
   dataDir: string;
   workspaceDir: string;
   scm: Scm;
+  db: Db;
   private locks = new Map<string, Promise<unknown>>();
-  constructor(dataDir: string, workspaceDir: string, scm: Scm) { this.dataDir = dataDir; this.workspaceDir = workspaceDir; this.scm = scm; }
+  private clones = new Map<string, string>();
+  constructor(dataDir: string, workspaceDir: string, scm: Scm, db: Db) { this.dataDir = dataDir; this.workspaceDir = workspaceDir; this.scm = scm; this.db = db; }
 
   /** Serialize operations that touch a repo's shared clone (refs, packed-refs, worktree metadata). */
   withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
@@ -57,7 +66,7 @@ export class Workspaces {
     return next;
   }
 
-  repoDir(repo: string) { return join(this.workspaceDir, 'repos', repo.replace(/[^A-Za-z0-9._-]+/g, '__')); }
+  repoDir(repo: string) { const dir = join(this.workspaceDir, 'repos', repo.replace(/[^A-Za-z0-9._-]+/g, '__')); this.clones.set(resolve(dir), repo); return dir; }
   worktreeDir(identifier: string) { return join(this.workspaceDir, 'worktrees', identifier); }
   private recordPath(worktree: string) { return join(this.dataDir, 'worktree-records', `${basename(worktree)}.json`); }
   private gitHome() { const h = join(this.dataDir, 'git-home'); mkdirSync(h, { recursive: true }); return h; }
@@ -68,9 +77,10 @@ export class Workspaces {
     const abs = resolve(cwd);
     if (this.isWorktreePath(abs)) {
       const rec = this.verifiedRecord(abs);
-      return [`--git-dir=${rec.gitDir}`, `--work-tree=${rec.worktree}`];
+      this.verifyRefs(rec.repo);
+      return [`--git-dir=${this.trustedState(abs).git_dir}`, `--work-tree=${rec.worktree}`];
     }
-    // A clone owned by the orchestrator: a plain .git directory that agents and commands can never write.
+    // Disposable reference clones are used for worktree creation, never policy/scan/push ranges.
     if (!abs.startsWith(join(this.workspaceDir, 'repos') + sep)) throw new Error(`refusing git in unmanaged directory ${abs}`);
     return [`--git-dir=${join(abs, '.git')}`];
   }
@@ -95,6 +105,74 @@ export class Workspaces {
     return rec;
   }
 
+  trustedState(worktree: string): GitState {
+    const state = this.db.prepare('SELECT * FROM git_states WHERE worktree = ?').get(realpathSync(worktree)) as unknown as GitState | undefined;
+    if (!state || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(state.base_sha) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(state.head_sha)) {
+      throw new WorktreeTamperedError(worktree, 'missing trusted hashes; existing workspaces require explicit migration');
+    }
+    return state;
+  }
+
+  private refsPath(repo: string) { return join(this.dataDir, 'git-ref-records', `${createHash('sha256').update(repo).digest('hex')}.json`); }
+
+  /** Hash raw ref files, never resolve them through agent-controlled git config. */
+  private refsDigest(repo: string): string {
+    const common = join(this.repoDir(repo), '.git');
+    const records: string[][] = [];
+    const visit = (p: string) => {
+      const name = p.slice(common.length);
+      const stat = lstatSync(p, { throwIfNoEntry: false });
+      if (!stat) { records.push([name, 'missing']); return; }
+      if (stat.isSymbolicLink()) throw new WorktreeTamperedError(common, 'symbolic link in ref metadata');
+      if (stat.isDirectory()) { records.push([name, 'directory']); for (const n of readdirSync(p).sort()) visit(join(p, n)); }
+      else if (stat.isFile()) records.push([name, 'file', createHash('sha256').update(readFileSync(p)).digest('hex')]);
+      else throw new WorktreeTamperedError(common, 'non-file ref metadata');
+    };
+    for (const name of ['HEAD', 'packed-refs', 'refs']) visit(join(common, name));
+    const worktrees = join(common, 'worktrees');
+    if (existsSync(worktrees)) for (const name of readdirSync(worktrees).sort()) visit(join(worktrees, name, 'HEAD'));
+    return createHash('sha256').update(JSON.stringify(records)).digest('hex');
+  }
+
+  private saveRefs(repo: string) {
+    mkdirSync(join(this.dataDir, 'git-ref-records'), { recursive: true });
+    writeFileSync(this.refsPath(repo), JSON.stringify({ digest: this.refsDigest(repo) }));
+  }
+
+  verifyRefs(repo: string) {
+    if (!existsSync(this.refsPath(repo))) throw new WorktreeTamperedError(this.repoDir(repo), 'no trusted ref snapshot');
+    const expected = JSON.parse(readFileSync(this.refsPath(repo), 'utf8')).digest;
+    if (this.refsDigest(repo) !== expected) throw new WorktreeTamperedError(this.repoDir(repo), 'unexpected ref or HEAD change');
+  }
+
+  verifyAgentWorkspace(worktree: string): Promise<void> {
+    const rec = this.verifiedRecord(worktree);
+    return this.withRepoLock(rec.repo, async () => { this.verifiedRecord(worktree); this.verifyRefs(rec.repo); });
+  }
+
+  /** Independent authenticated clone: no hardlinks, alternates or imports from agent-writable objects. */
+  private async provisionTrusted(repo: string, path: string, base: string, branch?: string) {
+    const dir = join(this.dataDir, 'trusted-git', basename(path));
+    if (existsSync(dir)) throw new WorktreeTamperedError(path, 'unregistered private object store already exists');
+    mkdirSync(join(this.dataDir, 'trusted-git'), { recursive: true });
+    await runOk('git', [...HARDENING, ...this.scm.gitAuthArgs(), 'clone', '--no-checkout', '--no-local', this.scm.cloneUrl(repo), dir], { env: gitEnv(this.gitHome()), timeoutMs: 900_000 });
+    const gitDir = join(dir, '.git');
+    const git = (args: string[]) => runOk('git', [...HARDENING, `--git-dir=${gitDir}`, `--work-tree=${path}`, ...args], { cwd: path, env: gitEnv(this.gitHome()), timeoutMs: 300_000 });
+    const baseSha = (await git(['rev-parse', '--verify', `${base}^{commit}`])).trim();
+    let headSha = baseSha;
+    if (branch) {
+      const remote = await run('git', [...HARDENING, `--git-dir=${gitDir}`, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}^{commit}`], { env: gitEnv(this.gitHome()) });
+      if (remote.code === 0) headSha = remote.stdout.trim();
+      await git(['symbolic-ref', 'HEAD', `refs/heads/${branch}`]);
+    }
+    await git(['update-ref', 'HEAD', headSha]);
+    await git(['config', 'user.name', 'autodev[bot]']);
+    await git(['config', 'user.email', 'autodev-bot@users.noreply.github.com']);
+    appendFileSync(join(gitDir, 'info', 'exclude'), '\n/.autodev-cache/\n');
+    await git(['read-tree', '--reset', '-u', headSha]);
+    this.db.prepare('INSERT INTO git_states VALUES (?,?,?,?)').run(realpathSync(path), gitDir, baseSha, headSha);
+  }
+
   /** Record a freshly created worktree (nothing else has run in it yet, so its pointer is trusted now). */
   private register(repo: string, worktree: string) {
     const real = realpathSync(worktree);
@@ -113,11 +191,19 @@ export class Workspaces {
     writeFileSync(join(real, '.git'), `gitdir: ${gitDir}\n`);
   }
 
-  git(cwd: string, args: string[], auth = false, timeoutMs = 300_000, signal?: AbortSignal) {
-    return runOk('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs, signal });
+  async git(cwd: string, args: string[], auth = false, timeoutMs = 300_000, signal?: AbortSignal) {
+    const repo = this.clones.get(resolve(cwd));
+    if (repo) this.verifyRefs(repo);
+    const result = await runOk('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs, signal });
+    if (repo) this.saveRefs(repo);
+    return result;
   }
-  gitRaw(cwd: string, args: string[], auth = false) {
-    return run('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs: 300_000 });
+  async gitRaw(cwd: string, args: string[], auth = false) {
+    const repo = this.clones.get(resolve(cwd));
+    if (repo) this.verifyRefs(repo);
+    const result = await run('git', [...HARDENING, ...(auth ? this.scm.gitAuthArgs() : []), ...this.gitDirArgs(cwd), ...args], { cwd, env: gitEnv(this.gitHome()), timeoutMs: 300_000 });
+    if (repo) this.saveRefs(repo);
+    return result;
   }
 
   ensureClone(repo: string): Promise<string> {
@@ -129,7 +215,8 @@ export class Workspaces {
     if (existsSync(dir) && !existsSync(join(dir, '.git'))) rmSync(dir, { recursive: true, force: true }); // interrupted clone
     if (!existsSync(join(dir, '.git'))) {
       mkdirSync(join(this.workspaceDir, 'repos'), { recursive: true });
-      await runOk('git', [...HARDENING, ...this.scm.gitAuthArgs(), 'clone', '--no-checkout', this.scm.cloneUrl(repo), dir], { env: gitEnv(this.gitHome()), timeoutMs: 900_000 });
+      await runOk('git', [...HARDENING, ...this.scm.gitAuthArgs(), 'clone', '--no-checkout', '--no-local', this.scm.cloneUrl(repo), dir], { env: gitEnv(this.gitHome()), timeoutMs: 900_000 });
+      this.saveRefs(repo);
       await this.git(dir, ['config', 'user.name', 'autodev[bot]']);
       await this.git(dir, ['config', 'user.email', 'autodev-bot@users.noreply.github.com']);
       // Per-job tool caches live in the worktree (outside the agent's denied HOME) and must never be committed.
@@ -156,7 +243,7 @@ export class Workspaces {
   private async ensureWorktreeUnlocked(repo: string, identifier: string, branch: string, base: string): Promise<{ path: string; reused: boolean }> {
     const repoDir = await this.ensureCloneUnlocked(repo);
     const path = this.worktreeDir(identifier);
-    if (existsSync(join(path, '.git'))) { this.verifiedRecord(path); return { path, reused: true }; }
+    if (existsSync(join(path, '.git'))) { this.verifiedRecord(path); this.trustedState(path); return { path, reused: true }; }
     mkdirSync(join(this.workspaceDir, 'worktrees'), { recursive: true });
     await this.git(repoDir, ['worktree', 'prune']);
     const localExists = (await this.gitRaw(repoDir, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])).code === 0;
@@ -164,6 +251,7 @@ export class Workspaces {
     else if (await this.remoteBranchExists(repoDir, branch)) await this.git(repoDir, ['worktree', 'add', '-b', branch, path, `origin/${branch}`]);
     else await this.git(repoDir, ['worktree', 'add', '--no-track', '-b', branch, path, `origin/${base}`]);
     this.register(repo, path);
+    await this.provisionTrusted(repo, path, `origin/${base}`, branch);
     return { path, reused: localExists };
   }
 
@@ -174,6 +262,7 @@ export class Workspaces {
       mkdirSync(join(this.workspaceDir, 'worktrees'), { recursive: true });
       await this.git(this.repoDir(repo), ['worktree', 'add', '--detach', path, ref]);
       this.register(repo, path);
+      await this.provisionTrusted(repo, path, ref);
       return path;
     });
   }
@@ -186,24 +275,29 @@ export class Workspaces {
     if (!(await this.status(path)).trim()) return false;
     await this.git(path, ['add', '-A']);
     await this.git(path, ['commit', '-m', message, '--no-verify']);
+    const head = (await this.git(path, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+    this.db.prepare('UPDATE git_states SET head_sha = ? WHERE worktree = ?').run(head, realpathSync(path));
     return true;
   }
 
-  async headSha(path: string): Promise<string> { return (await this.git(path, ['rev-parse', 'HEAD'])).trim(); }
+  async headSha(path: string): Promise<string> { this.verifiedRecord(path); this.verifyRefs(this.verifiedRecord(path).repo); return this.trustedState(path).head_sha; }
 
   async aheadOf(path: string, base: string): Promise<number> {
-    return Number((await this.git(path, ['rev-list', '--count', `origin/${base}..HEAD`])).trim());
+    const state = this.trustedState(path);
+    return Number((await this.git(path, ['rev-list', '--count', `${state.base_sha}..${state.head_sha}`])).trim());
   }
 
   async fetch(path: string) { await this.git(path, ['fetch', 'origin'], true); }
 
   /** Push without force. Returns false (and the message) if the remote rejected the push. */
-  async push(path: string, branch: string, repo?: string, control: { signal?: AbortSignal; beforePush?: () => Promise<unknown> } = {}): Promise<void> {
+  async push(path: string, branch: string, repo?: string, control: { signal?: AbortSignal; beforePush?: () => Promise<unknown>; expectedSha?: string } = {}): Promise<void> {
     const doPush = async () => {
       const sha = await this.headSha(path);
+      if (!control.expectedSha || control.expectedSha !== sha) throw new WorktreeTamperedError(path, 'push does not match the validated candidate');
+      await this.assertCandidate(path, sha);
       // Scan every outgoing commit, including secrets subsequently removed. Pin the
       // scanned SHA so a concurrent HEAD change cannot swap in unscanned content.
-      const commits = (await this.git(path, ['rev-list', sha, '--not', '--remotes=origin'])).trim().split('\n').filter(Boolean);
+      const commits = (await this.git(path, ['rev-list', `${this.trustedState(path).base_sha}..${sha}`])).trim().split('\n').filter(Boolean);
       for (const commit of commits) {
         const patch = await this.git(path, ['show', '--format=', '--root', '--diff-merges=separate', '--no-ext-diff', '--no-textconv', commit]);
         const secrets = scanSecrets(patch);
@@ -211,6 +305,7 @@ export class Workspaces {
       }
       control.signal?.throwIfAborted();
       await control.beforePush?.();
+      await this.assertCandidate(path, sha);
       control.signal?.throwIfAborted();
       await this.git(path, ['push', '--set-upstream', 'origin', `${sha}:refs/heads/${branch}`], true, 300_000, control.signal);
     };
@@ -218,11 +313,80 @@ export class Workspaces {
   }
 
   async diff(path: string, base: string, stat = false): Promise<string> {
-    return this.git(path, ['diff', ...(stat ? ['--stat'] : []), `origin/${base}...HEAD`]);
+    const state = this.trustedState(path);
+    return this.git(path, ['diff', '--no-ext-diff', '--no-textconv', ...(stat ? ['--stat'] : []), `${state.base_sha}...${state.head_sha}`]);
   }
 
   async changedFiles(path: string, base: string): Promise<string[]> {
-    return (await this.git(path, ['diff', '--name-only', `origin/${base}...HEAD`])).split('\n').filter(Boolean);
+    const state = this.trustedState(path);
+    return (await this.git(path, ['diff', '--name-only', `${state.base_sha}...${state.head_sha}`])).split('\n').filter(Boolean);
+  }
+
+  async assertCandidate(path: string, sha: string): Promise<void> {
+    const state = this.trustedState(path);
+    if (state.head_sha !== sha || (await this.status(path)).trim()) throw new WorktreeTamperedError(path, 'candidate or working files changed after capture');
+    const head = (await this.git(path, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+    if (head !== sha) throw new WorktreeTamperedError(path, 'private HEAD differs from trusted candidate');
+  }
+
+  private candidateRecordPath(path: string) { return join(this.dataDir, 'candidate-records', `${basename(path)}.json`); }
+
+  private fileDigest(path: string): string {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return `link:${createHash('sha256').update(readlinkSync(path, { encoding: 'buffer' })).digest('hex')}`;
+    if (!stat.isFile()) throw new WorktreeTamperedError(path, 'candidate path is not a regular file or symlink');
+    return `file:${stat.mode & 0o111}:${createHash('sha256').update(readFileSync(path)).digest('hex')}`;
+  }
+
+  /** Checkout from private objects, without .git or shared metadata. The coder cannot write this sibling. */
+  async candidateSnapshot(source: string, sha: string): Promise<string> {
+    await this.assertCandidate(source, sha);
+    const path = join(this.workspaceDir, 'candidates', `${basename(source)}-${sha}`);
+    if (existsSync(path)) { await this.assertSnapshot(path, source, sha); return path; }
+    mkdirSync(path, { recursive: true });
+    const entries = (await this.git(source, ['ls-tree', '-r', '-z', sha])).split('\0').filter(Boolean);
+    const names: string[] = [];
+    for (const entry of entries) {
+      const tab = entry.indexOf('\t');
+      const [mode, type] = entry.slice(0, tab).split(' ');
+      const name = entry.slice(tab + 1);
+      if (type !== 'blob' || !['100644', '100755', '120000'].includes(mode) || name.split('/').some(p => !p || p === '.' || p === '..' || p === '.git')) {
+        throw new WorktreeTamperedError(source, 'unsupported candidate tree entry (including submodules)');
+      }
+      names.push(name);
+    }
+    await this.git(source, ['checkout-index', '--all', '--force', `--prefix=${path}${sep}`]);
+    const files: Record<string, string> = {};
+    for (const name of names) files[name] = this.fileDigest(join(path, name));
+    const record: CandidateRecord = { source: realpathSync(source), path: realpathSync(path), sha, files };
+    mkdirSync(join(this.dataDir, 'candidate-records'), { recursive: true });
+    writeFileSync(this.candidateRecordPath(path), JSON.stringify(record));
+    return path;
+  }
+
+  verifySnapshot(path: string, source: string, sha: string): void {
+    try {
+      const record = JSON.parse(readFileSync(this.candidateRecordPath(path), 'utf8')) as CandidateRecord;
+      if (record.path !== realpathSync(path) || record.source !== realpathSync(source) || record.sha !== sha) throw new Error('candidate provenance mismatch');
+      for (const [name, digest] of Object.entries(record.files)) {
+        let parent = path;
+        for (const part of name.split('/').slice(0, -1)) {
+          parent = join(parent, part);
+          const stat = lstatSync(parent);
+          if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`candidate directory changed: ${name}`);
+        }
+        if (this.fileDigest(join(path, name)) !== digest) throw new Error(`candidate file changed: ${name}`);
+      }
+      if (lstatSync(join(path, '.git'), { throwIfNoEntry: false })) throw new Error('git metadata in candidate snapshot');
+    } catch (e) { throw new WorktreeTamperedError(path, `candidate snapshot invalid: ${String((e as Error).message)}`); }
+  }
+
+  async assertSnapshot(path: string, source: string, sha: string): Promise<void> {
+    this.verifySnapshot(path, source, sha);
+    // Detect additional source/config inputs as well as edits to tracked files.
+    // Build outputs and dependency caches must be ignored by the approved tree.
+    const changes = await this.git(source, [`--work-tree=${path}`, 'status', '--porcelain', '--untracked-files=all']);
+    if (changes.trim()) throw new WorktreeTamperedError(path, `candidate snapshot invalid: unexpected files or index changes: ${changes.slice(0, 500)}`);
   }
 
   /** Remove a worktree only when it has no uncommitted changes. Never deletes unfinished work. */
@@ -237,10 +401,23 @@ export class Workspaces {
 
   private async removeUnlocked(repo: string, path: string, force: boolean): Promise<boolean> {
     if (!existsSync(path)) return true;
+    const canonical = realpathSync(path);
     if (!force && (await this.status(path)).trim()) return false;
-    await this.gitRaw(this.repoDir(repo), ['worktree', 'remove', ...(force ? ['--force'] : []), path]);
+    const records = join(this.dataDir, 'candidate-records');
+    if (existsSync(records)) for (const name of readdirSync(records)) {
+      const file = join(records, name);
+      const rec = JSON.parse(readFileSync(file, 'utf8')) as CandidateRecord;
+      if (rec.source !== canonical) continue;
+      try { this.verifySnapshot(rec.path, path, rec.sha); }
+      catch { continue; } // preserve an unexpectedly modified snapshot for inspection
+      rmSync(rec.path, { recursive: true, force: true });
+      rmSync(file);
+    }
+    await this.gitRaw(this.repoDir(repo), ['worktree', 'remove', '--force', path]);
     if (existsSync(path)) rmSync(path, { recursive: true, force: true });
     rmSync(this.recordPath(path), { force: true });
+    const state = this.db.prepare('SELECT * FROM git_states WHERE worktree = ?').get(canonical) as unknown as GitState | undefined;
+    if (state) { rmSync(resolve(state.git_dir, '..'), { recursive: true, force: true }); this.db.prepare('DELETE FROM git_states WHERE worktree = ?').run(canonical); }
     return true;
   }
 }

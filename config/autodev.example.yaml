@@ -7,6 +7,9 @@
 #   AUTODEV_REPORT_WEBHOOK    optional ntfy/Slack webhook for the morning report
 
 dataDir: ./data
+# Defaults to a sibling of the configuration folder, e.g. /opt/autodev/instance-work.
+# Must be outside HOME, the config directory, and dataDir.
+# workspaceDir: /opt/autodev/instance-work
 tracker: linear        # linear | local (simulation)
 scm: github            # github | local (simulation)
 runner: claude         # claude | fake (no AI, for dry runs)

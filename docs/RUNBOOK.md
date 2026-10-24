@@ -34,14 +34,14 @@
 
 - `autodev status` lists jobs, stages, errors and pauses.
 - The dashboard's per-job log shows every event for a job.
-- Each job's worktree lives in `data/worktrees/<TICKET>`. Blocked, failed and canceled work is committed locally and is never pushed by failure handling. Inspect it on the host; do not assume it exists remotely.
+- Each job's worktree lives in `<workspaceDir>/worktrees/<TICKET>`. Blocked, failed and canceled work is committed locally and is never pushed by failure handling. Inspect it on the host; do not assume it exists remotely. Agent-visible git refs are a disposable reference checkout and do not advance when the orchestrator commits. The authoritative commit and private `git_dir` are in the protected `git_states` table. Operators can inspect that store explicitly with `git --git-dir=<git_dir> --work-tree=<worktree> show <head_sha>`; never expose it to an agent.
 - A secret in any outgoing commit prevents every push, even if a later commit removes it. Remove the credential from the entire unpublished history before retrying.
 - `autodev usage` lists durable budget reservations. Unknown results and crashed runs retain their reservation; `resume` does not erase it. Reconcile actual provider usage before manually settling a reservation and recording its cost. Never delete an unsettled reservation just to unblock spending.
-- Run `AUTODEV_REQUIRE_SANDBOX_TEST=1 node --test test/regressions.test.ts` on the target host before connecting accounts. This makes unavailable OS isolation a test failure rather than a skip. Setup and validation fail closed and have no network access.
+- Run `AUTODEV_REQUIRE_SANDBOX_TEST=1 npm run check` on the target host before connecting accounts. This makes unavailable OS isolation a test failure rather than a skip. Setup and validation fail closed and have no network access.
 - Retry a Failed ticket by moving it to Ready. A new job continues on the existing branch.
 - Inspect state: `sqlite3 data/autodev.db 'select ticket_identifier,status,stage,error from jobs order by updated_at desc limit 20'`.
 - Back up state: `sqlite3 data/autodev.db ".backup data/backup.db"`. The database is WAL mode, so
-  this is safe while running.
+  this is safe while running. Also preserve the private object stores under `data/trusted-git` and the candidate/ref records; a database backup alone is insufficient to recover unpublished commits. Stop work while taking a consistent full backup.
 
 ## Local simulation (no Linear or GitHub; optional real Claude)
 
@@ -69,3 +69,11 @@ cd /opt/autodev/app && git pull && npm ci && npm run check && sudo systemctl res
 ```
 
 After restarting, inspect queued work and unsettled budget reservations. Leases and stages preserve progress; remote writes are retried and reconciliation checks merges before marking Done.
+
+## Trusted-hash security blocks
+
+- `security.worktree_tampered` includes changed `.git` pointers, refs, `packed-refs`, HEAD, candidate files, missing trusted state, and remote PR head drift. A security block preserves files and publishes nothing further. Inspect the recorded event before retrying.
+- Shared ref snapshots are checked after every coding, planning, decision and review run. Disposable object corruption cannot alter the private policy/scan range; it may still break the agent's own git commands and require rebuilding that reference checkout.
+- Agents must leave edits uncommitted. A habitual `git commit` or `git stash` changes refs and blocks the job even when the edits are otherwise valid. Keep the event for inspection; do not disable the guard to accommodate it. A real-Claude smoke run is still needed to measure how often agents follow this contract.
+- Jobs record `base_sha`, `candidate_sha`, `validated_sha`, `reviewed_sha` and `candidate_worktree`. Validation and review use the separate candidate snapshot; the remote PR must have the same candidate SHA. No new commit is made after validation.
+- Keep Ubuntu VM verification explicitly outstanding until the required suite passes on the actual kernel/AppArmor setup. No new live-Claude evidence was gathered for this change.

@@ -9,7 +9,7 @@ import type { AgentRunSpec } from '../src/agents/runner.ts';
 import { ClaudeRunner } from '../src/agents/runner.ts';
 import { runAgent, RunGateClosed } from '../src/context.ts';
 import { canStartRun, reserveBudget } from '../src/budget.ts';
-import { openDb, spentSince, getJob } from '../src/db.ts';
+import { openDb, spentSince, getJob, updateJob } from '../src/db.ts';
 import { answerBlocked } from '../src/pipeline.ts';
 import { draftPlan, publishPlan } from '../src/planning.ts';
 import { commandEnv, runSandboxed } from '../src/command-sandbox.ts';
@@ -28,11 +28,11 @@ test('a detected secret blocks without publishing WIP', async () => {
   await e.cycle();
   const j = job(e, t.identifier);
   assert.equal(j.status, 'blocked');
-  assert.match(git(j.worktree, 'show', 'HEAD:CHANGES.md'), /ghp_A/);
+  assert.match(await e.ctx.ws.git(j.worktree, ['show', `${await e.ctx.ws.headSha(j.worktree)}:CHANGES.md`]), /ghp_A/);
   assert.equal(git(e.repo, 'for-each-ref', '--format=%(refname)', 'refs/heads/autodev/'), '');
 });
 
-test('push scans intermediate commits even when the final diff contains no secret', async () => {
+test('agent-created intermediate commits are rejected before they can be published', async () => {
   const e = makeEnv({ behaviors: { coding: async (s, n) => {
     writeFileSync(join(s.cwd, 'secret.txt'), syntheticKey());
     git(s.cwd, 'add', '-A'); git(s.cwd, 'commit', '-m', 'synthetic credential');
@@ -56,7 +56,7 @@ test('setup receives no inherited cloud, Anthropic or arbitrary host secrets', a
     const coder = e.runner.calls.find(s => s.role === 'coding')!;
     const reviewer = e.runner.calls.find(s => s.role === 'review')!;
     assert.ok(coder.gitReadPaths?.length, 'shared git metadata is readable without opening all orchestrator state');
-    assert.ok(reviewer.gitReadPaths?.length);
+    assert.deepEqual(reviewer.gitReadPaths, [], 'review uses the supplied diff and a file-only candidate snapshot');
     assert.equal('gitWritePaths' in coder, false, 'agents get no git metadata write grant; the orchestrator commits');
     assert.equal(commandEnv().ANTHROPIC_API_KEY, undefined);
     assert.throws(() => commandEnv({ AWS_ACCESS_KEY_ID: 'fake' }), /Refusing/);
@@ -157,7 +157,8 @@ test('policy approval is bound to the reviewed diff; later changes require new a
   const j = job(e, t.identifier);
   await answerBlocked(e.ctx, getJob(e.ctx.db, j.id)!, 'approve');
   writeFileSync(join(j.worktree, 'package.json'), '{"dependencies":{"second":"1"}}');
-  git(j.worktree, 'add', '-A'); git(j.worktree, 'commit', '-m', 'different dependency');
+  await e.ctx.ws.commitAll(j.worktree, 'different dependency captured by the orchestrator');
+  updateJob(e.ctx.db, j.id, { candidate_sha: await e.ctx.ws.headSha(j.worktree) });
   await e.cycle();
   assert.equal(job(e, t.identifier).status, 'blocked');
   assert.match(job(e, t.identifier).blocked_reason, /second/);
@@ -183,12 +184,12 @@ test('dependency lockfile edits cannot bypass policy by leaving the manifest unc
   assert.match(job(e, t.identifier).blocked_reason, /dependency changes require human review/);
 });
 
-test('dependency changes made by validation are checked again before push', async () => {
+test('validation cannot change dependencies in the captured candidate', async () => {
   const e = makeEnv();
   e.ctx.cfg.projects[0].validate = ['node -e \'require("fs").writeFileSync("package.json", JSON.stringify({dependencies:{unexpected:"1"}}))\''];
   const t = await ticket(e); await e.cycle();
   assert.equal(job(e, t.identifier).status, 'blocked');
-  assert.match(job(e, t.identifier).blocked_reason, /unexpected/);
+  assert.match(job(e, t.identifier).blocked_reason, /candidate snapshot invalid/);
   assert.equal(git(e.repo, 'for-each-ref', '--format=%(refname)', 'refs/heads/autodev/'), '');
 });
 

@@ -76,10 +76,12 @@ export function authorize(d: Decision, question: string, project: ProjectConfig,
  * Semantic checks are conservative heuristics; they do not replace human review.
  */
 export async function inspectChanges(ws: Workspaces, worktree: string, base: string, project: ProjectConfig, cfg: Config): Promise<{ hash: string; reasons: string[] }> {
-  const ref = `origin/${base}`;
+  const state = ws.trustedState(worktree);
+  const ref = state.base_sha;
+  const head = state.head_sha;
   const diff = await ws.diff(worktree, base);
-  const files = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', `${ref}...HEAD`])).split('\0').filter(Boolean);
-  const removed = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', `${ref}...HEAD`])).split('\0').filter(Boolean);
+  const files = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', `${ref}...${head}`])).split('\0').filter(Boolean);
+  const removed = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', `${ref}...${head}`])).split('\0').filter(Boolean);
   const reasons: string[] = [];
   const content = async (revision: string, file: string): Promise<string | null> => {
     const present = await ws.git(worktree, ['ls-tree', '-z', revision, '--', file]);
@@ -90,7 +92,7 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
     if (/(^|\/)package\.json$/.test(file)) {
       try {
         const before = JSON.parse(await content(ref, file) ?? '{}');
-        const after = JSON.parse(await content('HEAD', file) ?? '{}');
+        const after = JSON.parse(await content(head, file) ?? '{}');
         for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
           for (const name of new Set([...Object.keys(before[field] ?? {}), ...Object.keys(after[field] ?? {})])) {
             if (JSON.stringify(before[field]?.[name]) !== JSON.stringify(after[field]?.[name]) && !project.approvedDependencies.includes(name)) {
@@ -118,6 +120,6 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   if (/\b(?:DROP\s+(?:TABLE|COLUMN|DATABASE)|TRUNCATE\s+|dropTable\s*\(|dropColumn\s*\()/i.test(text)) reasons.push('destructive schema change');
   for (const keyword of cfg.policy.humanKeywords) if (new RegExp(keyword, 'i').test(diff)) reasons.push(`diff matches configured keyword /${keyword}/`);
   // Include the complete tree, since binary changes can have identical textual diffs.
-  const hash = createHash('sha256').update(await ws.git(worktree, ['rev-parse', ref])).update(await ws.git(worktree, ['rev-parse', 'HEAD^{tree}'])).update(diff).digest('hex');
+  const hash = createHash('sha256').update(ref).update(await ws.git(worktree, ['rev-parse', `${head}^{tree}`])).update(diff).digest('hex');
   return { hash, reasons: [...new Set(reasons)] };
 }

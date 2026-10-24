@@ -9,8 +9,8 @@ autodev runs AI-generated code and shell commands unattended. The design rule is
 |---|---|---|
 | **You** | approve plans (move to Ready), answer blockers, review, merge, deploy | — |
 | **Orchestrator process** (holds `GITHUB_TOKEN`, `LINEAR_API_KEY`) | push feature branches, open/update draft PRs, set ticket states (except → Ready), comment | merge to protected branches (branch protection), approve PRs, bypass checks, move tickets to Ready (no code path except `plan-approve` / human plan approval) |
-| **Coding agent** (Claude Code in a worktree) | read/edit files in its worktree, run sandboxed commands, git commit, ask for decisions, propose Backlog tickets | push, use `gh`, `curl`/`wget`, `ssh`, `docker`, cloud CLIs, `git config`/`remote`; see GitHub or Linear tokens; reach non-allowlisted hosts (sandbox) |
-| **Decision / Planning / Review agents** | read the repo, run read-only git commands, and web research (planning/decision only) | write files (Edit/Write are removed), run arbitrary Bash |
+| **Coding agent** (Claude Code in a worktree) | read/edit files in its worktree, run sandboxed commands, leave edits for the orchestrator to commit, ask for decisions, propose Backlog tickets | push, use `gh`, `curl`/`wget`, `ssh`, `docker`, cloud CLIs, `git config`/`remote`; see GitHub or Linear tokens; reach non-allowlisted hosts (sandbox) |
+| **Decision / Planning / Review agents** | read the repo, inspect files and reference git metadata (planning/decision), inspect a file-only candidate plus supplied diff (review), web research (planning/decision only) | write files (Edit/Write are removed), run arbitrary Bash |
 
 ## Controls
 
@@ -55,3 +55,15 @@ autodev runs AI-generated code and shell commands unattended. The design rule is
 - Command sandboxing must pass the required smoke test on the target host. Nested sandboxing is unavailable in some development environments; local test skips do not establish successful isolation.
 - Setup and validation are offline and cannot reach package registries, local databases, or service sockets. Prepare dependency artifacts inside the worktree or configure a dedicated `npmCacheDir`; only package data is copied into the private HOME. Use self-contained tests. Workflows requiring network services need a separately reviewed isolation design.
 - Budget reservations cap concurrent allowances, but SDK cost estimates can differ from billing and a model call can cross its configured threshold. Provider-side limits remain the spending backstop. Unknown/crashed runs keep their reservation until reconciled.
+
+## Git trust boundary
+
+The SDK can implicitly allow writes to some agent-visible Git metadata even when autodev supplies no write grant. Those refs, `packed-refs`, objects, `info/` and indexes are untrusted. Raw ref snapshots in protected state detect unexpected ref/HEAD changes at agent and command boundaries; a restored transient edit is not proof of absence of tampering. Security does not depend on those refs being immutable.
+
+Each coding/research worktree has a second, independent object store under `dataDir/trusted-git`. It is cloned directly from the configured remote with `--no-local`, so it has no object hardlinks or alternates into the disposable checkout. Its location is never an agent-visible `.git` pointer or SDK permission grant. Authoritative base/head hashes live in SQLite `git_states`, outside agent reach. Orchestrator commands use this private git directory, its private index and disabled hooks/fsmonitor. No objects or history are imported from the mutable agent repository.
+
+Policies and secret scans use the pinned base/candidate hashes. Every commit in `base_sha..candidate_sha` is scanned, including commits whose added credentials were later removed. Push sends that exact validated SHA. Remote PR head drift blocks CI/review handoff.
+
+Validation and review run on a separate checkout of the protected candidate. The original coding sandbox cannot write this sibling. Protected manifests fingerprint tracked bytes, symlinks and executable bits independently of git's stat cache; non-ignored extra inputs and any `.git` metadata are rejected. The reviewer receives the full protected diff and has no git repository grant. Any modification to candidate inputs blocks handoff. Setup is repeated to prepare offline dependencies; ignored build artifacts are not published.
+
+This relies on OS/SDK isolation of HOME/config/data and sibling writes. The latest implementation has not been exercised with real Claude, and Ubuntu 24.04 kernel/AppArmor verification remains outstanding. A skipped local OS test is not a deployment approval.

@@ -70,7 +70,7 @@ test('validation path (unsandboxed fixture): a pointer rewrite by repository cod
   const j = job(e, t.identifier);
   assert.equal(lootOf(loot), '');
   assert.equal(j.status, 'blocked');
-  assert.match(String(j.blocked_reason), /\.git pointer changed/);
+  assert.match(String(j.blocked_reason), /git metadata in candidate snapshot/);
   assert.equal(remoteBranches(e.repo), '');
 }));
 
@@ -130,7 +130,8 @@ test('validation path under the real OS sandbox: the .git pointer and git metada
     const rec = e.ctx.ws.verifiedRecord(j.worktree); // throws if the pointer or metadata changed
     assert.equal(existsSync(join(rec.commonDir, 'hooks', 'post-commit')), false);
     assert.equal(remoteBranches(e.repo), '', 'failed validation pushed nothing');
-    assert.match(String(j.error ?? j.pending_feedback), /validation/);
+    assert.equal(j.status, 'blocked');
+    assert.match(String(j.blocked_reason), /git metadata in candidate snapshot/);
   });
 });
 

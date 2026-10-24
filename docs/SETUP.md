@@ -12,6 +12,32 @@ npm ci && npm run check            # typecheck + pipeline and regression tests
 A full local simulation uses a local tracker, local git remote, and either the fake runner or
 real Claude. See `docs/RUNBOOK.md` › "Local simulation".
 
+## Workspace layout and release gate
+
+Keep credentials/configuration, trusted state and agent-visible workspaces separate:
+
+| Setting | Example | Contents |
+|---|---|---|
+| config directory | `/opt/autodev/instance` | `.env`, `autodev.config.yaml` |
+| `dataDir` | `/opt/autodev/instance/data` | SQLite, worktree/ref records, private Git object stores, candidate manifests |
+| `workspaceDir` | `/opt/autodev/instance-work` | disposable reference clones, coding worktrees, validation/review candidate snapshots |
+
+`workspaceDir` defaults to a sibling named `<config-folder>-work`. It must be outside HOME, the config directory and `dataDir`; symlink-resolved paths are checked. For local tests use directories under `/tmp`, or set an explicit workspace outside these protected roots. Coding agents cannot access the private object stores in `dataDir`.
+
+The systemd unit allows `/opt/autodev/instance-work` to be written, and cloud-init creates it with the service user's ownership. If you customize `workspaceDir`, update `ReadWritePaths` and create that directory first. Docker needs separate writable state and workspace volumes; the image declares both default paths.
+
+The reviewed Debian 12 Docker test required all three options below for nested bubblewrap:
+
+```text
+--security-opt seccomp=unconfined
+--security-opt apparmor=unconfined
+--security-opt systempaths=unconfined
+```
+
+The `systempaths` option permits bubblewrap to mount its private `/proc`. These options relax Docker's outer isolation; the inner OS sandbox remains mandatory. This container result does not verify Ubuntu 24.04's kernel/AppArmor configuration.
+
+Before connecting accounts, run `AUTODEV_REQUIRE_SANDBOX_TEST=1 npm run check` on the intended host. Ubuntu 24.04 kernel/AppArmor verification and a live-Claude check of these latest changes remain outstanding. Earlier Debian container evidence does not establish the Ubuntu VM configuration.
+
 ## 1. Claude authentication: decide this first (you)
 
 | Option | Billing | Fit for 24/7 unattended use |
@@ -117,7 +143,7 @@ That's only safe behind Tailscale with the firewall denying public traffic. Alte
 1. Add a `CLAUDE.md` with the build and test commands, conventions and architecture notes.
    Agents read it first.
 2. Setup and validation run offline in an OS sandbox with a private temporary HOME. For npm, set `npmCacheDir` to a dedicated cache populated by the operator from the approved lockfile before jobs start. Only its `_cacache` package data is copied into each command sandbox; no host `.npmrc` or credentials are copied. Use `npm ci --offline --no-audit` for setup. Other stacks need self-contained dependency artifacts in the worktree. Host caches, credential files, network databases and sockets are unavailable. Make validation self-contained.
-3. Before adding credentials, run `AUTODEV_REQUIRE_SANDBOX_TEST=1 node --test test/regressions.test.ts` on the target host. Unavailable isolation must fail this check.
+3. Before adding credentials, run `AUTODEV_REQUIRE_SANDBOX_TEST=1 npm run check` on the target host. Unavailable isolation must fail this check.
 4. Give each concurrent job isolated resources through `env` templating, for example a database
    per job: `postgres://localhost/app_test_{{jobId}}` and `PORT={{port}}`.
 5. Begin with `maxConcurrent: 1` per repo and `concurrency.global: 2`.
@@ -147,3 +173,11 @@ A historical small-ticket run was reported at about **$0.23** per the SDK estima
 
 At 2 agents, overnight throughput of about 6–15 tickets typically costs **$10–40 per night**.
 These are estimates, not measured overnight throughput. Reservations limit concurrent authorized allowances; use a provider-side limit as the billing backstop.
+
+## Trusted candidates and compatibility
+
+The orchestrator records the base and current commit hashes in protected SQLite state before an agent can run. It clones an independent per-worktree object store directly from the configured remote with `--no-local`; it never imports objects, refs, alternates, grafts or indexes from the agent-visible clone. Policies, outgoing history scans and pushes use these pinned hashes.
+
+The coder leaves changes in its working directory. The orchestrator commits them privately, then creates a separate snapshot of that exact candidate for validation and review. Setup runs again in this snapshot to prepare dependencies from the offline cache. The snapshot has no `.git`; validation and review must use file-based tools, and the reviewer receives the full trusted diff. Submodules are currently refused. Tracked inputs must remain unchanged; additional generated outputs/dependencies must be ignored by the approved repository. Ignored outputs are never committed or pushed.
+
+Existing workspaces created before trusted hashes/object stores were introduced are refused. Stop the service, back up the database, protected Git stores and workspace files, then explicitly reconcile or recreate affected jobs/workspaces from the real remote. Do not resolve or copy their mutable refs into trusted state as a migration shortcut.

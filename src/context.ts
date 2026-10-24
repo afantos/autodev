@@ -34,7 +34,7 @@ export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 
   const tracker = overrides.tracker ?? (cfg.tracker === 'linear' ? new LinearTracker(cfg, secret('LINEAR_API_KEY')!) : new LocalTracker(db));
   const scm = overrides.scm ?? (cfg.scm === 'github' ? new GitHubScm(secret('GITHUB_TOKEN')!) : new LocalScm(db, cfg.dataDir, cfg.localCi));
   const runner = overrides.runner ?? new ClaudeRunner();
-  return { cfg, db, tracker, scm, runner, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
+  return { cfg, db, tracker, scm, runner, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
 }
 
 /** Trees agents may never read: the orchestrator's home (credentials), config (.env) and state. */
@@ -84,12 +84,16 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   const protectedPaths = protectedRoots(ctx.cfg);
   assertOutsideProtected(spec.cwd, protectedPaths);
   const gitReadPaths: string[] = [];
+  const guardedWorktree = spec.fileOnly ? job?.worktree : spec.cwd;
   if (repository) {
     if (!ctx.cfg.projects.some(p => p.repo === repository)) throw new Error('agent repository is not configured');
     // Agents may read their worktree's git metadata (git status/diff/log) but never write it: the
     // orchestrator makes all commits with hardened git after verifying these pointers.
-    const rec = ctx.ws.verifiedRecord(spec.cwd);
-    gitReadPaths.push(rec.commonDir, rec.gitDir);
+    if (!guardedWorktree) throw new Error('file-only agent requires a managed job');
+    const rec = ctx.ws.verifiedRecord(guardedWorktree);
+    await ctx.ws.verifyAgentWorkspace(guardedWorktree);
+    if (spec.fileOnly) await ctx.ws.assertSnapshot(spec.cwd, guardedWorktree, job!.candidate_sha!);
+    else gitReadPaths.push(rec.commonDir, rec.gitDir);
   }
   const gate = reserveBudget(ctx.db, ctx.cfg, ctx.owner, meta, spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd);
   if (!gate.ok) throw new RunGateClosed(gate.reason!);
@@ -97,7 +101,9 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   logEvent(ctx.db, `agent.${spec.role}.start`, `model=${spec.model} budget=$${maxBudgetUsd.toFixed(2)}${spec.resume ? ' (resume)' : ''}`, { jobId: meta.jobId, ticketId: meta.ticketId });
   // A thrown runner error or process crash leaves the reservation in place;
   // actual spend is unknown and must not be silently made available again.
-  const res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths, gitReadPaths });
+  let res: AgentRunResult;
+  try { res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths, gitReadPaths }); }
+  catch (e) { if (repository) await ctx.ws.verifyAgentWorkspace(guardedWorktree!); throw e; }
   tx(ctx.db, () => {
     recordUsage(ctx.db, {
       jobId: meta.jobId, ticketId: meta.ticketId, role: spec.role, model: spec.model, costUsd: res.costUsd,
@@ -112,5 +118,9 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   if (res.errorKind === 'rate_limited') pauseForUsageLimit(ctx.db, res.resetsAt);
   else if (res.errorKind === 'api') pauseForApiError(ctx.db);
   else if (res.ok) { clearUsageLimitStreak(ctx.db); clearApiErrorStreak(ctx.db); }
+  if (repository) {
+    await ctx.ws.verifyAgentWorkspace(guardedWorktree!);
+    if (spec.fileOnly) await ctx.ws.assertSnapshot(spec.cwd, guardedWorktree!, job!.candidate_sha!);
+  }
   return res;
 }

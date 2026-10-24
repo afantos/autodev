@@ -18,11 +18,11 @@ RestartSec=10
 TimeoutStopSec=90
 KillMode=mixed
 
-# Hardening: the service can only write its own state.
+# Hardening: state/credentials and agent workspaces are separate trees.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/autodev/instance /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm /tmp
+ReadWritePaths=/opt/autodev/instance /opt/autodev/instance-work /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm /tmp
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

@@ -98,6 +98,11 @@ export interface Job {
   branch: string | null;
   base_branch: string | null;
   worktree: string | null;
+  base_sha: string | null;
+  candidate_sha: string | null;
+  validated_sha: string | null;
+  reviewed_sha: string | null;
+  candidate_worktree: string | null;
   pr_number: number | null;
   pr_url: string | null;
   session_id: string | null;
