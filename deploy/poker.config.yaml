@@ -25,7 +25,7 @@ projects:
     # Approved 2026-10-24 (poker ADRs 0002, 0007). Lockfile changes still always go to human review.
     approvedDependencies: [ws, react, react-dom, vite, "@types/ws", "@types/react", "@types/react-dom"]
     # Import boundaries (poker ADR 0006) and CI are human-only; .github/ and manifests are covered by the base policy.
-    humanReviewPaths: ['^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
+    humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
     protectTests: true                               # removed/changed assertions and new skips go to a human
 
 linear:

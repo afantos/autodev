@@ -73,9 +73,59 @@ export function authorize(d: Decision, question: string, project: ProjectConfig,
 }
 
 const TEST_FILE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
-// Heuristics, deliberately conservative: legitimate test edits also go to a human, which is the intended trade-off.
-const WEAKENING_REMOVED = /\bassert\b|\bexpect\s*\(|\b(?:test|it|describe|suite)\s*\(/;
-const WEAKENING_ADDED = /\.(?:skip|only|todo)\s*\(|\b(?:skip|only|todo)\s*:\s*(?:true|['"`])|\bt\.(?:skip|todo)\s*\(/;
+/** Added test code that can disable, skip, focus or short-circuit tests, or replace assertions. */
+const WEAKENING_ADDED: [RegExp, string][] = [
+  [/\.\s*(?:skip|only|todo)\b/, 'skips, focuses or marks a test todo'],
+  [/\b(?:skip|only|todo)\s*:/, 'sets a skip/only/todo test option'],
+  [/\bprocess\s*(?:\.\s*(?:exit|abort|kill|exitCode|reallyExit)\b|\[)/, 'can end the test process early'],
+  [/\bassert(?:\s*\.\s*\w+)*\s*=(?!=)|\b(?:mock\s*\.\s*method|Object\s*\.\s*(?:defineProperty|assign|setPrototypeOf))\s*\(\s*assert\b/, 'replaces assertion functions'],
+  [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
+];
+/** Leading lines of a test file before its first statement: imports, comments, blank lines. */
+const HEADER_LINE = /^\s*(?:$|import\b|\/\/|\/\*|\*|['"]use strict['"])/;
+
+/**
+ * Conservative test-weakening check for one file's hunks. Any modified or removed line of an existing test file,
+ * and any insertion other than in its import header or at its end, is ambiguous and goes to a human. Every added
+ * line, in new and existing test files alike, is scanned for code that disables tests or replaces assertions.
+ */
+export function testWeakening(file: string, lines: string[], oldText: string | null): string[] {
+  const out = new Set<string>();
+  for (const l of lines) {
+    if (!l.startsWith('+')) continue;
+    for (const [re, why] of WEAKENING_ADDED) if (re.test(l.slice(1))) out.add(`${file}: added test code ${why}`);
+  }
+  if (oldText === null) return [...out];
+  const old = oldText.split('\n');
+  if (old.at(-1) === '') old.pop();
+  const headerEnd = old.findIndex((l) => !HEADER_LINE.test(l)); // 0-based index of the first statement
+  const lastHeader = headerEnd === -1 ? old.length : headerEnd;
+  let cur = 0; // old lines consumed so far
+  for (const l of lines) {
+    const h = /^@@ -(\d+)(?:,(\d+))? \+/.exec(l);
+    if (h) { cur = h[2] === '0' ? Number(h[1]) : Number(h[1]) - 1; continue; }
+    if (l.startsWith('\\')) continue;
+    if (l.startsWith('-')) { out.add(`${file}: existing test code modified or removed`); cur++; continue; }
+    if (l.startsWith('+')) {
+      if (!(cur <= lastHeader || cur >= old.length)) out.add(`${file}: lines inserted inside existing test code`);
+      continue;
+    }
+    cur++;
+  }
+  return [...out];
+}
+
+function withoutApprovedDeps(manifest: Record<string, unknown>, approved: string[]): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...manifest };
+  for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+    const deps = manifest[field];
+    if (deps && typeof deps === 'object') {
+      const kept = Object.fromEntries(Object.entries(deps).filter(([name]) => !approved.includes(name)));
+      if (Object.keys(kept).length) copy[field] = kept; else delete copy[field];
+    }
+  }
+  return copy;
+}
 
 /** Mandatory check of committed changes against the trusted integration branch.
  * Semantic checks are conservative heuristics; they do not replace human review.
@@ -105,6 +155,10 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
             }
           }
         }
+        // Scripts, workspaces, exports, config ... decide what validation actually runs: any other change needs a human.
+        if (JSON.stringify(withoutApprovedDeps(before, project.approvedDependencies)) !== JSON.stringify(withoutApprovedDeps(after, project.approvedDependencies))) {
+          reasons.push(`${file}: manifest changed beyond approved dependencies (scripts, workspaces or other fields)`);
+        }
       } catch { reasons.push(`${file}: dependency manifest cannot be safely inspected`); }
     } else if (/(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|\.npmrc|\.yarnrc(?:\.yml)?|requirements[^/]*\.txt|pyproject\.toml|Pipfile(?:\.lock)?|poetry\.lock|uv\.lock|Cargo\.(toml|lock)|go\.(mod|sum)|Gemfile(?:\.lock)?|composer\.(json|lock)|pom\.xml|build\.gradle(?:\.kts)?)$/.test(file)) {
       reasons.push(`${file}: dependency changes require human review`);
@@ -117,20 +171,22 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   }
   // Exclude documentation from semantic keyword rules, but inspect every code hunk.
   let file = ''; let header = false; const added: string[] = [];
+  const hunks = new Map<string, string[]>();
   for (const line of diff.split('\n')) {
     // File headers only appear between `diff --git` and the first hunk; content lines may also start with ---/+++.
     if (line.startsWith('diff --git ')) { header = true; continue; }
     if (header) {
       if (line.startsWith('--- a/')) file = line.slice(6);
       if (line.startsWith('+++ b/')) file = line.slice(6);
-      if (line.startsWith('@@')) header = false;
-      continue;
+      if (!line.startsWith('@@')) continue;
+      header = false;
     }
+    if (!hunks.has(file)) hunks.set(file, []);
+    hunks.get(file)!.push(line);
     if (line.startsWith('+') && !/\.(md|txt|snap)$/.test(file)) added.push(line.slice(1));
-    if (project.protectTests && TEST_FILE.test(file)) {
-      if (line.startsWith('-') && WEAKENING_REMOVED.test(line)) reasons.push(`${file}: test assertion or test case removed or changed`);
-      if (line.startsWith('+') && WEAKENING_ADDED.test(line)) reasons.push(`${file}: test skipped, focused or marked todo`);
-    }
+  }
+  if (project.protectTests) {
+    for (const [f, lines] of hunks) if (TEST_FILE.test(f)) reasons.push(...testWeakening(f, lines, await content(ref, f)));
   }
   const text = added.join('\n');
   for (const [pattern, reason] of HUMAN_PATTERNS) if (pattern.test(text)) reasons.push(`diff touches ${reason}`);
