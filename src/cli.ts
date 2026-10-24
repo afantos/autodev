@@ -15,7 +15,7 @@ import { LinearTracker } from './tracker/linear.ts';
 import { LocalTracker } from './tracker/local.ts';
 import { LocalScm } from './scm/local.ts';
 import { answerBlocked } from './pipeline.ts';
-import { spentSince } from './db.ts';
+import { externalSpentSince, spentSince } from './db.ts';
 import { startOfDay, startOfMonth } from './budget.ts';
 import type { Priority, Status } from './types.ts';
 
@@ -140,7 +140,14 @@ async function main() {
       console.log(`today $${spentSince(ctx.db, startOfDay()).toFixed(2)} / $${cfg.budget.dailyUsd}   month $${spentSince(ctx.db, startOfMonth()).toFixed(2)} / $${cfg.budget.monthlyUsd}`);
       for (const r of rows) console.log(`${r.role.padEnd(9)} ${String(r.model).padEnd(8)} runs=${r.runs} ok=${r.ok} cost=$${r.cost.toFixed(2)} avg=$${r.avg.toFixed(3)} avg=${r.secs.toFixed(0)}s`);
       const done = ctx.db.prepare(`SELECT AVG(cost_usd) c, COUNT(*) n FROM jobs WHERE status IN ('done','awaiting_merge')`).get() as { c: number; n: number };
-      return console.log(`avg cost per delivered ticket: $${(done.c ?? 0).toFixed(2)} over ${done.n}`);
+      console.log(`avg cost per delivered ticket: $${(done.c ?? 0).toFixed(2)} over ${done.n}`);
+      if (cfg.secondReview.enabled) {
+        const p = cfg.secondReview.provider;
+        const ext = ctx.db.prepare(`SELECT model, COUNT(*) n, SUM(cost_usd) cost, SUM(CASE WHEN outcome='approve' THEN 1 ELSE 0 END) approved, SUM(CASE WHEN outcome='request_changes' THEN 1 ELSE 0 END) changes FROM external_usage WHERE provider = ? AND ts >= ? GROUP BY model`).all(p, startOfMonth()) as { model: string; n: number; cost: number; approved: number; changes: number }[];
+        console.log(`second review (${p}, separate budget): today $${externalSpentSince(ctx.db, p, startOfDay()).toFixed(2)} / $${cfg.secondReview.dailyUsd}   month $${externalSpentSince(ctx.db, p, startOfMonth()).toFixed(2)} / $${cfg.secondReview.monthlyUsd}`);
+        for (const r of ext) console.log(`  ${r.model} reviews=${r.n} approved=${r.approved} changes=${r.changes} cost=$${r.cost.toFixed(2)}`);
+      }
+      return;
     }
 
     case 'linear-check':

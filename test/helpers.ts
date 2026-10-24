@@ -1,3 +1,4 @@
+import type { SecondReviewer } from '../src/agents/second-review.ts';
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,7 +42,7 @@ export interface Env {
   cycle: () => Promise<void>;
 }
 
-export function makeEnv(opts: { behaviors?: Partial<Record<AgentRunSpec['role'], FakeBehavior>>; config?: Record<string, unknown>; project?: Record<string, unknown> } = {}): Env {
+export function makeEnv(opts: { behaviors?: Partial<Record<AgentRunSpec['role'], FakeBehavior>>; config?: Record<string, unknown>; project?: Record<string, unknown>; secondReviewer?: SecondReviewer } = {}): Env {
   const root = mkdtempSync(join(tmpdir(), 'autodev-test-'));
   const repo = makeRepo(root);
   // Production layout: config, state and workspaces are separate trees (agents are denied the first two).
@@ -59,7 +60,7 @@ export function makeEnv(opts: { behaviors?: Partial<Record<AgentRunSpec['role'],
   const runner = new FakeRunner(opts.behaviors);
   // Only trusted generated fixtures use this test double. The CLI has no config
   // switch that bypasses command isolation, including fake/local mode.
-  const ctx = createCtx(cfg, { db, tracker, scm, runner, runCommand: fixtureCommand });
+  const ctx = createCtx(cfg, { db, tracker, scm, runner, runCommand: fixtureCommand, secondReviewer: opts.secondReviewer });
   const orch = new Orchestrator(ctx);
   return { root, repo, ctx, tracker, scm, runner, orch, cycle: async () => { await orch.tick(); await orch.drain(Infinity); } };
 }

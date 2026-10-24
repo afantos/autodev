@@ -82,6 +82,19 @@ export class LocalScm implements Scm {
     const r = await run('git', ['merge-base', '--is-ancestor', `refs/heads/${branch}`, `refs/heads/${base}`], { cwd: resolve(repo) });
     return r.code === 0;
   }
+  async branchSha(repo: string, branch: string) { return this.sha(repo, branch); }
+  async markReady(_repo: string, pr: PullRequest) { this.db.prepare('UPDATE local_prs SET draft = 0 WHERE number = ?').run(pr.number); }
+  /** Records the approval (reviewer identity, exact sha) so tests can assert what was approved. */
+  async approve(_repo: string, number: number, sha: string, body: string) {
+    kvSet(this.db, `local-approval:${number}`, JSON.stringify({ sha, body }));
+  }
+  async mergePr(repo: string, number: number, sha: string) {
+    const pr = await this.getPr(repo, number);
+    if (pr.headSha !== sha) throw new Error(`head moved: expected ${sha}, PR head is ${pr.headSha}`);
+    if (!kvGet(this.db, `local-approval:${number}`) || JSON.parse(kvGet(this.db, `local-approval:${number}`)!).sha !== sha) throw new Error('not approved at this sha');
+    await this.merge(repo, number);
+  }
+
   /** Test helper: simulate a human merging a PR (fast-forward or merge commit in the bare repo). */
   async merge(repo: string, number: number) {
     const pr = await this.getPr(repo, number);

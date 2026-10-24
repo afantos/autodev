@@ -138,6 +138,12 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       await commandPreflight(ctx, job, project, signal);
       await implement(ctx, job, ticket, project, signal);
       signal.throwIfAborted();
+      {
+        // A base merge left conflicts for the agent: never commit leftover conflict markers.
+        const unmerged = await ws.unmergedPaths(job.worktree!);
+        const left = unmerged.length ? ws.conflictMarkers(job.worktree!, unmerged) : [];
+        if (left.length) return feedbackLoop(ctx, job, 'merge-conflict', `Conflict markers (<<<<<<< ======= >>>>>>>) remain in: ${left.join(', ')}. Resolve them, keeping both sides' intent.`);
+      }
       await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve implementation before policy checks`);
       const captured = { candidate_sha: await ws.headSha(job.worktree!), validated_sha: null, reviewed_sha: null, candidate_worktree: null };
       updateJob(db, job.id, captured, owner);
@@ -234,7 +240,8 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       await mayContinue(ctx, job, signal);
       await tracker.setStatus(ticket.id, 'review');
       const s = JSON.parse(job.summary_json ?? '{}');
-      await tracker.comment(ticket.id, `✅ Ready for your review: ${pr.url}${preview ? `\nPreview: ${preview}` : ''}\n\n${s.coding?.summary ?? ''}\n\nAI review: ${s.review?.outcome ?? 'n/a'} — ${s.review?.summary ?? ''}`);
+      const lead = project.autoMerge ? `✅ Ready: ${pr.url}\nautodev merges it automatically once the second review and every merge gate pass; otherwise it asks for your review.` : `✅ Ready for your review: ${pr.url}`;
+      await tracker.comment(ticket.id, `${lead}${preview ? `\nPreview: ${preview}` : ''}\n\n${s.coding?.summary ?? ''}\n\nAI review: ${s.review?.outcome ?? 'n/a'} — ${s.review?.summary ?? ''}`);
       return;
     }
   }

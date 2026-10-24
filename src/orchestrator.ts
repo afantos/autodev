@@ -4,6 +4,7 @@ import { canStartRun } from './budget.ts';
 import { acquireInstanceLock, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, updateJob } from './db.ts';
 import { blockJob, resumeBlocked, runJob } from './pipeline.ts';
 import { approvePlan } from './planning.ts';
+import { autoMergeStep } from './automerge.ts';
 import { rank } from './scheduler.ts';
 import { LABEL_PLAN } from './tracker/types.ts';
 import type { Job, Ticket } from './types.ts';
@@ -132,6 +133,15 @@ export class Orchestrator {
           updateJob(db, job.id, { status: 'closed', error: 'PR closed without merge' });
           await tracker.comment(t.id, `PR #${pr.number} was closed without merging. Branch \`${job.branch}\` is preserved. Move to Ready with a comment to rework.`).catch(() => {});
           logEvent(db, 'job.closed', `${job.ticket_identifier}: PR closed unmerged`, { jobId: job.id, ticketId: t.id, level: 'warn' });
+        } else if (t.status !== 'ready') {
+          const project = ctx.cfg.projects.find((p) => p.key === job.project);
+          if (project?.autoMerge) {
+            const outcome = await autoMergeStep(ctx, job, t, project).catch((e) => {
+              logEvent(db, 'automerge.error', `${job.ticket_identifier}: ${(e as Error).message.slice(0, 300)}`, { jobId: job.id, ticketId: t.id, level: 'warn' });
+              return 'waiting' as const;
+            });
+            if (outcome === 'requeued') byId.set(t.id, { ...t, status: 'in_progress' });
+          }
         } else if (t.status === 'ready') {
           // Human sent it back from Review with feedback → rework on the same branch/PR.
           const comments = await tracker.listComments(t.id);

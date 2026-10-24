@@ -10,6 +10,7 @@ const PATTERNS: [RegExp, string][] = [
   [/xox[baprs]-[A-Za-z0-9-]{10,}/, 'Slack token'],
   [/AIza[0-9A-Za-z_-]{35}/, 'Google API key'],
   [/lin_api_[A-Za-z0-9]{30,}/, 'Linear key'],
+  [/sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}/, 'OpenAI key'],
 ];
 
 export function scanSecrets(diff: string): string[] {

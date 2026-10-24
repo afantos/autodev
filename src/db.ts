@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS usage (
   cache_read_tokens INTEGER DEFAULT 0, duration_ms INTEGER DEFAULT 0, outcome TEXT
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+-- Spend at other vendors (second reviewer). Never counted against Claude's budget, never mixed into usage.
+CREATE TABLE IF NOT EXISTS external_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, job_id TEXT, ticket_id TEXT,
+  cost_usd REAL NOT NULL DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, outcome TEXT
+);
+CREATE INDEX IF NOT EXISTS external_usage_ts ON external_usage(provider, ts);
 
 -- Durable reservations are never expired automatically: a lost result may still
 -- have incurred charges. Reconcile unknown spend before releasing a reservation.
@@ -269,6 +276,15 @@ export function recordUsage(db: Db, u: UsageRow) {
 export function spentSince(db: Db, sinceMs: number): number {
   const r = db.prepare('SELECT COALESCE(SUM(cost_usd),0) AS s FROM usage WHERE ts >= ?').get(sinceMs) as { s: number };
   return r.s;
+}
+
+export function recordExternalUsage(db: Db, u: { provider: string; model: string; jobId?: string | null; ticketId?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; outcome?: string }) {
+  db.prepare('INSERT INTO external_usage (ts, provider, model, job_id, ticket_id, cost_usd, input_tokens, output_tokens, outcome) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(now(), u.provider, u.model, u.jobId ?? null, u.ticketId ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.outcome ?? null);
+}
+
+export function externalSpentSince(db: Db, provider: string, sinceMs: number): number {
+  return (db.prepare('SELECT COALESCE(SUM(cost_usd),0) AS s FROM external_usage WHERE provider = ? AND ts >= ?').get(provider, sinceMs) as { s: number }).s;
 }
 
 export function spentOnTicket(db: Db, ticketId: string): number {

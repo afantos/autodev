@@ -115,7 +115,7 @@ export function agentSandbox(spec: Pick<AgentRunSpec, 'cwd' | 'mode' | 'sandbox'
       allowWrite: [],
       denyWrite: [join(spec.cwd, '.git')],
     },
-    credentials: { envVars: [{ name: 'ANTHROPIC_API_KEY', mode: 'deny' }, { name: 'CLAUDE_CODE_OAUTH_TOKEN', mode: 'deny' }] },
+    credentials: { envVars: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'GITHUB_TOKEN', 'GITHUB_REVIEWER_TOKEN', 'LINEAR_API_KEY'].map((name) => ({ name, mode: 'deny' as const })) },
   };
 }
 

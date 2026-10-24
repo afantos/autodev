@@ -30,6 +30,11 @@ const ProjectSchema = z.object({
   stackedBranches: z.boolean().default(false),
   /** Dependencies (npm/pypi names) the decision agent may auto-approve. */
   approvedDependencies: z.array(z.string()).default([]),
+  /**
+   * Merge clean PRs without a human: CI green, Claude review approved, second (GPT) review approved, policy clean,
+   * branch up to date with base. Requires secondReview.enabled and a reviewer GitHub account. Flagged PRs still wait.
+   */
+  autoMerge: z.boolean().default(false),
   /** Repo-relative path regexes whose changes always need human review (e.g. lint boundary rules). */
   humanReviewPaths: z.array(z.string()).default([]),
   /** Send removed/changed assertions and newly skipped tests in test files to human review. */
@@ -106,6 +111,21 @@ const ConfigSchema = z.object({
     classify: z.string().default('haiku'),
     /** Complexity at or above which codingComplex is used. */
     complexThreshold: z.number().default(4),
+  }).prefault({}),
+  /** Independent second reviewer from another vendor; its spend is a separate ledger from Claude's budget. */
+  secondReview: z.object({
+    enabled: z.boolean().default(false),
+    provider: z.enum(['openai']).default('openai'),
+    model: z.string().default('gpt-6.1-sol'),
+    dailyUsd: z.number().positive().default(50),
+    monthlyUsd: z.number().positive().default(300),
+    /** Pricing used to compute spend from reported token usage (USD per 1M tokens). */
+    inputUsdPerMTok: z.number().nonnegative().default(2),
+    outputUsdPerMTok: z.number().nonnegative().default(10),
+    maxOutputTokens: z.number().int().positive().default(16_000),
+    /** Cap on supplied docs + diff (characters); larger diffs go to a human instead of being truncated. */
+    maxInputChars: z.number().int().positive().default(600_000),
+    timeoutSeconds: z.number().positive().default(900),
   }).prefault({}),
   policy: z.object({
     minAutoConfidence: z.number().default(0.7),

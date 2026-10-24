@@ -16,9 +16,33 @@ function split(repo: string) {
 export class GitHubScm implements Scm {
   private gh: Octokit;
   private token: string;
-  constructor(token: string) {
+  /** Separate reviewer account (approvals only). Branch protection rejects approvals from the last pusher. */
+  private reviewer: Octokit | null;
+  constructor(token: string, reviewerToken?: string) {
     this.token = token;
     this.gh = new Octokit({ auth: token, userAgent: 'autodev', request: { timeout: 30_000 } });
+    this.reviewer = reviewerToken ? new Octokit({ auth: reviewerToken, userAgent: 'autodev-reviewer', request: { timeout: 30_000 } }) : null;
+  }
+
+  async branchSha(repo: string, branch: string) {
+    return (await this.gh.repos.getBranch({ ...split(repo), branch })).data.commit.sha;
+  }
+
+  async markReady(_repo: string, pr: PullRequest) {
+    if (!pr.draft) return;
+    const { repository } = await this.gh.graphql<{ repository: { pullRequest: { id: string } } }>(
+      'query($o:String!,$n:String!,$num:Int!){ repository(owner:$o, name:$n){ pullRequest(number:$num){ id } } }',
+      { o: split(_repo).owner, n: split(_repo).repo, num: pr.number });
+    await this.gh.graphql('mutation($id:ID!){ markPullRequestReadyForReview(input:{ pullRequestId:$id }){ clientMutationId } }', { id: repository.pullRequest.id });
+  }
+
+  async approve(repo: string, number: number, sha: string, body: string) {
+    if (!this.reviewer) throw new Error('no reviewer account configured (GITHUB_REVIEWER_TOKEN)');
+    await this.reviewer.pulls.createReview({ ...split(repo), pull_number: number, commit_id: sha, event: 'APPROVE', body });
+  }
+
+  async mergePr(repo: string, number: number, sha: string, title: string) {
+    await this.gh.pulls.merge({ ...split(repo), pull_number: number, sha, merge_method: 'squash', commit_title: title });
   }
 
   cloneUrl(repo: string) { return `https://github.com/${repo}.git`; }

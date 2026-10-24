@@ -16,4 +16,12 @@ export interface Scm {
   previewUrl(repo: string, pr: PullRequest): Promise<string | null>;
   /** True if `branch`'s tip is contained in `base` (i.e. merged). */
   branchMerged?(repo: string, branch: string, base: string): Promise<boolean>;
+  /** Current tip of a branch on the remote. */
+  branchSha(repo: string, branch: string): Promise<string>;
+  /** Draft → ready for review (as the coding bot). */
+  markReady(repo: string, pr: PullRequest): Promise<void>;
+  /** Approve exactly `sha` as the separate reviewer account. Throws if no reviewer identity is configured. */
+  approve(repo: string, number: number, sha: string, body: string): Promise<void>;
+  /** Squash-merge, refusing unless the PR head is still exactly `sha`. */
+  mergePr(repo: string, number: number, sha: string, title: string): Promise<void>;
 }

@@ -349,6 +349,50 @@ export class Workspaces {
     return true;
   }
 
+  /**
+   * Bring the current remote base into the job branch, in the private object store. A clean merge becomes the new
+   * trusted head (to be revalidated). On conflict, the merge is left in progress with conflict markers in the working
+   * files for the coding agent to resolve; the next commitAll completes it. Either way the trusted base moves to the
+   * fetched base, so policy and push ranges cover only the branch's own changes.
+   */
+  async refreshBase(path: string, base: string): Promise<{ status: 'current' } | { status: 'merged'; baseSha: string; headSha: string } | { status: 'conflict'; baseSha: string; files: string[] }> {
+    const state = this.trustedState(path);
+    await this.assertCandidate(path, state.head_sha);
+    await this.git(path, ['fetch', '--no-tags', 'origin', `+refs/heads/${base}:refs/remotes/origin/${base}`], true);
+    const baseSha = (await this.git(path, ['rev-parse', '--verify', `refs/remotes/origin/${base}^{commit}`])).trim();
+    if (baseSha === state.base_sha) return { status: 'current' };
+    const real = realpathSync(path);
+    const merged = await this.gitRaw(path, ['merge', '--no-ff', '--no-edit', '-m', `Merge ${base} (${baseSha.slice(0, 12)}) into this branch`, baseSha]);
+    if (merged.code === 0) {
+      const head = (await this.git(path, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+      this.db.prepare('UPDATE git_states SET base_sha = ?, head_sha = ? WHERE worktree = ?').run(baseSha, head, real);
+      return { status: 'merged', baseSha, headSha: head };
+    }
+    const files = await this.unmergedPaths(path);
+    if (!files.length) {
+      await this.gitRaw(path, ['merge', '--abort']);
+      throw new Error(`merging ${base} failed without conflicts: ${(merged.stderr || merged.stdout).slice(-500)}`);
+    }
+    this.db.prepare('UPDATE git_states SET base_sha = ? WHERE worktree = ?').run(baseSha, real);
+    return { status: 'conflict', baseSha, files };
+  }
+
+  /** Paths with unresolved merge conflicts in the index (NUL-delimited, used literally). */
+  async unmergedPaths(path: string): Promise<string[]> {
+    return [...new Set((await this.git(path, ['diff', '--name-only', '-z', '--diff-filter=U'])).split('\0').filter(Boolean))];
+  }
+
+  /** Files among `paths` that still contain conflict markers in the working tree. */
+  conflictMarkers(path: string, paths: string[]): string[] {
+    const root = this.verifiedRecord(path).worktree;
+    return paths.filter((p) => {
+      const file = join(root, p);
+      const st = lstatSync(file, { throwIfNoEntry: false });
+      if (!st?.isFile()) return false;
+      return /^(?:<{7}|={7}|>{7})(?: |$)/m.test(readFileSync(file, 'utf8'));
+    });
+  }
+
   async headSha(path: string): Promise<string> {
     const rec = this.verifiedRecord(path);
     await this.verifyRefsLocked(rec.repo);

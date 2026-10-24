@@ -13,6 +13,8 @@ import { GitHubScm } from './scm/github.ts';
 import { LocalScm } from './scm/local.ts';
 import { Workspaces } from './scm/git.ts';
 import type { AgentRunner, AgentRunResult, AgentRunSpec } from './agents/runner.ts';
+import { OpenAiReviewer } from './agents/second-review.ts';
+import type { SecondReviewer } from './agents/second-review.ts';
 import { ClaudeRunner } from './agents/runner.ts';
 import { reserveBudget, clearApiErrorStreak, clearUsageLimitStreak, pauseForApiError, pauseForUsageLimit } from './budget.ts';
 import { runSandboxed } from './command-sandbox.ts';
@@ -27,14 +29,23 @@ export interface Ctx {
   /** Lease owner identity for this process. */
   owner: string;
   runCommand: typeof runSandboxed;
+  /** Independent second reviewer (another vendor), when secondReview is enabled. */
+  secondReviewer?: SecondReviewer;
 }
 
-export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 'scm' | 'runner' | 'db' | 'runCommand'>> = {}): Ctx {
+export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 'scm' | 'runner' | 'db' | 'runCommand' | 'secondReviewer'>> = {}): Ctx {
   const db = overrides.db ?? openDb(join(cfg.dataDir, 'autodev.db'));
   const tracker = overrides.tracker ?? (cfg.tracker === 'linear' ? new LinearTracker(cfg, secret('LINEAR_API_KEY')!) : new LocalTracker(db));
-  const scm = overrides.scm ?? (cfg.scm === 'github' ? new GitHubScm(secret('GITHUB_TOKEN')!) : new LocalScm(db, cfg.dataDir, cfg.localCi));
+  const autoMerge = cfg.secondReview.enabled && cfg.projects.some((p) => p.autoMerge);
+  if (cfg.projects.some((p) => p.autoMerge) && !cfg.secondReview.enabled) throw new Error('a project sets autoMerge but secondReview.enabled is false');
+  const scm = overrides.scm ?? (cfg.scm === 'github'
+    ? new GitHubScm(secret('GITHUB_TOKEN')!, autoMerge ? secret('GITHUB_REVIEWER_TOKEN')! : undefined)
+    : new LocalScm(db, cfg.dataDir, cfg.localCi));
   const runner = overrides.runner ?? new ClaudeRunner();
-  return { cfg, db, tracker, scm, runner, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
+  const secondReviewer = overrides.secondReviewer ?? (cfg.secondReview.enabled
+    ? new OpenAiReviewer(secret('OPENAI_API_KEY')!, cfg.secondReview.model, { inputUsdPerMTok: cfg.secondReview.inputUsdPerMTok, outputUsdPerMTok: cfg.secondReview.outputUsdPerMTok, maxOutputTokens: cfg.secondReview.maxOutputTokens, timeoutMs: cfg.secondReview.timeoutSeconds * 1000 })
+    : undefined);
+  return { cfg, db, tracker, scm, runner, secondReviewer, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
 }
 
 /** Trees agents may never read: the orchestrator's home (credentials), config (.env) and state. */

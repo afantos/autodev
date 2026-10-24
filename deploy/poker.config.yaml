@@ -26,7 +26,11 @@ projects:
     approvedDependencies: [ws, react, react-dom, vite, "@types/ws", "@types/react", "@types/react-dom"]
     # Import boundaries (poker ADR 0006) and CI are human-only; .github/ and manifests are covered by the base policy.
     humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
-    protectTests: true                               # removed/changed assertions and new skips go to a human
+    protectTests: true                               # any change to an existing test file goes to a human; new test files are scanned
+    # Clean PRs merge without a human: CI, Claude review, second review (secondReview below), policy clean, up to date.
+    # Anything the policy flags still waits for a human. Needs GITHUB_REVIEWER_TOKEN and OPENAI_API_KEY in .env.
+    autoMerge: true
+    docs: [CLAUDE.md, README.md, GLOSSARY.md, docs/mvp-spec.md, docs/adr]
 
 linear:
   states:                                # must match your Linear workflow state names
@@ -51,6 +55,13 @@ budget:                                  # USD, SDK estimates; the Claude Consol
   perRunUsd: 1.5
   perDecisionUsd: 0.5
   onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically
+
+secondReview:                            # independent merge reviewer; separate budget from Claude (approved 2026-10-24)
+  enabled: true
+  provider: openai
+  model: gpt-6.1-sol                     # $2 / $10 per 1M input/output tokens (developers.openai.com, checked 2026-10-24)
+  dailyUsd: 50
+  monthlyUsd: 300                        # also set this as the OpenAI project's monthly limit
 
 models:
   planning: opus

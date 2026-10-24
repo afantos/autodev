@@ -102,6 +102,27 @@ How you work in Linear:
 Using a separate bot account matters: PRs are authored by the bot, so **you** can approve them,
 and the bot can never approve its own work.
 
+### 3b. Auto-merge with an independent second reviewer (optional; you)
+
+With `autoMerge: true` on a project and `secondReview.enabled: true`, autodev merges a PR without a human only when
+all of these hold for the exact validated commit:
+- CI passes;
+- Claude's review approves;
+- the second reviewer (OpenAI `gpt-6.1-sol`) approves;
+- the diff policy flags nothing (dependencies, protected paths, existing tests, security keywords);
+- the branch contains the current base. When the base has moved, autodev merges it in and revalidates everything first;
+  conflicts go back to the coding agent.
+
+Anything flagged still waits for you. Setup:
+1. **Reviewer GitHub account.** Create a second machine account (e.g. `afantos-reviewer`) and invite it as a
+   collaborator with **write** access. Create a classic token with the `repo` scope and save it as
+   `GITHUB_REVIEWER_TOKEN`. Branch protection's "approval from someone other than the last pusher" is satisfied
+   because the coding bot pushes and the reviewer approves. Keep `enforce_admins` on.
+2. **OpenAI.** Create a dedicated project and API key (`OPENAI_API_KEY`), and set the project's monthly budget to the
+   same value as `secondReview.monthlyUsd`. autodev keeps a separate ledger for it (`autodev usage`); it never counts
+   against Claude's budget.
+3. **Turn off** by setting `autoMerge: false`. PRs then wait for a human again.
+
 ## 4. Cloud VM (you: this costs money)
 
 Sizing for 2 concurrent agents: **4 vCPU, 8–16 GB RAM, 80 GB SSD**, Ubuntu 24.04. Claude runs in
