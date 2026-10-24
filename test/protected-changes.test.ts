@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { makeEnv, job } from './helpers.ts';
 import { testWeakening } from '../src/policy.ts';
+import { docsHint } from '../src/agents/prompts.ts';
 
 // Project policy: protected paths (humanReviewPaths) and test weakening (protectTests) go to a human.
 const ticket = (e: ReturnType<typeof makeEnv>) => e.tracker.createTicket({ projectKey: 'demo', title: 'Policy ticket', description: '', status: 'ready', priority: 2 });
@@ -172,14 +173,63 @@ test('allowed: an approved dependency added to package.json passes the manifest 
   assert.equal(job(e, t.identifier).status, 'awaiting_merge', job(e, t.identifier).blocked_reason ?? job(e, t.identifier).error);
 });
 
-test('testWeakening: every change to an existing test file is flagged; new files are only pattern-scanned', () => {
-  const old = "import a from 'a';\n\ntest('x', () => {\n  a();\n});\n";
-  const changed = ['t.test.js: existing test file changed'];
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -1,0 +2,1 @@', '+/*'], old), changed, 'insertion in the header');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -5,0 +6,1 @@', '+*/'], old), changed, 'insertion at EOF');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -3,0 +4,1 @@', '+  return;'], old), changed, 'insertion inside a test');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -4 +4 @@', '-  a();', '+  a(true);'], old), changed, 'line edit');
-  assert.deepEqual(testWeakening('t.test.js', ['@@ -4 +3,0 @@', '-  a();'], old), changed, 'line removal');
-  assert.deepEqual(testWeakening('new.test.js', ['@@ -0,0 +1,1 @@', "+test('ok', () => {});"], null), [], 'clean new file');
-  assert.deepEqual(testWeakening('new.test.js', ['@@ -0,0 +1,2 @@', "+test('ok', () => {});", "+test.todo('later');"], null), ['new.test.js: added test code skips, focuses or marks a test todo']);
+test('testWeakening: any change to a file that existed on the base is flagged; new files are only pattern-scanned', () => {
+  assert.deepEqual(testWeakening('t.test.js', ['/*'], true), ['t.test.js: existing test file changed']);
+  assert.deepEqual(testWeakening('t.test.js', [], true), ['t.test.js: existing test file changed'], 'pure removals too');
+  assert.deepEqual(testWeakening('new.test.js', ["test('ok', () => {});"], false), [], 'clean new file');
+  assert.deepEqual(testWeakening('new.test.js', ["test('ok', () => {});", "test.todo('later');"], false), ['new.test.js: added test code skips, focuses or marks a test todo']);
+});
+
+// ---------------------------------------------------------------- quoted filenames (review 2026-10-24)
+// git quotes non-ASCII and special characters in diff headers ("a/test/caf\303\251.test.js"), which once let an
+// edit to test/café.test.js bypass protectTests. Paths now come only from NUL-delimited listings.
+
+const ODD_NAMES = [
+  'test/café.test.js',
+  'test/日本語.test.js',
+  'test/we"ird name.test.js',
+  'test/tab\there.test.js',
+  'test/back\\slash.test.js',
+  'test/new\nline.test.js',
+  'test/*.test.js',
+  'test/[ab].test.js',
+  'test/:(glob)x.test.js',
+];
+
+for (const name of ODD_NAMES) {
+  test(`quoted filename: editing existing ${JSON.stringify(name)} blocks`, async () => {
+    const e = env({ protectTests: true }, (cwd) => writeFileSync(join(cwd, name), TEST_SRC.replace("test('adds'", "/*\ntest('adds'") + '*/\n'));
+    seedMain(e.repo, { [name]: TEST_SRC });
+    const t = await ticket(e); await e.cycle();
+    assert.equal(job(e, t.identifier).status, 'blocked');
+    // blocked_reason is JSON; compare the decoded reason against the exact filename.
+    assert.ok(JSON.parse(job(e, t.identifier).blocked_reason).reason.includes(`${name}: existing test file changed`), job(e, t.identifier).blocked_reason);
+  });
+}
+
+test('quoted filename: a new Unicode-named test file is still scanned for skips', () =>
+  blockedWith({ protectTests: true }, {},
+    (cwd) => { mkdirSync(join(cwd, 'test'), { recursive: true }); writeFileSync(join(cwd, 'test', 'überprüfung.test.js'), "import { test } from 'node:test';\ntest.skip('later', () => {});\n"); },
+    /test\/überprüfung\.test\.js: added test code skips/));
+
+test('quoted filename: a new test file whose name is a glob only matches itself', async () => {
+  // `test/*.test.js` is new; the unrelated existing test/add.test.js is untouched and must not be flagged.
+  const e = env({ protectTests: true }, (cwd) => writeFileSync(join(cwd, 'test', '*.test.js'), "import { test } from 'node:test';\ntest('ok', () => {});\n"));
+  seedMain(e.repo, { 'test/add.test.js': TEST_SRC });
+  const t = await ticket(e); await e.cycle();
+  assert.equal(job(e, t.identifier).status, 'awaiting_merge', job(e, t.identifier).blocked_reason ?? job(e, t.identifier).error);
+});
+
+test('quoted filename: code in a Unicode-named file after a Markdown file is still keyword-scanned', () =>
+  blockedWith({}, {},
+    (cwd) => { mkdirSync(join(cwd, 'docs'), { recursive: true }); writeFileSync(join(cwd, 'docs', 'notes.md'), 'notes\n'); writeFileSync(join(cwd, 'src', 'café.js'), 'const sql = "DROP TABLE customers";\n'); },
+    /destructive schema change/));
+
+test('agents are told to put new behavior tests in new files when protectTests is on', () => {
+  const base = makeEnv().ctx.cfg.projects[0];
+  assert.doesNotMatch(docsHint(base), /Existing test files are protected/);
+  const hint = docsHint({ ...base, protectTests: true, humanReviewPaths: ['^eslint-rules/'] });
+  assert.match(hint, /Add tests for new behavior in NEW test files/);
+  assert.match(hint, /Plans must specify a new test file per ticket/);
+  assert.match(hint, /\/\^eslint-rules\/\/ need human review/);
 });

@@ -82,18 +82,15 @@ const WEAKENING_ADDED: [RegExp, string][] = [
   [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
 ];
 /**
- * Conservative test-weakening check for one file's hunks. Any change to an existing test file goes to a human:
- * position-based exceptions (import header, end of file) were bypassable, e.g. a block comment opened
- * before an existing test and closed after it.
- * New test files are allowed, but every added line is scanned for code that disables tests or replaces assertions.
+ * Conservative test-weakening check for one changed test file. Any change to a file that existed on the base
+ * (edit, insertion, deletion) goes to a human: position-based exceptions (import header, end of file) were
+ * bypassable, e.g. a block comment opened before an existing test and closed after it. New test files are allowed,
+ * but every added line is scanned for code that disables tests or replaces assertions.
  */
-export function testWeakening(file: string, lines: string[], oldText: string | null): string[] {
+export function testWeakening(file: string, addedLines: string[], existedOnBase: boolean): string[] {
   const out = new Set<string>();
-  if (oldText !== null && lines.some((l) => (l.startsWith('+') || l.startsWith('-')))) out.add(`${file}: existing test file changed`);
-  for (const l of lines) {
-    if (!l.startsWith('+')) continue;
-    for (const [re, why] of WEAKENING_ADDED) if (re.test(l.slice(1))) out.add(`${file}: added test code ${why}`);
-  }
+  if (existedOnBase) out.add(`${file}: existing test file changed`);
+  for (const l of addedLines) for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
   return [...out];
 }
 
@@ -120,10 +117,19 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   const files = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', `${ref}...${head}`])).split('\0').filter(Boolean);
   const removed = (await ws.git(worktree, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', `${ref}...${head}`])).split('\0').filter(Boolean);
   const reasons: string[] = [];
-  const content = async (revision: string, file: string): Promise<string | null> => {
-    const present = await ws.git(worktree, ['ls-tree', '-z', revision, '--', file]);
-    if (!present) return null;
-    return ws.git(worktree, ['show', `${revision}:${file}`]);
+  // Paths come from NUL-delimited listings and are used literally, never parsed from quoted diff headers.
+  const trees = new Map<string, Set<string>>();
+  const exists = async (revision: string, file: string): Promise<boolean> => {
+    if (!trees.has(revision)) trees.set(revision, new Set((await ws.git(worktree, ['ls-tree', '-r', '-z', '--name-only', '--full-tree', revision])).split('\0').filter(Boolean)));
+    return trees.get(revision)!.has(file);
+  };
+  const content = async (revision: string, file: string): Promise<string | null> =>
+    (await exists(revision, file)) ? ws.git(worktree, ['cat-file', 'blob', `${revision}:${file}`]) : null;
+  const addedLines = async (file: string): Promise<string[]> => {
+    const d = await ws.git(worktree, ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', `${ref}...${head}`, '--', `:(literal)${file}`]);
+    const lines = d.split('\n');
+    const firstHunk = lines.findIndex((l) => l.startsWith('@@'));
+    return firstHunk === -1 ? [] : lines.slice(firstHunk).filter((l) => l.startsWith('+')).map((l) => l.slice(1));
   };
   for (const file of files) {
     if (/(^|\/)package\.json$/.test(file)) {
@@ -151,24 +157,12 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
     if (removed.includes(file) && !/\.(md|txt|snap)$/.test(file)) reasons.push(`${file}: source or configuration file removed`);
     for (const pattern of project.humanReviewPaths) if (new RegExp(pattern).test(file)) reasons.push(`${file}: protected path (/${pattern}/) changed`);
   }
-  // Exclude documentation from semantic keyword rules, but inspect every code hunk.
-  let file = ''; let header = false; const added: string[] = [];
-  const hunks = new Map<string, string[]>();
-  for (const line of diff.split('\n')) {
-    // File headers only appear between `diff --git` and the first hunk; content lines may also start with ---/+++.
-    if (line.startsWith('diff --git ')) { header = true; continue; }
-    if (header) {
-      if (line.startsWith('--- a/')) file = line.slice(6);
-      if (line.startsWith('+++ b/')) file = line.slice(6);
-      if (!line.startsWith('@@')) continue;
-      header = false;
-    }
-    if (!hunks.has(file)) hunks.set(file, []);
-    hunks.get(file)!.push(line);
-    if (line.startsWith('+') && !/\.(md|txt|snap)$/.test(file)) added.push(line.slice(1));
-  }
-  if (project.protectTests) {
-    for (const [f, lines] of hunks) if (TEST_FILE.test(f)) reasons.push(...testWeakening(f, lines, await content(ref, f)));
+  // Exclude documentation from semantic keyword rules, but inspect every code file's added lines.
+  const added: string[] = [];
+  for (const f of files) {
+    const lines = await addedLines(f);
+    if (!/\.(md|txt|snap)$/.test(f)) added.push(...lines);
+    if (project.protectTests && TEST_FILE.test(f)) reasons.push(...testWeakening(f, lines, await exists(ref, f)));
   }
   const text = added.join('\n');
   for (const [pattern, reason] of HUMAN_PATTERNS) if (pattern.test(text)) reasons.push(`diff touches ${reason}`);

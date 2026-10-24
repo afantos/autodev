@@ -17,7 +17,14 @@ You have no credentials for GitHub, Linear, cloud providers or production system
 `;
 
 export function docsHint(p: ProjectConfig): string {
-  return `Project docs to read first if present: ${p.docs.join(', ')}. ADRs live in ${p.adrDir}.`;
+  const rules: string[] = [];
+  if (p.protectTests) {
+    rules.push('Existing test files are protected: any change to a test file that already exists on the base branch needs human review. '
+      + 'Add tests for new behavior in NEW test files (for example test/<feature>.test.ts), and leave existing test files unchanged. '
+      + 'Plans must specify a new test file per ticket where tests are needed.');
+  }
+  if (p.humanReviewPaths.length) rules.push(`Changes to paths matching ${p.humanReviewPaths.map((r) => `/${r}/`).join(', ')} need human review; avoid them unless the ticket requires it.`);
+  return `Project docs to read first if present: ${p.docs.join(', ')}. ADRs live in ${p.adrDir}.${rules.length ? `\nProject rules:\n${rules.map((r) => `- ${r}`).join('\n')}` : ''}`;
 }
 
 export const PLANNING_SYSTEM = `You are the Planning Agent of an autonomous development system.
