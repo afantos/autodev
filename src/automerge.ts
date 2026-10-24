@@ -108,10 +108,12 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     }
     try {
       const out = await reviewer.review(input);
-      settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict });
+      // Unknown usage keeps the worst-case reservation; known usage settles to the tier-priced cost.
+      if (out.costUsd === null) settleExternalUsage(db, reservation.id, { model: out.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: `${out.verdict.verdict}-usage-unknown` });
+      else settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict });
       verdict = out.verdict;
       kvSet(db, verdictKey, JSON.stringify(verdict));
-      logEvent(db, 'second_review', `${job.ticket_identifier}: ${verdict.verdict} (${out.model}, $${out.costUsd.toFixed(3)}): ${verdict.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
+      logEvent(db, 'second_review', `${job.ticket_identifier}: ${verdict.verdict} (${out.model}, ${out.costUsd === null ? `usage unknown, charged $${worst.toFixed(3)}` : `$${out.costUsd.toFixed(3)}`}): ${verdict.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
     } catch (e) {
       const err = e as Error & { costUsd?: number; inputTokens?: number; outputTokens?: number };
       // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.

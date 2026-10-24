@@ -119,9 +119,19 @@ const ConfigSchema = z.object({
     model: z.string().default('gpt-6.1-sol'),
     dailyUsd: z.number().positive().default(50),
     monthlyUsd: z.number().positive().default(300),
-    /** Pricing used to compute spend from reported token usage (USD per 1M tokens). */
-    inputUsdPerMTok: z.number().nonnegative().default(2),
-    outputUsdPerMTok: z.number().nonnegative().default(10),
+    /**
+     * Standard-tier pricing (USD per 1M tokens) and the long-context rule, from the model's official pricing page
+     * (gpt-6.1-sol, checked 2026-10-24): >272K input tokens bills the whole request at 2x input/cache and 1.5x output.
+     */
+    pricing: z.object({
+      inputUsdPerMTok: z.number().nonnegative().default(2),
+      cachedInputUsdPerMTok: z.number().nonnegative().default(0.1),
+      cacheWriteUsdPerMTok: z.number().nonnegative().default(2.5),
+      outputUsdPerMTok: z.number().nonnegative().default(10),
+      longContextThresholdTokens: z.number().int().positive().default(272_000),
+      longContextInputMultiplier: z.number().min(1).default(2),
+      longContextOutputMultiplier: z.number().min(1).default(1.5),
+    }).prefault({}),
     maxOutputTokens: z.number().int().positive().default(16_000),
     /** Cap on supplied docs + diff (characters); larger diffs go to a human instead of being truncated. */
     maxInputChars: z.number().int().positive().default(600_000), // bytes of the full request

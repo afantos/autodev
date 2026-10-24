@@ -143,7 +143,7 @@ async function main() {
       console.log(`avg cost per delivered ticket: $${(done.c ?? 0).toFixed(2)} over ${done.n}`);
       if (cfg.secondReview.enabled) {
         const p = cfg.secondReview.provider;
-        const ext = ctx.db.prepare(`SELECT model, COUNT(*) n, SUM(cost_usd) cost, SUM(CASE WHEN outcome='approve' THEN 1 ELSE 0 END) approved, SUM(CASE WHEN outcome='request_changes' THEN 1 ELSE 0 END) changes FROM external_usage WHERE provider = ? AND ts >= ? GROUP BY model`).all(p, startOfMonth()) as { model: string; n: number; cost: number; approved: number; changes: number }[];
+        const ext = ctx.db.prepare(`SELECT model, COUNT(*) n, SUM(cost_usd) cost, SUM(CASE WHEN outcome LIKE 'approve%' THEN 1 ELSE 0 END) approved, SUM(CASE WHEN outcome LIKE 'request_changes%' THEN 1 ELSE 0 END) changes FROM external_usage WHERE provider = ? AND ts >= ? GROUP BY model`).all(p, startOfMonth()) as { model: string; n: number; cost: number; approved: number; changes: number }[];
         console.log(`second review (${p}, separate budget): today $${externalSpentSince(ctx.db, p, startOfDay()).toFixed(2)} / $${cfg.secondReview.dailyUsd}   month $${externalSpentSince(ctx.db, p, startOfMonth()).toFixed(2)} / $${cfg.secondReview.monthlyUsd}`);
         for (const r of ext) console.log(`  ${r.model} reviews=${r.n} approved=${r.approved} changes=${r.changes} cost=$${r.cost.toFixed(2)}`);
       }

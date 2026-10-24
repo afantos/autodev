@@ -43,7 +43,7 @@ export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 
     : new LocalScm(db, cfg.dataDir, cfg.localCi));
   const runner = overrides.runner ?? new ClaudeRunner();
   const secondReviewer = overrides.secondReviewer ?? (cfg.secondReview.enabled
-    ? new OpenAiReviewer(secret('OPENAI_API_KEY')!, cfg.secondReview.model, { inputUsdPerMTok: cfg.secondReview.inputUsdPerMTok, outputUsdPerMTok: cfg.secondReview.outputUsdPerMTok, maxOutputTokens: cfg.secondReview.maxOutputTokens, timeoutMs: cfg.secondReview.timeoutSeconds * 1000 })
+    ? new OpenAiReviewer(secret('OPENAI_API_KEY')!, cfg.secondReview.model, { pricing: cfg.secondReview.pricing, maxOutputTokens: cfg.secondReview.maxOutputTokens, timeoutMs: cfg.secondReview.timeoutSeconds * 1000 })
     : undefined);
   return { cfg, db, tracker, scm, runner, secondReviewer, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
 }

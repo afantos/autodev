@@ -59,7 +59,7 @@ budget:                                  # USD, SDK estimates; the Claude Consol
 secondReview:                            # independent merge reviewer; separate budget from Claude (approved 2026-10-24)
   enabled: true
   provider: openai
-  model: gpt-6.1-sol                     # $2 / $10 per 1M input/output tokens (developers.openai.com, checked 2026-10-24)
+  model: gpt-6.1-sol                     # $2 in / $0.10 cached / $10 out per 1M; >272K input: whole request 2x in, 1.5x out (checked 2026-10-24)
   dailyUsd: 50
   monthlyUsd: 300                        # also set this as the OpenAI project's monthly limit
 
