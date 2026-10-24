@@ -81,6 +81,11 @@ const ConfigSchema = z.object({
     heartbeatSeconds: z.number().default(30),
     ciPollSeconds: z.number().default(60),
     cancellationPollSeconds: z.number().positive().default(5),
+    /**
+     * After a successful push, how long the PR's reported head may lag behind (GitHub's API is eventually consistent).
+     * Only the exact validated candidate is accepted; a mismatch that persists past this window blocks as tampering.
+     */
+    prHeadConvergeSeconds: z.number().positive().max(300).default(30),
   }).prefault({}),
   limits: z.object({
     maxAttempts: z.number().default(3),

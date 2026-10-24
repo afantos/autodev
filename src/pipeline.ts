@@ -205,6 +205,7 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
         pr = await scm.createPr(job.repo, { head: job.branch!, base: job.base_branch!, title: `${job.ticket_identifier}: ${ticket.title}`, body, draft: true });
         logEvent(db, 'pr.created', `#${pr.number} ${pr.url}`, { jobId: job.id, ticketId: job.ticket_id });
       }
+      pr = await awaitPrHead(ctx, job, pr, signal);
       assertPrCandidate(job, pr);
       updateJob(db, job.id, { pr_number: pr.number, pr_url: pr.url }, owner);
       Object.assign(job, { pr_number: pr.number, pr_url: pr.url });
@@ -250,6 +251,33 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
 function candidate(job: Job): string {
   if (!job.candidate_sha || !job.base_sha) throw new WorktreeTamperedError(job.worktree ?? job.id, 'job has no trusted candidate/base hashes');
   return job.candidate_sha;
+}
+
+/**
+ * The push stage just pushed the validated candidate, but the PR API can briefly report the previous head. Re-read the
+ * PR for a bounded window and return as soon as it reports exactly the candidate. Nothing else is accepted: if the head
+ * still differs when the window ends, the caller's assertPrCandidate blocks the job as tampering, as before.
+ */
+async function awaitPrHead(ctx: Ctx, job: Job, pr: PullRequest, signal: AbortSignal): Promise<PullRequest> {
+  const want = candidate(job);
+  if (pr.headSha === want) return pr;
+  const windowMs = ctx.cfg.loop.prHeadConvergeSeconds * 1000;
+  const intervalMs = Math.min(2_000, Math.max(50, windowMs / 10));
+  const started = Date.now();
+  const firstSeen = pr.headSha;
+  while (Date.now() - started < windowMs) {
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(resolve, intervalMs);
+      signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason); }, { once: true });
+    });
+    pr = await ctx.scm.getPr(job.repo, pr.number);
+    if (pr.headSha === want) {
+      logEvent(ctx.db, 'pr.head_converged', `#${pr.number}: API reported ${firstSeen.slice(0, 12)} after the push; converged to the candidate ${want.slice(0, 12)} after ${Date.now() - started} ms`, { jobId: job.id, ticketId: job.ticket_id });
+      return pr;
+    }
+  }
+  logEvent(ctx.db, 'pr.head_mismatch', `#${pr.number}: head still ${pr.headSha.slice(0, 12)} (candidate ${want.slice(0, 12)}) after ${windowMs} ms`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  return pr;
 }
 
 function assertPrCandidate(job: Job, pr: PullRequest) {
