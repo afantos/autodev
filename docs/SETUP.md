@@ -77,19 +77,23 @@ How you work in Linear:
 
 1. Create a machine user (for example `yourname-autodev`) or a GitHub App, and give it **write**
    access to only the target repos.
-2. Create a fine-grained PAT for it with these permissions on those repos only:
-   - Contents: Read & write
-   - Pull requests: Read & write
-   - Checks: Read
-   - Actions: Read
-   - Commit statuses: Read
-   - Deployments: Read
-   - Metadata: Read
-   - **No** Administration, Secrets or Workflows write.
+2. Create the bot's token. Which kind depends on who owns the repo:
+   - **Repo owned by an organization:** a fine-grained token with the org as resource owner,
+     scoped to only the target repos, with these permissions:
+     - Read and write: Contents, Pull requests
+     - Read only: Checks, Actions, Commit statuses, Deployments, Metadata
+     - **No** Administration, Secrets or Workflows write
+   - **Repo owned by a personal account (bot invited as a collaborator):** fine-grained tokens
+     don't support contributing to repos where you're a collaborator (a gap GitHub's token docs
+     list). Use a **classic** token with the `repo` scope and an expiry, for example 90 days.
+     In practice its reach is limited to the repos the bot was invited to, with write access.
+     Branch protection is what stops it from merging or pushing to `main`, so it's required.
 
    Store it as `GITHUB_TOKEN` in `.env`.
 3. In each repo, add CI (`templates/github/ci.yml`), then protect `main` with your own admin
-   credentials:
+   credentials. Branch protection on **private** repos needs a paid plan: GitHub Pro for
+   personal accounts, Team for organizations. On GitHub Free the API returns HTTP 403.
+   Command:
    ```bash
    ./scripts/protect-branch.sh your-org/webapp main "checks,audit"
    ```

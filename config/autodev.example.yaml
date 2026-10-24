@@ -1,7 +1,7 @@
 # autodev configuration. Copy to autodev.config.yaml (gitignored).
 # Secrets are NEVER put here — they come from the environment / .env next to this file:
 #   LINEAR_API_KEY            Linear personal API key (Settings → Security & access → API keys)
-#   GITHUB_TOKEN              fine-grained PAT of a *bot* account (see docs/SETUP.md §3)
+#   GITHUB_TOKEN              bot account token: fine-grained for org repos, classic `repo` for personal-account repos (docs/SETUP.md §3)
 #   ANTHROPIC_API_KEY         Claude Console API key with a spend limit (recommended for unattended use)
 #   AUTODEV_DASHBOARD_TOKEN   random string for the status page
 #   AUTODEV_REPORT_WEBHOOK    optional ntfy/Slack webhook for the morning report
