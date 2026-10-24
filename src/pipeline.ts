@@ -9,7 +9,7 @@ import type { AgentRunResult, AgentTool } from './agents/runner.ts';
 import { CodingResultSchema, ReviewSchema, jsonSchema } from './agents/schemas.ts';
 import type { CodingResult, Review } from './agents/schemas.ts';
 import { decisionsForTicket, recordHumanDecision, resolveQuestion } from './decisions.ts';
-import { slugify, tail } from './exec.ts';
+import { shellQuote, slugify, tail } from './exec.ts';
 import { similarity } from './planning.ts';
 import { LABEL_SUGGESTED } from './tracker/types.ts';
 import type { Job, PullRequest, Stage, Ticket } from './types.ts';
@@ -133,6 +133,9 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
     }
 
     case 'implement':
+      // Check the host command runtime before paying for another coding attempt,
+      // including jobs requeued by an earlier validation-sandbox failure.
+      await commandPreflight(ctx, job, project, signal);
       await implement(ctx, job, ticket, project, signal);
       signal.throwIfAborted();
       await ws.commitAll(job.worktree!, `${job.ticket_identifier}: preserve implementation before policy checks`);
@@ -273,6 +276,19 @@ function feedbackLoop(ctx: Ctx, job: Job, source: string, feedback: string): nev
 async function projectCommand(ctx: Ctx, job: Job, project: ProjectConfig, cmd: string, timeoutMs: number, signal: AbortSignal) {
   const env = projectEnv(project, job);
   return ctx.runCommand(cmd, job.worktree!, env, timeoutMs, signal, { npmCacheDir: project.npmCacheDir ? resolve(ctx.cfg.configDir, project.npmCacheDir) : undefined });
+}
+
+async function commandPreflight(ctx: Ctx, job: Job, project: ProjectConfig, signal: AbortSignal) {
+  const marker = 'AUTODEV_RUNTIME_READY';
+  const cmd = `${shellQuote(process.execPath)} -e ${shellQuote(`process.stdout.write('${marker}')`)}`;
+  const result = await projectCommand(ctx, job, project, cmd, 10_000, signal);
+  signal.throwIfAborted();
+  if (result.code === 0 && result.stdout === marker) return;
+  throw new Divert('blocked', 'command sandbox preflight failed', {
+    reason: `command sandbox preflight failed before agent execution (exit ${result.code}${result.signal ? `, signal ${result.signal}` : ''}): ${tail(result.stderr || result.stdout || 'no output', 1500)}`,
+    question: 'Repair and verify the host command sandbox with node scripts/diagnose-sandbox.ts before resuming this ticket.',
+    options: ['Repair the host command sandbox, then retry', 'Cancel'], recommendation: null, decisionId: null,
+  });
 }
 
 function mergeSummary(job: Job, patch: Record<string, unknown>): string {

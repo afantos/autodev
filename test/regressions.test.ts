@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { makeEnv, job } from './helpers.ts';
+import { makeEnv, job, sandboxAvailable } from './helpers.ts';
 import { DEFAULTS } from '../src/agents/fake.ts';
 import type { AgentRunSpec } from '../src/agents/runner.ts';
 import { ClaudeRunner } from '../src/agents/runner.ts';
@@ -69,10 +69,10 @@ test('setup receives no inherited cloud, Anthropic or arbitrary host secrets', a
 test('command OS sandbox denies sibling credential reads and symlink escapes, and protects host writes', async t => {
   const e = makeEnv();
   const cwd = join(e.root, 'seed');
-  const ready = await runSandboxed('true', cwd, {}, 3000);
-  if (ready.code !== 0) {
-    assert.notEqual(process.env.AUTODEV_REQUIRE_SANDBOX_TEST, '1', `Required OS sandbox unavailable: ${ready.stderr.trim()}`);
-    t.skip(`OS sandbox unavailable in this environment: ${ready.stderr.trim()}`); return;
+  const ready = await sandboxAvailable(e.root);
+  if (!ready.ok) {
+    assert.notEqual(process.env.AUTODEV_REQUIRE_SANDBOX_TEST, '1', `Required OS sandbox unavailable: ${ready.why}`);
+    t.skip(`OS sandbox unavailable in this environment: ${ready.why}`); return;
   }
   const secret = join(e.root, 'private.env');
   const escaped = join(e.root, 'escaped');

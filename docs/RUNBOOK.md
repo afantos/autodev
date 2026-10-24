@@ -77,3 +77,15 @@ After restarting, inspect queued work and unsettled budget reservations. Leases 
 - Agents must leave edits uncommitted. A habitual `git commit` or `git stash` changes refs and blocks the job even when the edits are otherwise valid. Keep the event for inspection; do not disable the guard to accommodate it. A real-Claude smoke run is still needed to measure how often agents follow this contract.
 - Jobs record `base_sha`, `candidate_sha`, `validated_sha`, `reviewed_sha` and `candidate_worktree`. Validation and review use the separate candidate snapshot; the remote PR must have the same candidate SHA. No new commit is made after validation.
 - Keep Ubuntu VM verification explicitly outstanding until the required suite passes on the actual kernel/AppArmor setup. No new live-Claude evidence was gathered for this change.
+
+## Command sandbox launch failures (no AI needed)
+
+Run `node scripts/diagnose-sandbox.ts` in Terminal on the intended host, outside any surrounding sandbox. It creates an isolated temporary fixture and does not import the agent runner, open a job database, or retry queued work. No Claude, Linear, GitHub or cloud calls are made.
+
+The diagnostic separates a denied basic sandbox launch (`host_unavailable`) from a working OS sandbox with a broken autodev profile (`profile_failed`). Only the first condition may skip local integration tests; a broken profile must fail. `AUTODEV_REQUIRE_SANDBOX_TEST=1` makes either condition fail the release gate.
+
+On macOS the report includes exit signals, profile files, a tagged Seatbelt log, and a comparison of the legacy policy with literal-root-directory and executable-mapping corrections. Apple's local `dyld-support.sb` documents the loader's need to open `/` as an openat base. The root grant is a **literal** directory grant, not recursive filesystem access. Compilation alone does not prove runtime compatibility.
+
+If the profile launches, the diagnostic also runs fixed Node/npm fixture tests and checks synthetic secret-file, symlink, `.git`, host-write and network boundaries. It saves `report.json` and profile/log artifacts in the printed temporary directory. A failed baseline or probe leaves the report unsuccessful; it never falls back to unsandboxed repository execution.
+
+Every coding attempt, including a requeued attempt, first checks the command sandbox with a fixed Node marker. Failure blocks the ticket before starting an agent. Repair and verify isolation before resuming it. The stopped paid smoke job remains separate, and another real-Claude run still requires explicit authorization.

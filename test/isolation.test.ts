@@ -131,7 +131,7 @@ test('validation path under the real OS sandbox: the .git pointer and git metada
     assert.equal(existsSync(join(rec.commonDir, 'hooks', 'post-commit')), false);
     assert.equal(remoteBranches(e.repo), '', 'failed validation pushed nothing');
     assert.equal(j.status, 'blocked');
-    assert.match(String(j.blocked_reason), /git metadata in candidate snapshot/);
+    assert.match(String(j.blocked_reason), /candidate snapshot invalid: (?:git metadata in candidate snapshot|unexpected files or index changes:)/);
   });
 });
 

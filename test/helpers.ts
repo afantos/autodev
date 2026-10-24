@@ -72,7 +72,8 @@ export function job(env: Env, identifier: string) {
 export async function sandboxAvailable(root: string): Promise<{ ok: boolean; why: string }> {
   const dir = join(root, 'sandbox-probe');
   mkdirSync(dir, { recursive: true });
-  const { runSandboxed } = await import('../src/command-sandbox.ts');
-  const r = await runSandboxed('true', dir, {}, 5000);
-  return { ok: r.code === 0, why: (r.stderr || `exit ${r.code}`).trim() };
+  const { diagnoseSandbox } = await import('../src/sandbox-diagnostics.ts');
+  const result = await diagnoseSandbox(dir);
+  if (result.status === 'profile_failed') throw new Error(`OS sandbox baseline works, but autodev's profile failed: ${result.probe?.stderr || `exit ${result.probe?.code}`}`);
+  return { ok: result.status === 'ready', why: (result.baseline.stderr || `baseline exit ${result.baseline.code}`).trim() };
 }

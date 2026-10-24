@@ -38,6 +38,8 @@ The `systempaths` option permits bubblewrap to mount its private `/proc`. These 
 
 Before connecting accounts, run `AUTODEV_REQUIRE_SANDBOX_TEST=1 npm run check` on the intended host. Ubuntu 24.04 kernel/AppArmor verification and a live-Claude check of these latest changes remain outstanding. Earlier Debian container evidence does not establish the Ubuntu VM configuration.
 
+For a free command-sandbox preflight, run `node scripts/diagnose-sandbox.ts` directly in Terminal first. It uses only synthetic fixtures and never starts an agent or resumes a job. On macOS a successful native profile compilation is insufficient: the runtime, Node/npm fixture and isolation probes must also pass. The macOS bootstrap correction remains unverified end to end until this host-level diagnostic succeeds.
+
 ## 1. Claude authentication: decide this first (you)
 
 | Option | Billing | Fit for 24/7 unattended use |

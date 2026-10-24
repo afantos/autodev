@@ -1,5 +1,5 @@
 import { cpSync, existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { run } from './exec.ts';
 import type { ExecResult } from './exec.ts';
@@ -27,6 +27,26 @@ export interface SandboxInputs {
   npmCacheDir?: string;
   /** Test seam only (not reachable from config): substitute the sandbox launcher to simulate it being unavailable. */
   launcherOverride?: string;
+  /** Diagnostic callback; never reachable from project configuration or agent tools. */
+  onProfile?: (profile: string, tag: string) => void;
+}
+
+/** Root is a literal directory grant, not a recursive read grant. On modern macOS,
+ * dyld's libignition opens / as the base for openat (see Apple's dyld-support.sb).
+ */
+export function macosSandboxProfile(worktree: string, scratch: string, runtime: string, tag: string): string {
+  const path = (p: string) => JSON.stringify(p);
+  const readable = ['/System', '/usr', '/bin', '/sbin', '/Library/Apple', '/private/etc/localtime', runtime, worktree, scratch];
+  const paths = readable.map(p => `(subpath ${path(p)})`).join(' ');
+  return `(version 1)
+(deny default (with message ${path(tag)}))
+(allow process-exec process-fork signal sysctl-read mach-lookup)
+(allow file-read-metadata)
+(allow file-read* file-test-existence (literal "/"))
+(allow file-read* ${paths} (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random"))
+(allow file-map-executable ${paths})
+(allow file-write* (subpath ${path(worktree)}) (subpath ${path(scratch)}) (literal "/dev/null"))
+(deny file-write* (literal ${path(join(worktree, '.git'))}))`;
 }
 
 export async function runSandboxed(cmd: string, cwd: string, extra: Record<string, string>, timeoutMs: number, signal?: AbortSignal, inputs: SandboxInputs = {}): Promise<ExecResult> {
@@ -39,16 +59,12 @@ export async function runSandboxed(cmd: string, cwd: string, extra: Record<strin
     // Symlinks remain symlinks and cannot escape the OS sandbox's read boundary.
     if (inputs.npmCacheDir) cpSync(join(inputs.npmCacheDir, '_cacache'), join(scratch, 'npm', '_cacache'), { recursive: true, dereference: false });
     if (process.platform === 'darwin') {
-      const path = (p: string) => JSON.stringify(p);
-      const readable = ['/System', '/usr', '/bin', '/sbin', '/Library/Apple', '/private/etc/localtime', runtime, worktree, scratch];
-      const profile = `(version 1)
-(deny default)
-(allow process-exec process-fork signal sysctl-read mach-lookup)
-(allow file-read-metadata)
-(allow file-read* ${readable.map(p => `(subpath ${path(p)})`).join(' ')} (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random"))
-(allow file-write* (subpath ${path(worktree)}) (subpath ${path(scratch)}) (literal "/dev/null"))
-(deny file-write* (literal ${path(join(worktree, '.git'))}))`;
-      return await run(inputs.launcherOverride ?? '/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-c', cmd], { cwd: worktree, env, timeoutMs, signal });
+      const tag = `AUTODEV_${basename(scratch)}`;
+      const profile = macosSandboxProfile(worktree, scratch, runtime, tag);
+      inputs.onProfile?.(profile, tag);
+      const result = await run(inputs.launcherOverride ?? '/usr/bin/sandbox-exec', ['-p', profile, '/bin/sh', '-c', cmd], { cwd: worktree, env, timeoutMs, signal });
+      if (result.code !== 0) result.stderr += `\nSandboxed command exited ${result.code}${result.signal ? ` (signal ${result.signal})` : ''}. Seatbelt log tag: ${tag}. Run the no-AI diagnostic: node scripts/diagnose-sandbox.ts\n`;
+      return result;
     }
     if (process.platform === 'linux') {
       const args = ['--unshare-all', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp'];
