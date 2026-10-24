@@ -1,0 +1,66 @@
+# autodev configuration for the DigitalOcean droplet (autodev-1), project: poker (Linear team DEV).
+# Installed to /opt/autodev/instance/autodev.config.yaml. Contains NO secrets: credentials come only from
+# /opt/autodev/instance/.env. All choices below were made by the operator on 2026-10-24.
+
+dataDir: ./data                          # /opt/autodev/instance/data (state DB, records; agents denied)
+workspaceDir: /opt/autodev/instance-work # clones, worktrees, candidate snapshots (outside HOME/config/data)
+
+tracker: linear
+scm: github
+runner: claude
+
+projects:
+  - key: poker
+    repo: afantos/poker
+    linear:
+      teamKey: DEV
+    setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
+    npmCacheDir: /opt/autodev/instance/cache/npm     # operator-seeded from poker's package-lock.json
+    validate: ["npm run typecheck", "npm run lint", "npm test"]
+    requiredChecks: ["checks"]                       # GitHub Actions job in .github/workflows/ci.yml
+    env:
+      NODE_ENV: test
+    maxConcurrent: 1
+    stackedBranches: false
+    approvedDependencies: []
+
+linear:
+  states:                                # must match your Linear workflow state names
+    ideas: Ideas
+    backlog: Backlog
+    ready: Ready
+    in_progress: In Progress
+    review: In Review
+    done: Done
+    blocked: Blocked
+    failed: Failed
+    canceled: Canceled
+  requireLabel: autodev                  # only tickets carrying this label are touched (safe default)
+
+concurrency:
+  global: 1                              # first supervised runs: one agent at a time
+
+budget:                                  # USD, SDK estimates; the Claude Console monthly limit is the hard stop
+  dailyUsd: 5
+  monthlyUsd: 50
+  perTicketUsd: 3
+  perRunUsd: 1.5
+  perDecisionUsd: 0.5
+  onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically
+
+models:
+  planning: opus
+  coding: sonnet
+  codingComplex: opus
+  complexThreshold: 4
+  decision: sonnet
+  review: opus
+  classify: haiku
+
+sandbox:
+  enabled: true
+  failIfUnavailable: true
+  allowedDomains: [registry.npmjs.org]
+
+dashboard: { enabled: false, host: 127.0.0.1, port: 7777 }   # not exposed; enable later with a token
+report: { hour: -1 }                     # no notifications yet
