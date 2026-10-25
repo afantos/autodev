@@ -16,7 +16,7 @@ projects:
       teamKey: DEV
     setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
     npmCacheDir: /opt/autodev/instance/cache/npm     # operator-seeded from poker's package-lock.json
-    validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # = poker's `npm run check`
+    validate: ["npm run typecheck", "npm run lint", "npm test", "NODE_ENV=production npm run build"]   # build in production mode; tests use NODE_ENV=test
     requiredChecks: ["checks"]                       # GitHub Actions job in .github/workflows/ci.yml
     env:
       NODE_ENV: test
