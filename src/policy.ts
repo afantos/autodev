@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { analyzeTestUpdate } from './test-updates.ts';
+import type { TestUpdateAnalysis } from './test-updates.ts';
 import { join } from 'node:path';
 import type { Config, ProjectConfig } from './config.ts';
 import { AUTO_CATEGORIES } from './agents/schemas.ts';
@@ -89,7 +91,7 @@ const WEAKENING_ADDED: [RegExp, string][] = [
  */
 export function testWeakening(file: string, addedLines: string[], existedOnBase: boolean): string[] {
   const out = new Set<string>();
-  if (existedOnBase) out.add(`${file}: existing test file changed`);
+  if (existedOnBase) out.add(existingTestReason(file));
   for (const l of addedLines) for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
   return [...out];
 }
@@ -109,7 +111,27 @@ function withoutApprovedDeps(manifest: Record<string, unknown>, approved: string
 /** Mandatory check of committed changes against the trusted integration branch.
  * Semantic checks are conservative heuristics; they do not replace human review.
  */
-export async function inspectChanges(ws: Workspaces, worktree: string, base: string, project: ProjectConfig, cfg: Config): Promise<{ hash: string; reasons: string[] }> {
+export interface PolicyInspection {
+  hash: string;
+  reasons: string[];
+  /** Existing test files changed in this diff, each with its narrow-update analysis (option B). */
+  testUpdates: (TestUpdateAnalysis & { file: string })[];
+}
+
+/** The reason string the protectTests rule emits for an edited existing test file. */
+export const existingTestReason = (file: string) => `${file}: existing test file changed`;
+
+/**
+ * True when the ONLY policy findings are edits to existing test files and every one of them is an eligible narrow update.
+ * Any other finding (dependencies, CI, protected paths, deletions, skips, security keywords...) keeps the human gate.
+ */
+export function onlyNarrowTestUpdates(r: PolicyInspection): boolean {
+  if (!r.reasons.length || !r.testUpdates.length) return false;
+  const eligible = new Set(r.testUpdates.filter((u) => u.eligible).map((u) => existingTestReason(u.file)));
+  return r.testUpdates.every((u) => u.eligible) && r.reasons.every((reason) => eligible.has(reason));
+}
+
+export async function inspectChanges(ws: Workspaces, worktree: string, base: string, project: ProjectConfig, cfg: Config): Promise<PolicyInspection> {
   const state = ws.trustedState(worktree);
   const ref = state.base_sha;
   const head = state.head_sha;
@@ -159,10 +181,19 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   }
   // Exclude documentation from semantic keyword rules, but inspect every code file's added lines.
   const added: string[] = [];
+  const testUpdates: PolicyInspection['testUpdates'] = [];
   for (const f of files) {
     const lines = await addedLines(f);
     if (!/\.(md|txt|snap)$/.test(f)) added.push(...lines);
-    if (project.protectTests && TEST_FILE.test(f)) reasons.push(...testWeakening(f, lines, await exists(ref, f)));
+    if (project.protectTests && TEST_FILE.test(f)) {
+      const existed = await exists(ref, f);
+      reasons.push(...testWeakening(f, lines, existed));
+      if (existed) {
+        const before = await content(ref, f);
+        const after = await content(head, f);
+        testUpdates.push({ file: f, ...(before === null || after === null ? { eligible: false, why: 'existing test file removed', changes: [] } : analyzeTestUpdate(before, after)) });
+      }
+    }
   }
   const text = added.join('\n');
   for (const [pattern, reason] of HUMAN_PATTERNS) if (pattern.test(text)) reasons.push(`diff touches ${reason}`);
@@ -170,5 +201,5 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   for (const keyword of cfg.policy.humanKeywords) if (new RegExp(keyword, 'i').test(diff)) reasons.push(`diff matches configured keyword /${keyword}/`);
   // Include the complete tree, since binary changes can have identical textual diffs.
   const hash = createHash('sha256').update(ref).update(await ws.git(worktree, ['rev-parse', `${head}^{tree}`])).update(diff).digest('hex');
-  return { hash, reasons: [...new Set(reasons)] };
+  return { hash, reasons: [...new Set(reasons)], testUpdates };
 }

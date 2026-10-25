@@ -16,7 +16,7 @@ import type { Job, PullRequest, Stage, Ticket } from './types.ts';
 import { STAGES } from './types.ts';
 import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
-import { inspectChanges } from './policy.ts';
+import { inspectChanges, onlyNarrowTestUpdates } from './policy.ts';
 export { scanSecrets } from './secrets.ts';
 
 const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
@@ -298,6 +298,17 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
   if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
   const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
+  // Option B: when the ONLY findings are eligible narrow existing-test updates and auto-merge with a second reviewer is
+  // on, don't stop for a human here. The merge gate then requires a recorded superseding requirement and a dedicated
+  // test-integrity review of the exact candidate, and holds for a human otherwise. Nothing merges on this path alone.
+  if (project.autoMerge && ctx.cfg.secondReview.enabled && onlyNarrowTestUpdates(result)) {
+    const key = `policy-deferred:${job.id}:${result.hash}`;
+    if (!kvGet(ctx.db, key)) {
+      kvSet(ctx.db, key, '1');
+      logEvent(ctx.db, 'policy.test_update_deferred', `${job.ticket_identifier}: narrow existing-test update (${result.testUpdates.map((u) => `${u.file}: ${u.changes.length} rename/expected-value change(s)`).join('; ')}) deferred to the test-integrity review`, { jobId: job.id, ticketId: job.ticket_id });
+    }
+    return;
+  }
   throw new Divert('blocked', 'mandatory diff policy requires human approval', {
     reason: result.reasons.join('; '), policyHash: result.hash,
     question: `Review the local diff (${result.hash.slice(0, 12)}). Remove the flagged changes, or explicitly approve this exact diff with /answer approve.`,

@@ -22,6 +22,12 @@ export function docsHint(p: ProjectConfig): string {
     rules.push('Existing test files are protected: any change to a test file that already exists on the base branch needs human review. '
       + 'Add tests for new behavior in NEW test files (for example test/<feature>.test.ts), and leave existing test files unchanged. '
       + 'Plans must specify a new test file per ticket where tests are needed.');
+    if (p.autoMerge) {
+      rules.push('Narrow exception: when this ticket or a recorded human decision explicitly says earlier behavior is SUPERSEDED, you may '
+        + 'update an existing test in place, but only its test name and the expected value of an existing assert.equal/strictEqual/deepEqual/deepStrictEqual '
+        + '(same assertion, same actual expression, a plain literal as the new value). Never delete, skip, comment out, add or otherwise edit lines in an '
+        + 'existing test file; put new coverage in new test files. Such updates get a dedicated test-integrity review; anything broader goes to a human.');
+    }
   }
   if (p.humanReviewPaths.length) rules.push(`Changes to paths matching ${p.humanReviewPaths.map((r) => `/${r}/`).join(', ')} need human review; avoid them unless the ticket requires it.`);
   return `Project docs to read first if present: ${p.docs.join(', ')}. ADRs live in ${p.adrDir}.${rules.length ? `\nProject rules:\n${rules.map((r) => `- ${r}`).join('\n')}` : ''}`;

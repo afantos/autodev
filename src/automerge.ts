@@ -2,8 +2,13 @@ import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, settleExternalUsage, tx, updateJob } from './db.ts';
 import { startOfDay, startOfMonth } from './budget.ts';
-import { inspectChanges } from './policy.ts';
-import { SecondReviewSchema, effectiveVerdict, requestBytes } from './agents/second-review.ts';
+import { inspectChanges, onlyNarrowTestUpdates } from './policy.ts';
+import type { PolicyInspection } from './policy.ts';
+import { decisionsForTicket } from './decisions.ts';
+import { findSupersedingRequirement } from './test-updates.ts';
+import { SecondReviewSchema, TestIntegritySchema, effectiveVerdict, requestBytes, testIntegrityApproved } from './agents/second-review.ts';
+import type { TestUpdateReviewInput } from './agents/second-review.ts';
+import type { z } from 'zod';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
 
@@ -73,26 +78,22 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (checks.state === 'pending') return 'waiting';
   if (checks.state !== 'success' && !(checks.state === 'none' && !project.requiredChecks.length)) return hold(`CI is not green on ${sha.slice(0, 12)} (${checks.state}).`);
 
-  // 4. Mandatory policy: flagged changes always go to a human, even if a human approved them earlier.
+  // 4. Mandatory policy: flagged changes go to a human, even if a human approved them earlier. The single exception
+  // (option B): findings that are ONLY eligible narrow existing-test updates, not human-approved, may pass a recorded
+  // superseding requirement plus a dedicated test-integrity review of this exact candidate.
   const policy = await inspectChanges(ws, job.worktree, job.base_branch, project, cfg);
-  if (policy.reasons.length) return hold(`The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`);
+  if (policy.reasons.length) {
+    const narrow = onlyNarrowTestUpdates(policy) && !kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
+    if (!narrow) return hold(`The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`);
+    const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
+    if (gate !== 'approved') return gate;
+  }
 
   // 5. Independent second review, once per candidate sha.
   const verdictKey = `second-review:${job.id}:${sha}`;
   // A cached verdict is reused only if it still validates against the current schema. Verdicts cached by an older
   // version (e.g. findings without a category) are discarded and the review runs again: never reinterpret them.
-  let verdict: SecondReviewVerdict | null = null;
-  const cached = kvGet(db, verdictKey);
-  if (cached) {
-    let raw: unknown = null;
-    try { raw = JSON.parse(cached); } catch { /* unreadable → invalid */ }
-    const parsed = SecondReviewSchema.safeParse(raw);
-    if (parsed.success) verdict = parsed.data;
-    else {
-      kvSet(db, verdictKey, null);
-      logEvent(db, 'second_review.cache_invalidated', `${job.ticket_identifier}: cached verdict for ${sha.slice(0, 12)} doesn't match the current schema; reviewing again`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
-    }
-  }
+  let verdict = cachedVerdict(ctx, job, verdictKey, SecondReviewSchema, 'second_review');
   if (!verdict) {
     const input = {
       repo: job.repo, ticket, baseSha: job.base_sha!, candidateSha: sha,
@@ -100,44 +101,16 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       diffStat: await ws.diff(job.worktree, job.base_branch, true),
       diff: await ws.diff(job.worktree, job.base_branch),
     };
-    const worst = reviewer.maxCostUsd(input);
     const bytes = requestBytes(input);
     if (bytes > cfg.secondReview.maxInputChars) return hold(`The change is too large for the second review (${bytes} bytes; limit ${cfg.secondReview.maxInputChars}).`);
-    // Reserve the worst case as a pending ledger row before calling: it counts against the caps while the call runs and
-    // stays at the worst case if the process dies or the provider's usage is unknown, so spend is never under-recorded.
-    const reservation = tx(db, () => {
-      const day = externalSpentSince(db, reviewer.provider, startOfDay());
-      const month = externalSpentSince(db, reviewer.provider, startOfMonth());
-      if (day + worst > cfg.secondReview.dailyUsd || month + worst > cfg.secondReview.monthlyUsd) return { ok: false as const, day, month };
-      return { ok: true as const, id: recordExternalUsage(db, { provider: reviewer.provider, model: reviewer.model, jobId: job.id, ticketId: job.ticket_id, costUsd: worst, outcome: 'pending' }) };
-    });
-    if (!reservation.ok) {
-      const key = `second-review-budget:${startOfDay()}`;
-      if (!kvGet(db, key)) {
-        kvSet(db, key, '1');
-        logEvent(db, 'second_review.budget', `second-review budget reached (today $${reservation.day.toFixed(2)}/$${cfg.secondReview.dailyUsd}, month $${reservation.month.toFixed(2)}/$${cfg.secondReview.monthlyUsd}, next review up to $${worst.toFixed(2)}); waiting`, { level: 'warn' });
-      }
-      return 'waiting';
-    }
-    try {
+    const r = await reservedReview(ctx, job, sha, 'second_review', 'second-review-failures', reviewer.maxCostUsd(input), async () => {
       const out = await reviewer.review(input);
-      // Unknown usage keeps the worst-case reservation; known usage settles to the tier-priced cost.
-      if (out.costUsd === null) settleExternalUsage(db, reservation.id, { model: out.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: `${out.verdict.verdict}-usage-unknown` });
-      else settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict });
-      verdict = out.verdict;
-      kvSet(db, verdictKey, JSON.stringify(verdict));
-      logEvent(db, 'second_review', `${job.ticket_identifier}: ${verdict.verdict} (${out.model}, ${out.costUsd === null ? `usage unknown, charged $${worst.toFixed(3)}` : `$${out.costUsd.toFixed(3)}`}): ${verdict.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
-    } catch (e) {
-      const err = e as Error & { costUsd?: number; inputTokens?: number; outputTokens?: number };
-      // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.
-      if (typeof err.costUsd === 'number') settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: err.costUsd, inputTokens: err.inputTokens ?? 0, outputTokens: err.outputTokens ?? 0, outcome: 'error' });
-      else settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: 'error-usage-unknown' });
-      const failKey = `second-review-failures:${job.id}:${sha}`;
-      const failures = Number(kvGet(db, failKey) ?? 0) + 1;
-      kvSet(db, failKey, String(failures));
-      logEvent(db, 'second_review.error', `${job.ticket_identifier}: ${err.message.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
-      return failures >= 3 ? hold(`The second review failed ${failures} times: ${err.message.slice(0, 500)}`) : 'waiting';
-    }
+      return { value: out.verdict, model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.verdict.verdict, summary: out.verdict.summary };
+    });
+    if (r.kind === 'waiting') return 'waiting';
+    if (r.kind === 'failed') return hold(`The second review failed ${r.failures} times: ${r.message.slice(0, 500)}`);
+    verdict = r.value;
+    kvSet(db, verdictKey, JSON.stringify(verdict));
   }
 
   // The merge decision is enforced in code: only blocker findings, or major bugs/regressions/spec/security/test gaps, block.
@@ -189,4 +162,102 @@ async function reviewDocs(ctx: Ctx, worktree: string, sha: string, project: Proj
   const out: { path: string; content: string }[] = [];
   for (const f of wanted.slice(0, 60)) out.push({ path: f, content: (await ctx.ws.git(worktree, ['cat-file', 'blob', `${sha}:${f}`])).slice(0, 100_000) });
   return out;
+}
+
+type ReviewRun<T> = { value: T; model: string; costUsd: number | null; inputTokens: number; outputTokens: number; outcome: string; summary: string };
+
+/** Reuse a cached verdict only if it validates against the current schema; otherwise drop it so the review runs again. */
+function cachedVerdict<T>(ctx: Ctx, job: Job, key: string, schema: z.ZodType<T>, event: string): T | null {
+  const cached = kvGet(ctx.db, key);
+  if (!cached) return null;
+  let raw: unknown = null;
+  try { raw = JSON.parse(cached); } catch { /* unreadable → invalid */ }
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+  kvSet(ctx.db, key, null);
+  logEvent(ctx.db, `${event}.cache_invalidated`, `${job.ticket_identifier}: cached verdict for ${key.split(':').at(-1)!.slice(0, 12)} doesn't match the current schema; reviewing again`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  return null;
+}
+
+/**
+ * Run one second-reviewer call under the shared budget rules: reserve the worst case as a pending ledger row inside a
+ * transaction (counts against the caps while it runs; stays charged if usage is unknown or the process dies), then
+ * settle to the provider-reported cost. Used by both the code review and the test-integrity review.
+ */
+async function reservedReview<T>(ctx: Ctx, job: Job, sha: string, event: string, failPrefix: string, worst: number, call: () => Promise<ReviewRun<T>>):
+  Promise<{ kind: 'ok'; value: T } | { kind: 'waiting' } | { kind: 'failed'; failures: number; message: string }> {
+  const { db, cfg } = ctx;
+  const reviewer = ctx.secondReviewer!;
+  const reservation = tx(db, () => {
+    const day = externalSpentSince(db, reviewer.provider, startOfDay());
+    const month = externalSpentSince(db, reviewer.provider, startOfMonth());
+    if (day + worst > cfg.secondReview.dailyUsd || month + worst > cfg.secondReview.monthlyUsd) return { ok: false as const, day, month };
+    return { ok: true as const, id: recordExternalUsage(db, { provider: reviewer.provider, model: reviewer.model, jobId: job.id, ticketId: job.ticket_id, costUsd: worst, outcome: 'pending' }) };
+  });
+  if (!reservation.ok) {
+    const key = `second-review-budget:${startOfDay()}`;
+    if (!kvGet(db, key)) {
+      kvSet(db, key, '1');
+      logEvent(db, 'second_review.budget', `second-review budget reached (today $${reservation.day.toFixed(2)}/$${cfg.secondReview.dailyUsd}, month $${reservation.month.toFixed(2)}/$${cfg.secondReview.monthlyUsd}, next review up to $${worst.toFixed(2)}); waiting`, { level: 'warn' });
+    }
+    return { kind: 'waiting' };
+  }
+  try {
+    const out = await call();
+    // Unknown usage keeps the worst-case reservation; known usage settles to the tier-priced cost.
+    if (out.costUsd === null) settleExternalUsage(db, reservation.id, { model: out.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: `${out.outcome}-usage-unknown` });
+    else settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.outcome });
+    logEvent(db, event, `${job.ticket_identifier}: ${out.outcome} (${out.model}, ${out.costUsd === null ? `usage unknown, charged $${worst.toFixed(3)}` : `$${out.costUsd.toFixed(3)}`}): ${out.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
+    return { kind: 'ok', value: out.value };
+  } catch (e) {
+    const err = e as Error & { costUsd?: number; inputTokens?: number; outputTokens?: number };
+    // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.
+    if (typeof err.costUsd === 'number') settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: err.costUsd, inputTokens: err.inputTokens ?? 0, outputTokens: err.outputTokens ?? 0, outcome: 'error' });
+    else settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: 'error-usage-unknown' });
+    const failKey = `${failPrefix}:${job.id}:${sha}`;
+    const failures = Number(kvGet(db, failKey) ?? 0) + 1;
+    kvSet(db, failKey, String(failures));
+    logEvent(db, `${event}.error`, `${job.ticket_identifier}: ${err.message.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    return failures >= 3 ? { kind: 'failed', failures, message: err.message } : { kind: 'waiting' };
+  }
+}
+
+/**
+ * Option B gate for eligible narrow existing-test updates: a recorded superseding requirement must exist, and a dedicated
+ * test-integrity review of THIS candidate (original tests + proposed test diff + requirement) must approve, with both
+ * "implements the requirement" and "preserves coverage" affirmed. Verdicts are bound to the exact candidate sha.
+ */
+async function testIntegrityGate(ctx: Ctx, job: Job, ticket: Ticket, policy: PolicyInspection, sha: string, hold: (reason: string) => Promise<'held'>): Promise<'approved' | 'waiting' | 'held'> {
+  const { db, ws, tracker } = ctx;
+  const reviewer = ctx.secondReviewer!;
+  const files = policy.testUpdates.map((u) => u.file);
+  const latest = (await tracker.getTicket(ticket.id)) ?? ticket;
+  const comments = await tracker.listComments(ticket.id).catch(() => []);
+  const humanDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved');
+  const superseding = findSupersedingRequirement({ description: latest.description, comments, humanDecisions });
+  if (!superseding.length) {
+    return hold(`Existing tests were updated (only test names and expected values: ${files.join(', ')}), but neither the ticket nor a recorded human decision says the old behavior is superseded. A human needs to confirm.`);
+  }
+  const key = `test-integrity:${job.id}:${sha}`;
+  let verdict = cachedVerdict(ctx, job, key, TestIntegritySchema, 'test_integrity');
+  if (!verdict) {
+    const state = ws.trustedState(job.worktree!);
+    const originalTests: { path: string; content: string }[] = [];
+    for (const f of files) originalTests.push({ path: f, content: await ws.git(job.worktree!, ['cat-file', 'blob', `${state.base_sha}:${f}`]) });
+    const testDiff = await ws.git(job.worktree!, ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', `${state.base_sha}...${sha}`, '--', ...files.map((f) => `:(literal)${f}`)]);
+    const input: TestUpdateReviewInput = { repo: job.repo, ticket: latest, candidateSha: sha, originalTests, testDiff, superseding };
+    const r = await reservedReview(ctx, job, sha, 'test_integrity', 'test-integrity-failures', reviewer.maxTestUpdateCostUsd(input), async () => {
+      const out = await reviewer.reviewTestUpdate(input);
+      return { value: out.verdict, model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: testIntegrityApproved(out.verdict) ? 'approve' : 'reject', summary: out.verdict.summary };
+    });
+    if (r.kind === 'waiting') return 'waiting';
+    if (r.kind === 'failed') return hold(`The test-integrity review failed ${r.failures} times: ${r.message.slice(0, 500)}`);
+    verdict = r.value;
+    kvSet(db, key, JSON.stringify(verdict));
+  }
+  if (!testIntegrityApproved(verdict)) {
+    return hold(`The test-integrity review (${reviewer.model}) did not approve the existing-test update in ${files.join(', ')}: ${verdict.summary}${verdict.concerns.length ? `\n${verdict.concerns.map((c) => `- ${c}`).join('\n')}` : ''}\n(implements requirement: ${verdict.implementsRequirement}; preserves coverage: ${verdict.preservesCoverage})`);
+  }
+  logEvent(db, 'test_integrity.approved', `${job.ticket_identifier}: narrow existing-test update approved at ${sha.slice(0, 12)} (${files.join(', ')})`, { jobId: job.id, ticketId: job.ticket_id });
+  return 'approved';
 }

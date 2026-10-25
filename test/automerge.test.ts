@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { makeEnv, job } from './helpers.ts';
 import { DEFAULTS } from '../src/agents/fake.ts';
 import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, SECOND_REVIEW_SYSTEM, effectiveVerdict, parseUsage, priceUsage, requestBytes, worstCaseUsd } from '../src/agents/second-review.ts';
-import type { Pricing } from '../src/agents/second-review.ts';
+import type { Pricing, TestIntegrityVerdict, TestUpdateReviewInput } from '../src/agents/second-review.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
 import { externalSpentSince, getJob, kvGet, kvSet, spentSince } from '../src/db.ts';
 import { answerBlocked } from '../src/pipeline.ts';
@@ -36,6 +36,14 @@ class FakeReviewer implements SecondReviewer {
   fail?: Error;
   constructor(verdicts: SecondReviewVerdict[], worst = 0.2) { this.verdicts = verdicts; this.worst = worst; }
   maxCostUsd() { return this.worst; }
+  integrity: TestIntegrityVerdict[] = [{ verdict: 'approve', implementsRequirement: true, preservesCoverage: true, summary: 'Expectations match the superseding requirement.', concerns: [] }];
+  integrityInputs: TestUpdateReviewInput[] = [];
+  maxTestUpdateCostUsd() { return this.worst; }
+  async reviewTestUpdate(input: TestUpdateReviewInput) {
+    this.integrityInputs.push(input);
+    const verdict = this.integrity.length > 1 ? this.integrity.shift()! : this.integrity[0]!;
+    return { verdict, model: this.model, costUsd: 0.02, inputTokens: 5_000, outputTokens: 300 };
+  }
   async review(input: SecondReviewInput) {
     this.inputs.push(input);
     await this.during?.();
