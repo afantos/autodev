@@ -2,6 +2,9 @@
 Description=autodev orchestrator
 After=network-online.target
 Wants=network-online.target
+# A failing ExecStartPre (sandbox self-test) must not restart forever: give up after 3 tries in 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -11,6 +14,8 @@ WorkingDirectory=/opt/autodev/instance
 EnvironmentFile=/opt/autodev/instance/.env
 Environment=AUTODEV_CONFIG=/opt/autodev/instance/autodev.config.yaml
 Environment=TZ=America/New_York
+# Refuse to start unless the command sandbox works under THIS unit's hardening (otherwise every ticket fails setup).
+ExecStartPre=/usr/bin/node /opt/autodev/app/scripts/sandbox-selftest.ts
 ExecStart=/usr/bin/node /opt/autodev/app/src/cli.ts run
 Restart=always
 RestartSec=10
@@ -24,7 +29,9 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/opt/autodev/instance /opt/autodev/instance-work /home/autodev/.claude /home/autodev/.cache /home/autodev/.npm /tmp
 PrivateTmp=true
-ProtectKernelTunables=true
+# No ProtectKernelTunables: its read-only overmounts on /proc make the kernel refuse the fresh /proc that the bwrap
+# command sandbox mounts ("Can't mount proc on /newroot/proc: Operation not permitted"; 2026-10-25). The service runs
+# as the unprivileged autodev user, which cannot write kernel tunables anyway.
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true

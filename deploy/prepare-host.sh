@@ -47,6 +47,19 @@ systemctl disable autodev >/dev/null 2>&1 || true
 systemd-analyze verify /etc/systemd/system/autodev.service
 echo "enabled=$(systemctl is-enabled autodev 2>/dev/null || true) active=$(systemctl is-active autodev 2>/dev/null || true)"
 
+echo "== sandbox self-test under the unit's own systemd settings"
+# Read the hardening straight from the installed unit (single source of truth), then run the self-test with exactly
+# those settings as the service user. Fails the preparation if the sandbox can't start under the unit.
+UNIT=/etc/systemd/system/autodev.service
+set --
+while IFS= read -r prop; do
+  [ -n "$prop" ] && set -- "$@" -p "$prop"
+done <<PROPS
+$(sed -n '/^\[Service\]/,/^\[/p' "$UNIT" | grep -E '^(NoNewPrivileges|ProtectSystem|ProtectHome|ReadWritePaths|PrivateTmp|Protect[A-Za-z]+|Restrict[A-Za-z]+|LockPersonality|MemoryMax|PrivateDevices|SystemCallFilter|CapabilityBoundingSet|AmbientCapabilities|Environment|WorkingDirectory)=')
+PROPS
+systemd-run --quiet --wait --pipe --uid=autodev --gid=autodev "$@" /usr/bin/node "$APP/scripts/sandbox-selftest.ts" \
+  || { echo "sandbox self-test FAILED under the unit's settings; not continuing"; exit 1; }
+
 echo "== config schema check (no credentials needed)"
 su - autodev -c "cd $INSTANCE && node --input-type=module -e \"
 import { loadConfig } from '$APP/src/config.ts';
