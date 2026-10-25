@@ -19,6 +19,7 @@ import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
+import { conflictFeedback } from './automerge.ts';
 export { scanSecrets } from './secrets.ts';
 
 const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
@@ -434,7 +435,8 @@ async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectCon
   const priorDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- Q: ${d.question}\n  A (${d.authority}): ${d.decision}`).join('\n');
   // Human answers on the [Plan] umbrella issue (e.g. to the plan's open questions) are part of the requirements.
   const planNotes = ticket.parentId ? (await ctx.tracker.listComments(ticket.parentId).catch(() => [])).filter((c) => !c.byAutomation).map((c) => c.body).join('\n---\n') : '';
-  const feedback = job.pending_feedback;
+  const refreshed = baseRefreshNote(ctx, job);
+  const feedback = [job.pending_feedback, refreshed].filter(Boolean).join('\n\n') || null;
   const status = (await ctx.ws.status(job.worktree!)).trim();
   const ahead = await ctx.ws.aheadOf(job.worktree!, job.base_branch!);
 
@@ -478,6 +480,7 @@ When done, leave the changes in the working tree (the orchestrator commits them)
   if (result.status === 'blocked') throw new Divert('blocked', result.blocker ?? 'agent reported blocked', { reason: result.blocker ?? 'agent reported blocked', question: result.blocker ?? 'The coding agent could not proceed. See its summary.', options: [], recommendation: null, decisionId: null, triage: true });
   if (result.status === 'failed') throw new AgentFailure({ ...res, ok: false, errorKind: 'other', error: result.blocker ?? result.summary });
   updateJob(db, job.id, { pending_feedback: null, summary_json: mergeSummary(job, { coding: result }) }, owner);
+  kvSet(db, `base-refreshed:${job.id}`, null);
   job.pending_feedback = null;
 }
 
@@ -625,6 +628,49 @@ async function handleDivert(ctx: Ctx, job: Job, project: ProjectConfig, e: unkno
 }
 
 /** Preserve WIP locally. Blocked, failed and canceled work is never published. */
+/** Remember that autodev merged the base into this branch, so the coding agent is told those changes are legitimate. */
+export function markBaseRefreshed(ctx: Ctx, job: Job, baseSha: string) {
+  kvSet(ctx.db, `base-refreshed:${job.id}`, JSON.stringify({ base: job.base_branch, sha: baseSha }));
+}
+
+function baseRefreshNote(ctx: Ctx, job: Job): string | null {
+  const raw = kvGet(ctx.db, `base-refreshed:${job.id}`);
+  if (!raw) return null;
+  const r = JSON.parse(raw) as { base: string; sha: string };
+  return `Autodev merged the latest ${r.base} (${r.sha.slice(0, 12)}) into this branch. Every change that came from ${r.base} is legitimate, merged work by other tickets: keep it exactly as it is. Don't delete or revert files you didn't change; if something conflicts or tests now fail, adapt this ticket's change to work with ${r.base}.`;
+}
+
+/**
+ * Shared by every resume of a blocked job (a human answer, or triage once its fix tickets merged): commit leftover work
+ * locally (hardened git; never pushed before validation), then bring the base up to date if it moved (refreshBase keeps
+ * its tamper checks). Any failure is returned, never thrown, so the caller can hold the ticket.
+ */
+export async function prepareResume(ctx: Ctx, job: Job): Promise<{ ok: true; patch: Partial<Job>; note: string } | { ok: false; error: string }> {
+  if (!job.worktree || !job.base_branch) return { ok: true, patch: {}, note: '' };
+  try {
+    const preserved = await ctx.ws.commitAll(job.worktree, `WIP ${job.ticket_identifier} (autodev: preserved before resuming)`);
+    const r = await ctx.ws.refreshBase(job.worktree, job.base_branch);
+    const st = ctx.ws.trustedState(job.worktree);
+    const changed = preserved || r.status !== 'current' || st.head_sha !== job.candidate_sha;
+    const patch: Partial<Job> = changed ? { base_sha: st.base_sha, candidate_sha: st.head_sha, validated_sha: null, reviewed_sha: null, candidate_worktree: null } : {};
+    if (r.status === 'current') return { ok: true, patch, note: '' };
+    markBaseRefreshed(ctx, job, r.baseSha);
+    logEvent(ctx.db, 'job.base_refreshed', `${job.ticket_identifier}: merged the latest ${job.base_branch} before resuming${r.status === 'conflict' ? ` (conflicts in ${r.files.join(', ')})` : ''}`, { jobId: job.id, ticketId: job.ticket_id });
+    return { ok: true, patch, note: r.status === 'conflict' ? conflictFeedback(job.base_branch, r.files) : '' };
+  } catch (e) {
+    return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 500) };
+  }
+}
+
+/** A resume that could not prepare the workspace: keep the job blocked with the reason, once (no retry every tick). */
+export async function holdResume(ctx: Ctx, job: Job, b: Blocker, error: string): Promise<void> {
+  const reason = { ...b, triageWait: undefined, resumeFailed: error };
+  updateJob(ctx.db, job.id, { status: 'blocked', blocked_reason: JSON.stringify(reason) });
+  await ctx.tracker.setStatus(job.ticket_id, 'blocked').catch(() => {});
+  await ctx.tracker.comment(job.ticket_id, `⏸️ autodev could not resume this ticket: preparing the workspace (saving work in progress and merging the latest ${job.base_branch ?? 'base'}) failed, so nothing was changed or pushed.\n\n\`\`\`\n${error}\n\`\`\`\nA human should check the workspace; move the ticket back to Ready to try again.`).catch(() => {});
+  logEvent(ctx.db, 'job.resume_failed', `${job.ticket_identifier}: ${error.split('\n')[0]}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+}
+
 async function preserveWork(ctx: Ctx, job: Job, why: string) {
   if (!job.worktree || !job.branch) return;
   try {
@@ -637,12 +683,14 @@ async function preserveWork(ctx: Ctx, job: Job, why: string) {
 export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   const { db, owner, tracker } = ctx;
   let b = blocker;
+  // Save the interrupted run's work as a local commit first, whatever happens next: triage may park or requeue the job
+  // without reaching a human, and a later base refresh refuses a dirty workspace. Nothing is pushed unvalidated.
+  await preserveWork(ctx, job, 'blocked');
   if (b.triage) {
     const t = await triageBlocker(ctx, job, b).catch((e) => ({ kind: 'human' as const, note: `triage failed: ${(e as Error).message.slice(0, 300)}`, recommendation: null }));
     if (t?.kind === 'resolved') return;
     if (t) b = { ...b, reason: `${b.reason}\n\n**Triage:** ${t.note}`, recommendation: b.recommendation ?? t.recommendation };
   }
-  await preserveWork(ctx, job, 'blocked');
   if (!b.decisionId) {
     // Record the open question in the decision log so the answer is kept with it.
     b.decisionId = recordPending(ctx, job, b);
@@ -701,9 +749,12 @@ export async function resumeBlocked(ctx: Ctx, job: Job, explicitAnswer?: string)
     if (b.policyFingerprint && b.policyReasons) kvSet(ctx.db, `policy-approved-change:${job.id}:${b.policyFingerprint}`, JSON.stringify(b.policyReasons));
   }
   recordHumanDecision(ctx, b.decisionId ?? null, answer, { ticket: ticket ?? undefined, repo: job.repo, question: b.question });
+  const prep = await prepareResume(ctx, job);
+  if (!prep.ok) return holdResume(ctx, job, b, prep.error);
   updateJob(ctx.db, job.id, {
+    ...prep.patch,
     status: 'queued', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, decision_count: Math.max(0, job.decision_count - 1),
-    pending_feedback: `A human answered the blocking question.\nQuestion: ${b.question}\nAnswer: ${answer}\nContinue the implementation accordingly.`,
+    pending_feedback: `A human answered the blocking question.\nQuestion: ${b.question}\nAnswer: ${answer}\nContinue the implementation accordingly.${prep.note ? `\n\n${prep.note}` : ''}`,
     ...(approved ? { stage: 'implement' as const } : {}),
   });
   await ctx.tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});

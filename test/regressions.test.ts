@@ -285,7 +285,9 @@ test('Linear Done write retries after outage; database never gets ahead of Linea
   await e.scm.merge(e.repo, job(e, t.identifier).pr_number);
   const original = e.tracker.setStatus.bind(e.tracker); let failed = false;
   e.tracker.setStatus = async (id, status) => { if (status === 'done' && !failed) { failed = true; throw new Error('outage'); } return original(id, status); };
-  await assert.rejects(e.orch.reconcile(), /outage/);
+  // The outage is contained to this job (reconciliation of other jobs continues) and recorded; nothing is marked done.
+  await e.orch.reconcile();
+  assert.match(String((e.ctx.db.prepare("SELECT message FROM events WHERE type = 'reconcile.job_error'").get() as { message: string } | undefined)?.message), /outage/);
   assert.equal(job(e, t.identifier).status, 'awaiting_merge');
   await e.orch.reconcile();
   assert.equal(job(e, t.identifier).status, 'done');

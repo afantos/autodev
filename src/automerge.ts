@@ -2,6 +2,7 @@ import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { kvGet, kvSet, logEvent, updateJob } from './db.ts';
 import { cachedVerdict, reservedReview } from './external-review.ts';
+import { markBaseRefreshed } from './pipeline.ts';
 import { TEST_FILE, inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { clearKeywordFlags, triageEnabled } from './triage.ts';
 import type { PolicyInspection } from './policy.ts';
@@ -64,6 +65,7 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (baseHead !== job.base_sha) {
     if (job.fix_attempts >= cfg.limits.maxFixAttempts) return hold(`${job.base_branch} moved, but the fix-attempt limit (${cfg.limits.maxFixAttempts}) is used up, so the branch can't be updated automatically.`);
     const r = await ws.refreshBase(job.worktree, job.base_branch);
+    if (r.status !== 'current') markBaseRefreshed(ctx, job, r.baseSha);
     if (r.status === 'merged') {
       return requeue({ stage: 'implement', candidate_sha: r.headSha, base_sha: r.baseSha },
         'automerge.refresh', `🔄 ${job.base_branch} moved since this PR was validated. autodev merged it into the branch cleanly and is revalidating (checks, CI, review) before any merge.`);

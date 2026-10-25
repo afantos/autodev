@@ -11,8 +11,7 @@ import { ClearanceSchema, EvidenceSchema, TriageSchema, clearanceTask, evidenceT
 import type { CheckResult, Clearance, KeywordMatch, StructuredTask, Triage, TriageCandidateTicket } from './agents/triage.ts';
 import { onlyKeywordFindings } from './policy.ts';
 import type { PolicyInspection } from './policy.ts';
-import { projectEnv } from './pipeline.ts';
-import { conflictFeedback } from './automerge.ts';
+import { holdResume, prepareResume, projectEnv } from './pipeline.ts';
 import type { Blocker } from './pipeline.ts';
 import { LABEL_SUGGESTED } from './tracker/types.ts';
 import { STAGES } from './types.ts';
@@ -169,7 +168,9 @@ async function verifyFactual(ctx: Ctx, job: Job, project: ProjectConfig, ticket:
   if (bad) return human(`A proposed check is not a single command line: ${JSON.stringify(bad.command.slice(0, 120))}`);
 
   // Run every check in the command sandbox on a throwaway copy of the candidate, never in the job's worktree.
-  const sha = job.candidate_sha!;
+  // A validated snapshot when there is one; otherwise (a coding-agent question) the trusted head, which includes the
+  // run's preserved work in progress.
+  const sha = job.candidate_worktree ? job.candidate_sha! : ws.trustedState(job.worktree!).head_sha;
   const source = job.candidate_worktree ?? await ws.candidateSnapshot(job.worktree!, sha);
   const dir = join(cfg.workspaceDir!, 'triage', `${job.ticket_identifier}-${randomUUID().slice(0, 8)}`);
   mkdirSync(join(cfg.workspaceDir!, 'triage'), { recursive: true });
@@ -255,18 +256,11 @@ export async function resumeIfFixesMerged(ctx: Ctx, job: Job, ticketById: (id: s
   const b = JSON.parse(job.blocked_reason ?? '{}') as Blocker & { triageWait?: { tickets: string[]; answer: string } };
   if (!b.triageWait) return false;
   for (const id of b.triageWait.tickets) if ((await ticketById(id))?.status !== 'done') return false;
-  let feedback = `Autodev triage answered a blocking question.\nQuestion: ${b.question}\nAnswer: ${b.triageWait.answer}\nContinue the implementation accordingly.`;
-  const moved: Partial<Job> = {};
-  if (job.worktree && job.base_branch) {
-    const r = await ctx.ws.refreshBase(job.worktree, job.base_branch);
-    if (r.status !== 'current') {
-      const st = ctx.ws.trustedState(job.worktree);
-      Object.assign(moved, { base_sha: st.base_sha, candidate_sha: st.head_sha, validated_sha: null, reviewed_sha: null, candidate_worktree: null });
-      if (r.status === 'conflict') feedback += `\n\n${conflictFeedback(job.base_branch, r.files)}`;
-    }
-    logEvent(ctx.db, 'triage.base_refreshed', `${job.ticket_identifier}: ${r.status === 'current' ? `already on the latest ${job.base_branch}` : `merged the latest ${job.base_branch}${r.status === 'conflict' ? ` with conflicts in ${r.files.join(', ')}` : ''}`}`, { jobId: job.id, ticketId: job.ticket_id });
-  }
-  updateJob(ctx.db, job.id, { ...moved, status: 'queued', stage: 'workspace', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, pending_feedback: feedback });
+  const prep = await prepareResume(ctx, job);
+  if (!prep.ok) { await holdResume(ctx, job, b, prep.error); return true; }
+  const feedback = `Autodev triage answered a blocking question.\nQuestion: ${b.question}\nAnswer: ${b.triageWait.answer}\nContinue the implementation accordingly.${prep.note ? `\n\n${prep.note}` : ''}`;
+  logEvent(ctx.db, 'triage.base_refreshed', `${job.ticket_identifier}: ${prep.patch.base_sha && prep.patch.base_sha !== job.base_sha ? `merged the latest ${job.base_branch}` : `already on the latest ${job.base_branch}`}`, { jobId: job.id, ticketId: job.ticket_id });
+  updateJob(ctx.db, job.id, { ...prep.patch, status: 'queued', stage: 'workspace', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, pending_feedback: feedback });
   await ctx.tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});
   await ctx.tracker.comment(job.ticket_id, '🧭 The prerequisite fix ticket(s) merged. autodev refreshes this branch with them and resumes the work.').catch(() => {});
   logEvent(ctx.db, 'triage.prerequisites_merged', `${job.ticket_identifier}: prerequisites merged; resuming`, { jobId: job.id, ticketId: job.ticket_id });

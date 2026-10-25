@@ -111,51 +111,65 @@ export class Orchestrator {
     for (const t of listed) for (const id of [...t.blockedBy, ...t.blocks]) await fetchMissing(id);
 
     for (const job of jobsByStatus(db, 'awaiting_merge', 'blocked', 'queued', 'waiting_ci')) {
-      const t = await fetchMissing(job.ticket_id);
-      if (!t) continue;
-      if (job.status !== 'awaiting_merge' && ['canceled', 'backlog', 'ideas'].includes(t.status)) {
-        updateJob(db, job.id, { status: 'canceled', error: `ticket moved to ${t.status} by a human` });
-        logEvent(db, 'job.canceled', `${job.ticket_identifier}: ticket moved to ${t.status}; branch preserved`, { jobId: job.id, ticketId: t.id });
-        continue;
-      }
-      if (job.status === 'blocked' && t.status === 'blocked' && await resumeIfFixesMerged(ctx, job, fetchMissing)) continue;
-      if (job.status === 'blocked' && t.status === 'ready') { await resumeBlocked(ctx, job); continue; }
-      if (job.status === 'awaiting_merge' && job.pr_number) {
-        const pr = await scm.getPr(job.repo, job.pr_number).catch(() => null);
-        if (!pr) continue;
-        if (pr.state === 'merged') {
-          // Done only after GitHub confirms the merge.
-          await tracker.setStatus(t.id, 'done');
-          updateJob(db, job.id, { status: 'done' });
-          await tracker.comment(t.id, `🎉 PR #${pr.number} merged — marked Done by autodev.`).catch(() => {});
-          logEvent(db, 'job.done', `${job.ticket_identifier} merged (#${pr.number})`, { jobId: job.id, ticketId: t.id });
-          byId.set(t.id, { ...t, status: 'done' });
-          if (job.worktree) await ctx.ws.removeWorktreeIfClean(job.repo, job.worktree).catch(() => {});
-        } else if (pr.state === 'closed') {
-          updateJob(db, job.id, { status: 'closed', error: 'PR closed without merge' });
-          await tracker.comment(t.id, `PR #${pr.number} was closed without merging. Branch \`${job.branch}\` is preserved. Move to Ready with a comment to rework.`).catch(() => {});
-          logEvent(db, 'job.closed', `${job.ticket_identifier}: PR closed unmerged`, { jobId: job.id, ticketId: t.id, level: 'warn' });
-        } else if (t.status === 'review') {
-          // Auto-merge only from Review: a ticket a human moved (Canceled, Backlog, Done...) is never merged.
-          const project = ctx.cfg.projects.find((p) => p.key === job.project);
-          if (project?.autoMerge) {
-            const outcome = await autoMergeStep(ctx, job, t, project).catch((e) => {
-              logEvent(db, 'automerge.error', `${job.ticket_identifier}: ${(e as Error).message.slice(0, 300)}`, { jobId: job.id, ticketId: t.id, level: 'warn' });
-              return 'waiting' as const;
-            });
-            if (outcome === 'requeued') byId.set(t.id, { ...t, status: 'in_progress' });
-          }
-        } else if (t.status === 'ready') {
-          // Human sent it back from Review with feedback → rework on the same branch/PR.
-          const comments = await tracker.listComments(t.id);
-          const human = comments.filter((c) => !c.byAutomation).pop();
-          updateJob(db, job.id, { status: 'queued', stage: 'workspace', fix_attempts: 0, review_cycles: 0, pending_feedback: `Human reviewer requested rework:\n${human?.body ?? '(no comment given — re-check the acceptance criteria and PR review comments)'}` });
-          await tracker.setStatus(t.id, 'in_progress');
-          logEvent(db, 'job.rework', `${job.ticket_identifier}: human requested rework`, { jobId: job.id, ticketId: t.id });
-        }
+      try {
+        await this.reconcileJob(job, byId, fetchMissing);
+      } catch (e) {
+        // One job's failure must never stop reconciliation of the others (or the scheduler after it).
+        const msg = String((e as Error)?.message ?? e).slice(0, 400);
+        const key = `reconcile-error:${job.id}`;
+        if (kvGet(db, key) !== msg) { kvSet(db, key, msg); logEvent(db, 'reconcile.job_error', `${job.ticket_identifier}: ${msg}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); }
       }
     }
     return byId;
+  }
+
+  /** Reconcile one job with its ticket and PR. Errors are contained by the caller. */
+  private async reconcileJob(job: Job, byId: Map<string, Ticket>, fetchMissing: (id: string) => Promise<Ticket | null>) {
+    const { ctx } = this;
+    const { db, scm, tracker } = ctx;
+    const t = await fetchMissing(job.ticket_id);
+    if (!t) return;
+    if (job.status !== 'awaiting_merge' && ['canceled', 'backlog', 'ideas'].includes(t.status)) {
+      updateJob(db, job.id, { status: 'canceled', error: `ticket moved to ${t.status} by a human` });
+      logEvent(db, 'job.canceled', `${job.ticket_identifier}: ticket moved to ${t.status}; branch preserved`, { jobId: job.id, ticketId: t.id });
+      return;
+    }
+    if (job.status === 'blocked' && t.status === 'blocked' && await resumeIfFixesMerged(ctx, job, fetchMissing)) return;
+    if (job.status === 'blocked' && t.status === 'ready') { await resumeBlocked(ctx, job); return; }
+    if (job.status === 'awaiting_merge' && job.pr_number) {
+      const pr = await scm.getPr(job.repo, job.pr_number).catch(() => null);
+      if (!pr) return;
+      if (pr.state === 'merged') {
+        // Done only after GitHub confirms the merge.
+        await tracker.setStatus(t.id, 'done');
+        updateJob(db, job.id, { status: 'done' });
+        await tracker.comment(t.id, `🎉 PR #${pr.number} merged — marked Done by autodev.`).catch(() => {});
+        logEvent(db, 'job.done', `${job.ticket_identifier} merged (#${pr.number})`, { jobId: job.id, ticketId: t.id });
+        byId.set(t.id, { ...t, status: 'done' });
+        if (job.worktree) await ctx.ws.removeWorktreeIfClean(job.repo, job.worktree).catch(() => {});
+      } else if (pr.state === 'closed') {
+        updateJob(db, job.id, { status: 'closed', error: 'PR closed without merge' });
+        await tracker.comment(t.id, `PR #${pr.number} was closed without merging. Branch \`${job.branch}\` is preserved. Move to Ready with a comment to rework.`).catch(() => {});
+        logEvent(db, 'job.closed', `${job.ticket_identifier}: PR closed unmerged`, { jobId: job.id, ticketId: t.id, level: 'warn' });
+      } else if (t.status === 'review') {
+        // Auto-merge only from Review: a ticket a human moved (Canceled, Backlog, Done...) is never merged.
+        const project = ctx.cfg.projects.find((p) => p.key === job.project);
+        if (project?.autoMerge) {
+          const outcome = await autoMergeStep(ctx, job, t, project).catch((e) => {
+            logEvent(db, 'automerge.error', `${job.ticket_identifier}: ${(e as Error).message.slice(0, 300)}`, { jobId: job.id, ticketId: t.id, level: 'warn' });
+            return 'waiting' as const;
+          });
+          if (outcome === 'requeued') byId.set(t.id, { ...t, status: 'in_progress' });
+        }
+      } else if (t.status === 'ready') {
+        // Human sent it back from Review with feedback → rework on the same branch/PR.
+        const comments = await tracker.listComments(t.id);
+        const human = comments.filter((c) => !c.byAutomation).pop();
+        updateJob(db, job.id, { status: 'queued', stage: 'workspace', fix_attempts: 0, review_cycles: 0, pending_feedback: `Human reviewer requested rework:\n${human?.body ?? '(no comment given — re-check the acceptance criteria and PR review comments)'}` });
+        await tracker.setStatus(t.id, 'in_progress');
+        logEvent(db, 'job.rework', `${job.ticket_identifier}: human requested rework`, { jobId: job.id, ticketId: t.id });
+      }
+    }
   }
 
   async pollCi() {
