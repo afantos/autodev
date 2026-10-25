@@ -5,7 +5,8 @@ across several GitHub repos. It uses Claude Code agents in isolated git worktree
 continuously on a small VM, including overnight.
 
 You set direction and approve. autodev plans, implements, asks for decisions, reviews, and
-reports. You merge.
+reports. When enabled, autodev auto-merges clean PRs after CI, policy checks, and an independent
+second review pass; otherwise, you review and merge.
 
 ```
 idea ──▶ Planning Agent (reads the repo) ──▶ [Plan] + tickets in Backlog
@@ -14,8 +15,129 @@ Ready ──▶ scheduler (priority, dependencies, conflicts, budget) ──▶ 
       ──▶ worktree ──▶ Coding Agent ──(questions)──▶ Decision Agent ──▶ policy: auto | you
       ──▶ orchestrator-run validation ──▶ commit + secret scan ──▶ push ──▶ draft PR ──▶ CI
       ──▶ independent Review Agent ──(changes)──▶ bounded fix loop
-      ──▶ In Review (+ preview URL) ──▶ you merge ──▶ Done (verified on GitHub)
+      ──▶ In Review (+ preview URL) ──▶ auto-merge (if enabled and checks pass) or you merge
+      ──▶ Done (verified on GitHub)
 ```
+
+## Architecture
+
+One Node process (systemd) owns job state. Linear and GitHub stay the source of truth for tickets and code.
+
+### Overview
+
+```mermaid
+flowchart LR
+  you(["You"]) --> plan["Planning"]
+  plan --> tickets[("Linear tickets")]
+  tickets --> orch["Orchestrator"]
+  orch --> coding["Coding pipeline"]
+  coding --> review["AI review"]
+  review --> merge{"Auto-merge or<br/>human review"}
+  merge --> done(["Done"])
+
+  classDef user fill:#dbeafe,stroke:#2563eb,color:#0f172a
+  classDef core fill:#ede9fe,stroke:#7c3aed,color:#0f172a
+  classDef agent fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef external fill:#e5e7eb,stroke:#4b5563,color:#0f172a
+  classDef finish fill:#dcfce7,stroke:#16a34a,color:#0f172a
+  class you user
+  class plan,orch,coding core
+  class review agent
+  class tickets external
+  class merge,done finish
+```
+
+### Components
+
+Solid arrows carry work; dashed arrows record state and spend.
+
+```mermaid
+flowchart LR
+  you(["You"])
+
+  subgraph proc["autodev process"]
+    cli["Command line"]
+    status["Dashboard and reports"]
+    orch["Orchestrator<br/>reconcile, schedule"]
+    plan["Planning"]
+    pipe["Coding pipeline<br/>implement, validate, PR, review"]
+    dec["Decisions and policy"]
+    merge["Auto-merge<br/>clean PRs only"]
+    sandbox["Command sandbox"]
+  end
+
+  subgraph agents["AI agents"]
+    claude["Claude agents<br/>planning, coding, decision, review"]
+    gpt["Second reviewer<br/>OpenAI"]
+  end
+
+  subgraph ext["External services"]
+    linear[("Linear")]
+    github[("GitHub")]
+  end
+
+  subgraph state["Local state"]
+    db[("SQLite<br/>jobs, leases, decisions")]
+    budget["Budget caps"]
+    repos[("Git worktrees")]
+  end
+
+  you --> cli
+  you -->|"Ready, /answer"| linear
+  you -->|"review, merge"| github
+  status --> you
+
+  cli --> orch
+  cli --> plan
+  orch --> pipe
+  orch --> merge
+  orch <-->|sync| linear
+  orch <-->|sync| github
+
+  plan --> claude
+  pipe --> claude
+  pipe --> dec
+  dec --> claude
+  pipe --> sandbox --> repos
+  pipe -->|"push, draft PR"| github
+  merge --> gpt
+  merge -->|"approve, squash-merge"| github
+
+  orch -.-> db
+  agents -.->|spend| budget
+
+  classDef user fill:#dbeafe,stroke:#2563eb,color:#0f172a
+  classDef core fill:#ede9fe,stroke:#7c3aed,color:#0f172a
+  classDef agent fill:#fef3c7,stroke:#d97706,color:#0f172a
+  classDef external fill:#e5e7eb,stroke:#4b5563,color:#0f172a
+  classDef data fill:#dcfce7,stroke:#16a34a,color:#0f172a
+  class you user
+  class cli,status,orch,plan,pipe,dec,merge,sandbox core
+  class claude,gpt agent
+  class linear,github external
+  class db,budget,repos data
+```
+
+| Box | Code |
+|---|---|
+| Command line | `src/cli.ts` |
+| Dashboard and reports | `src/dashboard.ts`, `src/report.ts` |
+| Orchestrator | `src/orchestrator.ts` (tick loop, reconcile) and `src/scheduler.ts` (priority, dependencies, conflicts) |
+| Planning | `src/planning.ts`: idea → tickets |
+| Coding pipeline | `src/pipeline.ts` |
+| Decisions and policy | `src/decisions.ts`, `src/policy.ts` (policy can only escalate) |
+| Auto-merge | `src/automerge.ts` (off unless `autoMerge: true`) |
+| Command sandbox | `src/command-sandbox.ts`: bubblewrap or Seatbelt, offline |
+| Claude agents | `src/agents/runner.ts` (Claude Agent SDK) |
+| Second reviewer | `src/agents/second-review.ts` (OpenAI Responses API) |
+| Linear | `src/tracker/linear.ts` (GraphQL) |
+| GitHub | `src/scm/github.ts` (Octokit) |
+| Git worktrees | `src/scm/git.ts` |
+| SQLite | `src/db.ts`: jobs, leases, decisions, usage; every component reads and writes it |
+| Budget caps | `src/budget.ts`: daily, monthly and per-ticket limits, recorded in SQLite |
+
+`Tracker` (Linear | Local), `Scm` (GitHub | Local) and `AgentRunner` (Claude | Fake) are swappable seams, so
+the whole flow runs in tests offline with no AI spend. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Status
 
