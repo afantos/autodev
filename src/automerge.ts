@@ -1,14 +1,14 @@
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
-import { externalSpentSince, kvGet, kvSet, logEvent, recordExternalUsage, settleExternalUsage, tx, updateJob } from './db.ts';
-import { startOfDay, startOfMonth } from './budget.ts';
-import { inspectChanges, onlyNarrowTestUpdates } from './policy.ts';
+import { kvGet, kvSet, logEvent, updateJob } from './db.ts';
+import { cachedVerdict, reservedReview } from './external-review.ts';
+import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
+import { clearKeywordFlags, triageEnabled } from './triage.ts';
 import type { PolicyInspection } from './policy.ts';
 import { decisionsForTicket } from './decisions.ts';
 import { findSupersedingRequirement } from './test-updates.ts';
 import { SecondReviewSchema, TestIntegritySchema, effectiveVerdict, requestBytes, testIntegrityApproved } from './agents/second-review.ts';
 import type { TestUpdateReviewInput } from './agents/second-review.ts';
-import type { z } from 'zod';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
 
@@ -81,12 +81,22 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   // 4. Mandatory policy: flagged changes go to a human, even if a human approved them earlier. The single exception
   // (option B): findings that are ONLY eligible narrow existing-test updates, not human-approved, may pass a recorded
   // superseding requirement plus a dedicated test-integrity review of this exact candidate.
+  // Triage exception: findings that come only from the keyword heuristic, cleared for this exact diff hash.
   const policy = await inspectChanges(ws, job.worktree, job.base_branch, project, cfg);
+  let policyNote = 'clean';
   if (policy.reasons.length) {
-    const narrow = onlyNarrowTestUpdates(policy) && !kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
-    if (!narrow) return hold(`The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`);
-    const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
-    if (gate !== 'approved') return gate;
+    const humanApproved = !!kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
+    const flagged = `The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`;
+    if (!humanApproved && onlyNarrowTestUpdates(policy)) {
+      const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
+      if (gate !== 'approved') return gate;
+      policyNote = 'narrow existing-test update approved by the test-integrity review';
+    } else if (!humanApproved && onlyKeywordFindings(policy) && triageEnabled(ctx, project)) {
+      const c = await clearKeywordFlags(ctx, job, project, policy);
+      if (c.kind === 'waiting') return 'waiting';
+      if (c.kind !== 'cleared') return hold(`${flagged}\n\nTriage: ${c.note}`);
+      policyNote = 'keyword flag(s) cleared by triage as mentions only';
+    } else return hold(flagged);
   }
 
   // 5. Independent second review, once per candidate sha.
@@ -140,16 +150,16 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
   // Approve exactly this sha as the reviewer account, then squash-merge pinned to it.
   const notes = decision.notes.length ? `\n\nNon-blocking notes from the second review:\n${fmt(decision.notes)}` : '';
-  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: clean\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}`;
+  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: ${policyNote}\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}`;
   await scm.markReady(job.repo, pr);
   await scm.approve(job.repo, pr.number, sha, body);
   await scm.mergePr(job.repo, pr.number, sha, `${job.ticket_identifier}: ${ticket.title} (#${pr.number})`);
   logEvent(db, 'automerge.merged', `${job.ticket_identifier}: PR #${pr.number} merged at ${sha.slice(0, 12)}`, { jobId: job.id, ticketId: job.ticket_id });
-  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy clean, up to date with ${job.base_branch}.${notes}`).catch(() => {});
+  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy ${policyNote === 'clean' ? 'clean' : `(${policyNote})`}, up to date with ${job.base_branch}.${notes}`).catch(() => {});
   return 'merged';
 }
 
-function conflictFeedback(base: string, files: string[]): string {
+export function conflictFeedback(base: string, files: string[]): string {
   return `The orchestrator merged the latest ${base} into this branch and it conflicts in:\n${files.map((f) => `- ${f}`).join('\n')}\n`
     + 'Resolve every conflict in the working files (remove all <<<<<<< ======= >>>>>>> markers), keeping both the changes already on '
     + `${base} and this ticket's changes. Don't run git commands; the orchestrator completes the merge. Then re-run the checks.`;
@@ -162,64 +172,6 @@ async function reviewDocs(ctx: Ctx, worktree: string, sha: string, project: Proj
   const out: { path: string; content: string }[] = [];
   for (const f of wanted.slice(0, 60)) out.push({ path: f, content: (await ctx.ws.git(worktree, ['cat-file', 'blob', `${sha}:${f}`])).slice(0, 100_000) });
   return out;
-}
-
-type ReviewRun<T> = { value: T; model: string; costUsd: number | null; inputTokens: number; outputTokens: number; outcome: string; summary: string };
-
-/** Reuse a cached verdict only if it validates against the current schema; otherwise drop it so the review runs again. */
-function cachedVerdict<T>(ctx: Ctx, job: Job, key: string, schema: z.ZodType<T>, event: string): T | null {
-  const cached = kvGet(ctx.db, key);
-  if (!cached) return null;
-  let raw: unknown = null;
-  try { raw = JSON.parse(cached); } catch { /* unreadable → invalid */ }
-  const parsed = schema.safeParse(raw);
-  if (parsed.success) return parsed.data;
-  kvSet(ctx.db, key, null);
-  logEvent(ctx.db, `${event}.cache_invalidated`, `${job.ticket_identifier}: cached verdict for ${key.split(':').at(-1)!.slice(0, 12)} doesn't match the current schema; reviewing again`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
-  return null;
-}
-
-/**
- * Run one second-reviewer call under the shared budget rules: reserve the worst case as a pending ledger row inside a
- * transaction (counts against the caps while it runs; stays charged if usage is unknown or the process dies), then
- * settle to the provider-reported cost. Used by both the code review and the test-integrity review.
- */
-async function reservedReview<T>(ctx: Ctx, job: Job, sha: string, event: string, failPrefix: string, worst: number, call: () => Promise<ReviewRun<T>>):
-  Promise<{ kind: 'ok'; value: T } | { kind: 'waiting' } | { kind: 'failed'; failures: number; message: string }> {
-  const { db, cfg } = ctx;
-  const reviewer = ctx.secondReviewer!;
-  const reservation = tx(db, () => {
-    const day = externalSpentSince(db, reviewer.provider, startOfDay());
-    const month = externalSpentSince(db, reviewer.provider, startOfMonth());
-    if (day + worst > cfg.secondReview.dailyUsd || month + worst > cfg.secondReview.monthlyUsd) return { ok: false as const, day, month };
-    return { ok: true as const, id: recordExternalUsage(db, { provider: reviewer.provider, model: reviewer.model, jobId: job.id, ticketId: job.ticket_id, costUsd: worst, outcome: 'pending' }) };
-  });
-  if (!reservation.ok) {
-    const key = `second-review-budget:${startOfDay()}`;
-    if (!kvGet(db, key)) {
-      kvSet(db, key, '1');
-      logEvent(db, 'second_review.budget', `second-review budget reached (today $${reservation.day.toFixed(2)}/$${cfg.secondReview.dailyUsd}, month $${reservation.month.toFixed(2)}/$${cfg.secondReview.monthlyUsd}, next review up to $${worst.toFixed(2)}); waiting`, { level: 'warn' });
-    }
-    return { kind: 'waiting' };
-  }
-  try {
-    const out = await call();
-    // Unknown usage keeps the worst-case reservation; known usage settles to the tier-priced cost.
-    if (out.costUsd === null) settleExternalUsage(db, reservation.id, { model: out.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: `${out.outcome}-usage-unknown` });
-    else settleExternalUsage(db, reservation.id, { model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: out.outcome });
-    logEvent(db, event, `${job.ticket_identifier}: ${out.outcome} (${out.model}, ${out.costUsd === null ? `usage unknown, charged $${worst.toFixed(3)}` : `$${out.costUsd.toFixed(3)}`}): ${out.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
-    return { kind: 'ok', value: out.value };
-  } catch (e) {
-    const err = e as Error & { costUsd?: number; inputTokens?: number; outputTokens?: number };
-    // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.
-    if (typeof err.costUsd === 'number') settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: err.costUsd, inputTokens: err.inputTokens ?? 0, outputTokens: err.outputTokens ?? 0, outcome: 'error' });
-    else settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: 'error-usage-unknown' });
-    const failKey = `${failPrefix}:${job.id}:${sha}`;
-    const failures = Number(kvGet(db, failKey) ?? 0) + 1;
-    kvSet(db, failKey, String(failures));
-    logEvent(db, `${event}.error`, `${job.ticket_identifier}: ${err.message.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
-    return failures >= 3 ? { kind: 'failed', failures, message: err.message } : { kind: 'waiting' };
-  }
 }
 
 /**

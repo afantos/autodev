@@ -143,6 +143,23 @@ const ConfigSchema = z.object({
     /** Cap on supplied docs + diff (characters); larger diffs go to a human instead of being truncated. */
     maxInputChars: z.number().int().positive().default(600_000), // bytes of the full request
     timeoutSeconds: z.number().positive().default(900),
+    /**
+     * Triage before asking a human (needs autoMerge on the project and this reviewer). Code limits what it may do:
+     * clear keyword-only policy flags for the exact diff, answer factual questions with sandboxed checks, and sequence
+     * fixes for defects using tickets suggested from the blocked ticket. Everything else goes to a human.
+     */
+    triage: z.object({
+      enabled: z.boolean().default(true),
+      /** Triage resolutions per job before every further blocker goes to a human. */
+      maxPerJob: z.number().int().min(0).default(3),
+      /** Checks per factual question, and the time limit for each. */
+      maxChecks: z.number().int().min(1).max(10).default(6),
+      checkTimeoutSeconds: z.number().int().positive().default(600),
+      /** More keyword matches than this in one diff are not treated as incidental mentions. */
+      maxKeywordMatches: z.number().int().positive().default(40),
+      /** Diff characters sent as context for a blocker (truncated beyond; triage never approves code). */
+      maxDiffChars: z.number().int().positive().default(200_000),
+    }).prefault({}),
   }).prefault({}),
   policy: z.object({
     minAutoConfidence: z.number().default(0.7),

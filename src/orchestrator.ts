@@ -5,6 +5,7 @@ import { acquireInstanceLock, releaseInstanceLock, acquireLease, activeJobForTic
 import { blockJob, resumeBlocked, runJob } from './pipeline.ts';
 import { approvePlan } from './planning.ts';
 import { autoMergeStep } from './automerge.ts';
+import { resumeIfFixesMerged } from './triage.ts';
 import { rank } from './scheduler.ts';
 import { LABEL_PLAN } from './tracker/types.ts';
 import type { Job, Ticket } from './types.ts';
@@ -117,6 +118,7 @@ export class Orchestrator {
         logEvent(db, 'job.canceled', `${job.ticket_identifier}: ticket moved to ${t.status}; branch preserved`, { jobId: job.id, ticketId: t.id });
         continue;
       }
+      if (job.status === 'blocked' && t.status === 'blocked' && await resumeIfFixesMerged(ctx, job, fetchMissing)) continue;
       if (job.status === 'blocked' && t.status === 'ready') { await resumeBlocked(ctx, job); continue; }
       if (job.status === 'awaiting_merge' && job.pr_number) {
         const pr = await scm.getPr(job.repo, job.pr_number).catch(() => null);

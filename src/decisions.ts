@@ -151,6 +151,17 @@ export function recordHumanDecision(ctx: Ctx, decisionId: string | null, answer:
   return id;
 }
 
+/**
+ * A blocker resolved by autodev triage (second-review model under code-enforced limits). Recorded with authority
+ * 'triage', never 'human': anything that requires a human decision (e.g. option B's superseding requirement) ignores it.
+ */
+export function recordTriageDecision(ctx: Ctx, job: { ticket_id: string; ticket_identifier: string; repo: string }, question: string, answer: string, model: string): string {
+  const id = randomUUID();
+  ctx.db.prepare(`INSERT INTO decisions (id, ticket_id, ticket_identifier, repo, question, question_hash, decision, reasoning, authority, status, created_at, resolved_at) VALUES (?,?,?,?,?,?,?,?, 'triage','resolved',?,?)`)
+    .run(id, job.ticket_id, job.ticket_identifier, job.repo, question, questionHash(question), answer, `Triage by ${model}`, now(), now());
+  return id;
+}
+
 export function supersedeDecision(ctx: Ctx, oldId: string, newId: string) {
   ctx.db.prepare(`UPDATE decisions SET superseded_by = ?, status = 'superseded' WHERE id = ?`).run(newId, oldId);
 }

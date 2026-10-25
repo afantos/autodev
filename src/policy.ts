@@ -134,6 +134,31 @@ export interface PolicyInspection {
   reasons: string[];
   /** Existing test files changed in this diff, each with its narrow-update analysis (option B). */
   testUpdates: (TestUpdateAnalysis & { file: string })[];
+  /** Added code lines that matched a HUMAN_PATTERNS topic (the source of each "diff touches …" reason), for triage. */
+  keywordMatches: { category: string; file: string; text: string }[];
+  /** Fingerprint of the change itself, independent of where the base is (see diffFingerprint). */
+  fingerprint: string;
+}
+
+const KEYWORD_REASON = 'diff touches ';
+
+/**
+ * True when every finding comes from the HUMAN_PATTERNS keyword heuristic and each has its matching lines on record.
+ * Only these may be cleared by triage; paths, dependencies, CI, tests, removals, configured keywords and schema changes
+ * never qualify.
+ */
+export function onlyKeywordFindings(r: PolicyInspection): boolean {
+  if (!r.reasons.length) return false;
+  return r.reasons.every((reason) => reason.startsWith(KEYWORD_REASON) && r.keywordMatches.some((m) => `${KEYWORD_REASON}${m.category}` === reason));
+}
+
+/**
+ * Like `git patch-id`: a hash of the diff with index lines and hunk positions removed, so the same change on a moved
+ * base fingerprints the same, while any change to its content or surrounding context does not.
+ */
+export function diffFingerprint(diff: string): string {
+  const normalized = diff.split('\n').filter((l) => !l.startsWith('index ')).map((l) => (l.startsWith('@@') ? '@@' : l)).join('\n');
+  return createHash('sha256').update(normalized).digest('hex');
 }
 
 /** The reason string the protectTests rule emits for an edited existing test file. */
@@ -199,10 +224,14 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   }
   // Exclude documentation from semantic keyword rules, but inspect every code file's added lines.
   const added: string[] = [];
+  const keywordMatches: PolicyInspection['keywordMatches'] = [];
   const testUpdates: PolicyInspection['testUpdates'] = [];
   for (const f of files) {
     const lines = await addedLines(f);
-    if (!/\.(md|txt|snap)$/.test(f)) added.push(...lines);
+    if (!/\.(md|txt|snap)$/.test(f)) {
+      added.push(...lines);
+      for (const line of lines) for (const [pattern, reason] of HUMAN_PATTERNS) if (pattern.test(line)) keywordMatches.push({ category: reason, file: f, text: line.trim().slice(0, 300) });
+    }
     if (project.protectTests && TEST_FILE.test(f)) {
       const existed = await exists(ref, f);
       reasons.push(...testWeakening(f, lines, existed));
@@ -219,5 +248,5 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   for (const keyword of cfg.policy.humanKeywords) if (new RegExp(keyword, 'i').test(diff)) reasons.push(`diff matches configured keyword /${keyword}/`);
   // Include the complete tree, since binary changes can have identical textual diffs.
   const hash = createHash('sha256').update(ref).update(await ws.git(worktree, ['rev-parse', `${head}^{tree}`])).update(diff).digest('hex');
-  return { hash, reasons: [...new Set(reasons)], testUpdates };
+  return { hash, reasons: [...new Set(reasons)], testUpdates, keywordMatches, fingerprint: diffFingerprint(diff) };
 }

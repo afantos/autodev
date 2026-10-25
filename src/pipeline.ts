@@ -16,12 +16,19 @@ import type { Job, PullRequest, Stage, Ticket } from './types.ts';
 import { STAGES } from './types.ts';
 import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
-import { inspectChanges, onlyNarrowTestUpdates } from './policy.ts';
+import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
+import { clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
 export { scanSecrets } from './secrets.ts';
 
 const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
 
-interface Blocker { reason: string; question: string; options: string[]; recommendation: string | null; decisionId: string | null; policyHash?: string }
+export interface Blocker {
+  reason: string; question: string; options: string[]; recommendation: string | null; decisionId: string | null; policyHash?: string;
+  /** For diff-policy blockers: the change's fingerprint and findings, so a human approval can carry over to the same change on a moved base. */
+  policyFingerprint?: string; policyReasons?: string[];
+  /** A question (from the coding or review agent) that triage may try to resolve before it reaches a human. */
+  triage?: boolean;
+}
 
 /** Thrown inside a stage to divert the job; handled centrally in runJob. */
 class Divert extends Error {
@@ -298,6 +305,14 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
   if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
   const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
+  // A human approved this same change (same fingerprint) with the same or more findings; only the base moved since.
+  const carried = kvGet(ctx.db, `policy-approved-change:${job.id}:${result.fingerprint}`);
+  if (carried && result.reasons.every((r) => (JSON.parse(carried) as string[]).includes(r))) {
+    kvSet(ctx.db, `policy-approved:${job.id}:${result.hash}`, 'human (carried over: same change, moved base)');
+    logEvent(ctx.db, 'policy.approval_carried', `${job.ticket_identifier}: human approval carried over to diff ${result.hash.slice(0, 12)} (same change ${result.fingerprint.slice(0, 12)}, base moved)`, { jobId: job.id, ticketId: job.ticket_id });
+    return;
+  }
+  if (isCleared(ctx, job, result)) return;
   // Option B: when the ONLY findings are eligible narrow existing-test updates and auto-merge with a second reviewer is
   // on, don't stop for a human here. The merge gate then requires a recorded superseding requirement and a dedicated
   // test-integrity review of the exact candidate, and holds for a human otherwise. Nothing merges on this path alone.
@@ -309,8 +324,16 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
     }
     return;
   }
+  // Triage: findings that come ONLY from the keyword heuristic may be cleared for this exact diff.
+  let triageNote = '';
+  if (onlyKeywordFindings(result) && triageEnabled(ctx, project)) {
+    const c = await clearKeywordFlags(ctx, job, project, result);
+    if (c.kind === 'cleared') return;
+    triageNote = c.kind === 'waiting' ? 'triage unavailable (second-review budget reached)' : c.note;
+  }
   throw new Divert('blocked', 'mandatory diff policy requires human approval', {
-    reason: result.reasons.join('; '), policyHash: result.hash,
+    reason: `${result.reasons.join('; ')}${triageNote ? `\n\n**Triage:** ${triageNote}` : ''}`, policyHash: result.hash,
+    policyFingerprint: result.fingerprint, policyReasons: result.reasons,
     question: `Review the local diff (${result.hash.slice(0, 12)}). Remove the flagged changes, or explicitly approve this exact diff with /answer approve.`,
     options: ['Remove or revise flagged changes', 'Approve this exact diff with /answer approve'],
     recommendation: 'Remove or revise flagged changes', decisionId: null,
@@ -436,7 +459,7 @@ When done, leave the changes in the working tree (the orchestrator commits them)
 
   const parsed = CodingResultSchema.safeParse(res.structured);
   const result: CodingResult = parsed.success ? parsed.data : { status: 'completed', summary: res.text.slice(0, 2000), filesChanged: [], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: ['structured result missing'] };
-  if (result.status === 'blocked') throw new Divert('blocked', result.blocker ?? 'agent reported blocked', { reason: result.blocker ?? 'agent reported blocked', question: result.blocker ?? 'The coding agent could not proceed. See its summary.', options: [], recommendation: null, decisionId: null });
+  if (result.status === 'blocked') throw new Divert('blocked', result.blocker ?? 'agent reported blocked', { reason: result.blocker ?? 'agent reported blocked', question: result.blocker ?? 'The coding agent could not proceed. See its summary.', options: [], recommendation: null, decisionId: null, triage: true });
   if (result.status === 'failed') throw new AgentFailure({ ...res, ok: false, errorKind: 'other', error: result.blocker ?? result.summary });
   updateJob(db, job.id, { pending_feedback: null, summary_json: mergeSummary(job, { coding: result }) }, owner);
   job.pending_feedback = null;
@@ -515,7 +538,7 @@ Review this supplied diff and the surrounding files in this candidate snapshot. 
 
   if (r.outcome === 'approved') { updateJob(db, job.id, { reviewed_sha: candidate(job) }, owner); return; }
   if (r.outcome === 'blocked') {
-    throw new Divert('blocked', 'review needs a human decision', { reason: 'the review agent raised a question that needs a human', question: r.blockingQuestion ?? r.summary, options: [], recommendation: null, decisionId: null });
+    throw new Divert('blocked', 'review needs a human decision', { reason: `the review agent raised a question that needs a human\n\nReview summary: ${r.summary}`, question: r.blockingQuestion ?? r.summary, options: [], recommendation: null, decisionId: null, triage: true });
   }
   const findings = r.findings.filter((f) => f.severity !== 'nit').map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.issue}\n  Fix: ${f.suggestion}`).join('\n');
   const unmet = r.acceptanceCriteria.filter((a) => !a.met).map((a) => `- NOT MET: ${a.criterion} (${a.evidence})`).join('\n');
@@ -597,8 +620,14 @@ async function preserveWork(ctx: Ctx, job: Job, why: string) {
   }
 }
 
-export async function blockJob(ctx: Ctx, job: Job, b: Blocker) {
+export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   const { db, owner, tracker } = ctx;
+  let b = blocker;
+  if (b.triage) {
+    const t = await triageBlocker(ctx, job, b).catch((e) => ({ kind: 'human' as const, note: `triage failed: ${(e as Error).message.slice(0, 300)}`, recommendation: null }));
+    if (t?.kind === 'resolved') return;
+    if (t) b = { ...b, reason: `${b.reason}\n\n**Triage:** ${t.note}`, recommendation: b.recommendation ?? t.recommendation };
+  }
   await preserveWork(ctx, job, 'blocked');
   if (!b.decisionId) {
     // Record the open question in the decision log so the answer is kept with it.
@@ -617,7 +646,7 @@ To continue: reply with a comment starting with \`/answer\` and move this ticket
   await tracker.comment(job.ticket_id, body).catch((err) => logEvent(db, 'linear.error', String(err), { jobId: job.id, level: 'warn' }));
   await tracker.setStatus(job.ticket_id, 'blocked').catch((err) => logEvent(db, 'linear.error', String(err), { jobId: job.id, level: 'warn' }));
   releaseLease(db, job.id, owner, 'blocked', { blocked_reason: JSON.stringify({ ...b, blockedAt: now() }), stage: STAGES.indexOf(job.stage) > STAGES.indexOf('workspace') ? 'workspace' : job.stage });
-  logEvent(db, 'job.blocked', `${job.ticket_identifier}: ${b.reason}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  logEvent(db, 'job.blocked', `${job.ticket_identifier}: ${b.reason.split('\n')[0]}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
 }
 
 function recordPending(ctx: Ctx, job: Job, b: Blocker): string {
@@ -653,7 +682,10 @@ export async function resumeBlocked(ctx: Ctx, job: Job, explicitAnswer?: string)
   }
   const ticket = await ctx.tracker.getTicket(job.ticket_id);
   const approved = !!b.policyHash && /^\s*(approve|accept)(?:\s|$)/i.test(answer);
-  if (approved) kvSet(ctx.db, `policy-approved:${job.id}:${b.policyHash}`, 'human');
+  if (approved) {
+    kvSet(ctx.db, `policy-approved:${job.id}:${b.policyHash}`, 'human');
+    if (b.policyFingerprint && b.policyReasons) kvSet(ctx.db, `policy-approved-change:${job.id}:${b.policyFingerprint}`, JSON.stringify(b.policyReasons));
+  }
   recordHumanDecision(ctx, b.decisionId ?? null, answer, { ticket: ticket ?? undefined, repo: job.repo, question: b.question });
   updateJob(ctx.db, job.id, {
     status: 'queued', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, decision_count: Math.max(0, job.decision_count - 1),

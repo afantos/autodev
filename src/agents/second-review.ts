@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import type { Ticket } from '../types.ts';
 import { untrusted } from './prompts.ts';
+import { taskBytes } from './triage.ts';
+import type { StructuredTask } from './triage.ts';
 
 /** Independent second review by another vendor's model (default: OpenAI gpt-6.1-sol via the Responses API). */
 
@@ -139,7 +141,12 @@ export interface SecondReviewer {
   /** Dedicated test-integrity review of a narrow existing-test update (option B). */
   reviewTestUpdate(input: TestUpdateReviewInput, signal?: AbortSignal): Promise<TestUpdateReviewOutcome>;
   maxTestUpdateCostUsd(input: TestUpdateReviewInput): number;
+  /** Generic structured request (triage). Optional: without it, triage is off and every blocker goes to a human. */
+  ask?<T>(task: StructuredTask<T>, signal?: AbortSignal): Promise<StructuredOutcome<T>>;
+  maxAskCostUsd?(task: StructuredTask<unknown>): number;
 }
+
+export interface StructuredOutcome<T> { value: T; model: string; costUsd: number | null; inputTokens: number; outputTokens: number }
 
 // ---------------------------------------------------------------- test-integrity review (option B)
 
@@ -314,6 +321,14 @@ export class OpenAiReviewer implements SecondReviewer {
     return worstCaseUsd(this.opts.pricing, testIntegrityRequestBytes(input) + 1_000, this.opts.maxOutputTokens);
   }
 
+  maxAskCostUsd(task: StructuredTask<unknown>): number {
+    return worstCaseUsd(this.opts.pricing, taskBytes(task) + 1_000, this.opts.maxOutputTokens);
+  }
+
+  async ask<T>(task: StructuredTask<T>, signal?: AbortSignal): Promise<StructuredOutcome<T>> {
+    return this.call(task.system, task.prompt, task.name, task.jsonSchema, task.parser, signal);
+  }
+
   async review(input: SecondReviewInput, signal?: AbortSignal): Promise<SecondReviewOutcome> {
     const r = await this.call(SECOND_REVIEW_SYSTEM, secondReviewPrompt(input), 'merge_review', SECOND_REVIEW_JSON_SCHEMA, SecondReviewSchema, signal);
     return { verdict: r.value, model: r.model, costUsd: r.costUsd, inputTokens: r.inputTokens, outputTokens: r.outputTokens };
@@ -324,7 +339,7 @@ export class OpenAiReviewer implements SecondReviewer {
     return { verdict: r.value, model: r.model, costUsd: r.costUsd, inputTokens: r.inputTokens, outputTokens: r.outputTokens };
   }
 
-  /** One Responses API call with strict structured output; shared by both reviews so billing rules can't diverge. */
+  /** One Responses API call with strict structured output; shared by every request so billing rules can't diverge. */
   private async call<T>(instructions: string, prompt: string, name: string, schema: object, parser: z.ZodType<T>, signal?: AbortSignal): Promise<{ value: T; model: string; costUsd: number | null; inputTokens: number; outputTokens: number }> {
     const timeout = AbortSignal.timeout(this.opts.timeoutMs);
     const res = await this.fetchImpl('https://api.openai.com/v1/responses', {
