@@ -102,6 +102,8 @@ const ConfigSchema = z.object({
     dailyUsd: z.number().default(25),
     monthlyUsd: z.number().default(300),
     perTicketUsd: z.number().default(15),
+    /** Owner-approved per-ticket limits that replace perTicketUsd for those tickets only (by identifier, e.g. DEV-56). */
+    perTicketOverrides: z.record(z.string(), z.number().positive()).default({}),
     perRunUsd: z.number().default(8),
     perDecisionUsd: z.number().default(1.5),
     /** What happens when a budget is exhausted: wait for the next period, or stay paused until `autodev resume`. */

@@ -2,7 +2,7 @@ import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { kvGet, kvSet, logEvent, updateJob } from './db.ts';
 import { cachedVerdict, reservedReview } from './external-review.ts';
-import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
+import { TEST_FILE, inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { clearKeywordFlags, triageEnabled } from './triage.ts';
 import type { PolicyInspection } from './policy.ts';
 import { decisionsForTicket } from './decisions.ts';
@@ -11,6 +11,7 @@ import { SecondReviewSchema, TestIntegritySchema, effectiveVerdict, requestBytes
 import type { TestUpdateReviewInput } from './agents/second-review.ts';
 import type { SecondReviewVerdict } from './agents/second-review.ts';
 import type { Job, Ticket } from './types.ts';
+import { createHash } from 'node:crypto';
 
 /**
  * Merge a finished PR without a human, but only when every gate holds for the exact validated candidate:
@@ -99,8 +100,10 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     } else return hold(flagged);
   }
 
-  // 5. Independent second review, once per candidate sha.
-  const verdictKey = `second-review:${job.id}:${sha}`;
+  // 5. Independent second review, once per candidate sha AND requirements: a clarified ticket (description or a recorded
+  // human decision) gets a fresh review instead of a verdict that predates the clarification.
+  const requirements = requirementsHash(ctx, ticket);
+  const verdictKey = `second-review:${job.id}:${sha}:${requirements}`;
   // A cached verdict is reused only if it still validates against the current schema. Verdicts cached by an older
   // version (e.g. findings without a category) are discarded and the review runs again: never reinterpret them.
   let verdict = cachedVerdict(ctx, job, verdictKey, SecondReviewSchema, 'second_review');
@@ -131,6 +134,10 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   }
   if (decision.decision !== 'approve') {
     const findings = fmt(decision.blocking);
+    // No progress: this exact candidate was already sent back for these findings and the rework changed nothing.
+    const reworkKey = `second-review-rework:${job.id}:${sha}:${requirements}`;
+    if (kvGet(db, reworkKey)) return hold(`The second review (${reviewer.model}) still requests changes, but the last rework left the candidate unchanged (${sha.slice(0, 12)}), so another rework would repeat it. A human should decide:\n${verdict.summary}\n${findings}`);
+    kvSet(db, reworkKey, '1');
     if (job.review_cycles >= cfg.limits.maxReviewCycles) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles:\n${verdict.summary}\n${findings}`);
     return requeue({ stage: 'workspace', review_cycles: job.review_cycles + 1, pending_feedback: `The independent merge reviewer (${reviewer.model}) requested changes before this can be merged:\n${verdict.summary}\n${findings}\nSpec conformance notes: ${verdict.specConformance}` },
       'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
@@ -157,6 +164,12 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   logEvent(db, 'automerge.merged', `${job.ticket_identifier}: PR #${pr.number} merged at ${sha.slice(0, 12)}`, { jobId: job.id, ticketId: job.ticket_id });
   await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy ${policyNote === 'clean' ? 'clean' : `(${policyNote})`}, up to date with ${job.base_branch}.${notes}`).catch(() => {});
   return 'merged';
+}
+
+/** Hash of what the ticket requires: title, description and resolved human decisions (answers, clarifications). */
+export function requirementsHash(ctx: Ctx, ticket: Ticket): string {
+  const decisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved').map((d) => d.decision ?? '');
+  return createHash('sha256').update(JSON.stringify([ticket.title, ticket.description, decisions])).digest('hex').slice(0, 16);
 }
 
 export function conflictFeedback(base: string, files: string[]): string {
@@ -190,14 +203,23 @@ async function testIntegrityGate(ctx: Ctx, job: Job, ticket: Ticket, policy: Pol
   if (!superseding.length) {
     return hold(`Existing tests were updated (only test names and expected values: ${files.join(', ')}), but neither the ticket nor a recorded human decision says the old behavior is superseded. A human needs to confirm.`);
   }
-  const key = `test-integrity:${job.id}:${sha}`;
+  const key = `test-integrity:${job.id}:${sha}:${requirementsHash(ctx, latest)}`;
   let verdict = cachedVerdict(ctx, job, key, TestIntegritySchema, 'test_integrity');
   if (!verdict) {
     const state = ws.trustedState(job.worktree!);
     const originalTests: { path: string; content: string }[] = [];
     for (const f of files) originalTests.push({ path: f, content: await ws.git(job.worktree!, ['cat-file', 'blob', `${state.base_sha}:${f}`]) });
     const testDiff = await ws.git(job.worktree!, ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', `${state.base_sha}...${sha}`, '--', ...files.map((f) => `:(literal)${f}`)]);
-    const input: TestUpdateReviewInput = { repo: job.repo, ticket: latest, candidateSha: sha, originalTests, testDiff, superseding };
+    const added = (await ws.git(job.worktree!, ['diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', `${state.base_sha}...${sha}`])).split('\0').filter((f) => f && TEST_FILE.test(f));
+    const newTests: { path: string; content: string }[] = [];
+    let budget = 200_000;
+    for (const f of added.slice(0, 20)) {
+      if (budget <= 0) break;
+      const content = (await ws.git(job.worktree!, ['cat-file', 'blob', `${sha}:${f}`])).slice(0, Math.min(50_000, budget));
+      budget -= content.length;
+      newTests.push({ path: f, content });
+    }
+    const input: TestUpdateReviewInput = { repo: job.repo, ticket: latest, candidateSha: sha, originalTests, testDiff, superseding, newTests };
     const r = await reservedReview(ctx, job, sha, 'test_integrity', 'test-integrity-failures', reviewer.maxTestUpdateCostUsd(input), async () => {
       const out = await reviewer.reviewTestUpdate(input);
       return { value: out.verdict, model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: testIntegrityApproved(out.verdict) ? 'approve' : 'reject', summary: out.verdict.summary };

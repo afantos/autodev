@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { runAgent, RunGateClosed } from './context.ts';
+import { perTicketLimit } from './budget.ts';
 import { getJob, heartbeat, LeaseLostError, logEvent, releaseLease, setStage, updateJob, now, kvGet, kvSet } from './db.ts';
 import { CODING_SYSTEM, REVIEW_SYSTEM, docsHint, ticketBlock, untrusted } from './agents/prompts.ts';
 import type { AgentRunResult, AgentTool } from './agents/runner.ts';
@@ -300,6 +301,21 @@ function assertPrCandidate(job: Job, pr: PullRequest) {
   if (pr.headSha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'remote PR HEAD differs from the validated candidate');
 }
 
+/**
+ * A closed run gate: global limits (daily/monthly budget, pauses) clear by waiting, so requeue. The ticket's own
+ * budget never clears by waiting; requeueing it would retry forever and hold the project's slot, so block for a human.
+ */
+function gateDivert(ctx: Ctx, job: Job, e: RunGateClosed): Divert {
+  if (!e.ticketBudget) return new Divert('requeue', e.why);
+  return new Divert('blocked', e.why, ticketBudgetBlocker(ctx, job));
+}
+
+function ticketBudgetBlocker(ctx: Ctx, job: Job): Blocker {
+  const spent = (ctx.db.prepare('SELECT COALESCE(SUM(cost_usd),0) s FROM usage WHERE ticket_id = ?').get(job.ticket_id) as { s: number }).s;
+  const limit = perTicketLimit(ctx.db, ctx.cfg, job.ticket_id);
+  return { reason: `ticket budget $${limit} exhausted ($${spent.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null };
+}
+
 async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig) {
   const state = ctx.ws.trustedState(job.worktree!);
   if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
@@ -448,7 +464,7 @@ When done, leave the changes in the working tree (the orchestrator commits them)
       res = await runAgent(ctx, { ...spec, prompt: fresh }, { jobId: job.id, ticketId: ticket.id });
     }
   } catch (e) {
-    if (e instanceof RunGateClosed) throw new Divert('requeue', e.why);
+    if (e instanceof RunGateClosed) throw gateDivert(ctx, job, e);
     throw e;
   }
   if (res.sessionId) updateJob(db, job.id, { session_id: res.sessionId }, owner);
@@ -521,7 +537,7 @@ Review this supplied diff and the surrounding files in this candidate snapshot. 
       signal,
     }, { jobId: job.id, ticketId: ticket.id });
   } catch (e) {
-    if (e instanceof RunGateClosed) throw new Divert('requeue', e.why);
+    if (e instanceof RunGateClosed) throw gateDivert(ctx, job, e);
     throw e;
   }
   await ws.assertCandidate(job.worktree!, candidate(job));
@@ -596,9 +612,7 @@ async function handleDivert(ctx: Ctx, job: Job, project: ProjectConfig, e: unkno
     }
     if (k === 'budget') {
       const t = (db.prepare('SELECT COALESCE(SUM(cost_usd),0) s FROM usage WHERE ticket_id = ?').get(job.ticket_id) as { s: number }).s;
-      if (t >= cfg.budget.perTicketUsd - 0.05) {
-        return blockJob(ctx, job, { reason: `ticket budget $${cfg.budget.perTicketUsd} exhausted ($${t.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null });
-      }
+      if (t >= perTicketLimit(db, cfg, job.ticket_id) - 0.05) return blockJob(ctx, job, ticketBudgetBlocker(ctx, job));
     }
   }
   // Generic failure: bounded retries, then Failed.

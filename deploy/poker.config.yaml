@@ -52,6 +52,8 @@ budget:                                  # USD, SDK estimates; the Claude Consol
   dailyUsd: 50
   monthlyUsd: 500
   perTicketUsd: 3
+  perTicketOverrides:                    # owner-approved exceptions to perTicketUsd, by ticket
+    DEV-56: 4.5                          # 2026-10-25: one-time +$1.50 after a rework loop on a stale GPT verdict
   perRunUsd: 1.5
   perDecisionUsd: 0.5
   onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically

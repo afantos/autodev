@@ -74,7 +74,7 @@ export function authorize(d: Decision, question: string, project: ProjectConfig,
   return { authority: reasons.length ? 'human' : 'auto', reasons };
 }
 
-const TEST_FILE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
+export const TEST_FILE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
 /** Added test code that can disable, skip, focus or short-circuit tests, or replace assertions. */
 const WEAKENING_ADDED: [RegExp, string][] = [
   [/\.\s*(?:skip|only|todo)\b/, 'skips, focuses or marks a test todo'],

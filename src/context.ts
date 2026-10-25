@@ -81,7 +81,9 @@ export function assertOutsideProtected(cwd: string, roots: string[]) {
 
 export class RunGateClosed extends Error {
   why: string;
-  constructor(why: string) { super(why); this.why = why; }
+  /** Refused by the ticket's own budget, which waiting never clears (block for a human instead of requeueing). */
+  ticketBudget: boolean;
+  constructor(why: string, ticketBudget = false) { super(why); this.why = why; this.ticketBudget = ticketBudget; }
 }
 
 /**
@@ -107,7 +109,7 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
     else gitReadPaths.push(rec.commonDir, rec.gitDir);
   }
   const gate = reserveBudget(ctx.db, ctx.cfg, ctx.owner, meta, spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd);
-  if (!gate.ok) throw new RunGateClosed(gate.reason!);
+  if (!gate.ok) throw new RunGateClosed(gate.reason!, !!gate.ticketScoped);
   const maxBudgetUsd = Math.min(spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd, gate.allowanceUsd);
   logEvent(ctx.db, `agent.${spec.role}.start`, `model=${spec.model} budget=$${maxBudgetUsd.toFixed(2)}${spec.resume ? ' (resume)' : ''}`, { jobId: meta.jobId, ticketId: meta.ticketId });
   // A thrown runner error or process crash leaves the reservation in place;

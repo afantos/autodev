@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { requirementsHash } from '../src/automerge.ts';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -605,7 +606,7 @@ test('P1: a cached pre-category major-bug rejection is never downgraded into a m
   const t = await ready(e);
   await e.cycle();
   const j = job(e, t.identifier);
-  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}`, JSON.stringify(LEGACY_REJECTION));
+  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}:${requirementsHash(e.ctx, (await e.tracker.getTicket(t.id))!)}`, JSON.stringify(LEGACY_REJECTION));
   await e.cycle();
   assert.equal(approval(e, j.pr_number), null, 'no approval from a stale cache');
   assert.notEqual((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
@@ -621,7 +622,7 @@ test('P1: after an invalidated cache, a fresh approval merges (one new review, n
   const t = await ready(e);
   await e.cycle();
   const j = job(e, t.identifier);
-  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}`, JSON.stringify(LEGACY_REJECTION));
+  kvSet(e.ctx.db, `second-review:${j.id}:${j.candidate_sha}:${requirementsHash(e.ctx, (await e.tracker.getTicket(t.id))!)}`, JSON.stringify(LEGACY_REJECTION));
   await cycles(e, 2);
   assert.equal(reviewer.inputs.length, 1);
   assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');

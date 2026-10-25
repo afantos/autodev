@@ -14,12 +14,20 @@ export interface Gate {
   reason?: string;
   /** Max USD the next run may spend. */
   allowanceUsd: number;
+  /** The per-ticket limit (not a global one) refused the run. */
+  ticketScoped?: boolean;
 }
 
 /**
  * Global gate for starting any agent run: manual pause, usage-limit pause, daily/monthly budgets.
  * Never bypasses a limit — it only decides whether to wait.
  */
+/** The ticket's spending limit: an owner-approved override for its identifier, else perTicketUsd. */
+export function perTicketLimit(db: Db, cfg: Config, ticketId: string): number {
+  const row = db.prepare('SELECT ticket_identifier AS id FROM jobs WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1').get(ticketId) as { id: string } | undefined;
+  return (row && cfg.budget.perTicketOverrides[row.id]) ?? cfg.budget.perTicketUsd;
+}
+
 export function canStartRun(db: Db, cfg: Config, ticketId?: string | null): Gate {
   if (kvGet(db, 'manual_pause')) return { ok: false, reason: `paused manually: ${kvGet(db, 'manual_pause')}`, allowanceUsd: 0 };
   const until = Number(kvGet(db, 'paused_until') ?? 0);
@@ -34,9 +42,12 @@ export function canStartRun(db: Db, cfg: Config, ticketId?: string | null): Gate
   if (month >= cfg.budget.monthlyUsd || day >= cfg.budget.dailyUsd) return { ok: false, reason: 'remaining daily/monthly budget is reserved by active or unsettled runs', allowanceUsd: 0 };
   let allowance = Math.min(cfg.budget.perRunUsd, cfg.budget.dailyUsd - day, cfg.budget.monthlyUsd - month);
   if (ticketId) {
+    const limit = perTicketLimit(db, cfg, ticketId);
     const t = spentOnTicket(db, ticketId) + (db.prepare('SELECT COALESCE(SUM(amount_usd),0) s FROM budget_reservations WHERE ticket_id = ?').get(ticketId) as { s: number }).s;
-    if (t >= cfg.budget.perTicketUsd) return { ok: false, reason: `ticket budget $${cfg.budget.perTicketUsd} reached ($${t.toFixed(2)})`, allowanceUsd: 0 };
-    allowance = Math.min(allowance, cfg.budget.perTicketUsd - t);
+    // Ticket-scoped: unlike daily/monthly limits this never clears by waiting, so callers block instead of requeueing.
+    if (t >= limit) return { ok: false, reason: `ticket budget $${limit} reached ($${t.toFixed(2)})`, allowanceUsd: 0, ticketScoped: true };
+    allowance = Math.min(allowance, limit - t);
+    if (allowance <= 0 && limit - t <= 0) return { ok: false, reason: `ticket budget $${limit} reached ($${t.toFixed(2)})`, allowanceUsd: 0, ticketScoped: true };
   }
   return { ok: allowance > 0, allowanceUsd: Math.max(0, allowance), reason: allowance > 0 ? undefined : 'no budget remaining' };
 }

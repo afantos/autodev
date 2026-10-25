@@ -220,7 +220,7 @@ test('e2e: stale approvals don’t carry over: a new candidate needs a new test-
   const [first, second] = reviewer.integrityInputs;
   assert.notEqual(first!.candidateSha, second!.candidateSha);
   assert.equal(second!.candidateSha, job(e, t.identifier).candidate_sha);
-  assert.equal(kvGet(e.ctx.db, `test-integrity:${job(e, t.identifier).id}:${first!.candidateSha}`) !== null, true, 'the old approval is bound to the old sha only');
+  assert.ok(e.ctx.db.prepare('SELECT 1 FROM kv WHERE k LIKE ? AND v IS NOT NULL').get(`test-integrity:${job(e, t.identifier).id}:${first!.candidateSha}:%`), 'the old approval is bound to the old sha only');
   assert.equal(await merged(e, t), false, 'the stale approval did not merge the new candidate');
 });
 
@@ -591,4 +591,18 @@ test('regression e2e: the regex-after-if bypass blocks for a human, even with au
   assert.equal(event(e, 'policy.test_update_deferred'), false);
   const pr = job(e, t.identifier).pr_number;
   assert.ok(pr == null || !(await merged(e, t)), 'nothing merged');
+});
+
+// ---------------------------------------------------------------- new coverage is visible to the test-integrity review
+
+test('the test-integrity review sees test files the change adds (DEV-57: required coverage lives in a new file)', async () => {
+  const reviewer = new Reviewer();
+  const e = env(reviewer, () => DEV11, (cwd) => writeFileSync(join(cwd, 'test', 'all-in-raise-coverage.test.js'), "test('a short all-in raise leaves the increment unchanged', () => {});\n"));
+  const t = await ticket(e);
+  authorize(e, t.id);
+  await cycles(e, 4);
+  assert.equal(reviewer.integrityInputs.length, 1);
+  assert.deepEqual(reviewer.integrityInputs[0]!.newTests.map((x) => x.path), ['test/all-in-raise-coverage.test.js']);
+  assert.match(reviewer.integrityInputs[0]!.newTests[0]!.content, /short all-in raise leaves the increment unchanged/);
+  assert.ok(!reviewer.integrityInputs[0]!.newTests.some((x) => x.path === TEST_PATH), 'the edited existing test is not listed as new');
 });
