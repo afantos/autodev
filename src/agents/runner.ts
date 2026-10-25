@@ -60,6 +60,8 @@ export interface AgentRunResult {
   numTurns: number;
   /** False when no terminal usage result was received; keep its budget reserved. */
   usageComplete?: boolean;
+  /** Claude SDK totals include earlier calls in a resumed session; test runners normally return per-run usage. */
+  usageScope?: 'run' | 'session';
   error?: string;
   errorKind?: AgentErrorKind;
   /** Epoch ms when a usage limit resets (subscription rate limits). */
@@ -141,6 +143,12 @@ export function classifyError(msg: string): AgentErrorKind {
 }
 
 export class ClaudeRunner implements AgentRunner {
+  private readonly query: (input: Parameters<typeof query>[0]) => AsyncIterable<SDKMessage>;
+
+  constructor(runQuery: (input: Parameters<typeof query>[0]) => AsyncIterable<SDKMessage> = query) {
+    this.query = runQuery;
+  }
+
   async run(spec: AgentRunSpec): Promise<AgentRunResult> {
     const started = Date.now();
     const abort = new AbortController();
@@ -192,7 +200,7 @@ export class ClaudeRunner implements AgentRunner {
     options.sandbox = agentSandbox(spec);
 
     try {
-      for await (const m of query({ prompt: spec.prompt, options })) {
+      for await (const m of this.query({ prompt: spec.prompt, options })) {
         spec.onMessage?.(m);
         if (m.type === 'system' && m.subtype === 'init') res.sessionId = m.session_id;
         if (m.type === 'rate_limit_event' && m.rate_limit_info.status === 'rejected') {
@@ -201,9 +209,12 @@ export class ClaudeRunner implements AgentRunner {
         }
         if (m.type === 'result') {
           res.usageComplete = true;
+          res.usageScope = 'session';
           res.sessionId = m.session_id ?? res.sessionId;
-          res.costUsd = m.total_cost_usd ?? 0;
+          res.costUsd = m.total_cost_usd;
           res.numTurns = m.num_turns;
+          // These are cumulative too. Replace the previous result's totals, never sum them.
+          res.inputTokens = res.outputTokens = res.cacheReadTokens = 0;
           for (const u of Object.values(m.modelUsage ?? {})) {
             res.inputTokens += u.inputTokens; res.outputTokens += u.outputTokens; res.cacheReadTokens += u.cacheReadInputTokens;
           }

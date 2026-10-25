@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS plans (
 
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL, job_id TEXT, ticket_id TEXT, role TEXT NOT NULL, model TEXT,
+  ts INTEGER NOT NULL, job_id TEXT, ticket_id TEXT, session_id TEXT, role TEXT NOT NULL, model TEXT,
   cost_usd REAL NOT NULL DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
   cache_read_tokens INTEGER DEFAULT 0, duration_ms INTEGER DEFAULT 0, outcome TEXT
 );
@@ -121,6 +121,8 @@ export function openDb(path: string): Db {
   for (const name of ['base_sha', 'candidate_sha', 'validated_sha', 'reviewed_sha', 'candidate_worktree']) {
     if (!columns.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} TEXT`);
   }
+  const usageColumns = db.prepare('PRAGMA table_info(usage)').all() as { name: string }[];
+  if (!usageColumns.some(c => c.name === 'session_id')) db.exec('ALTER TABLE usage ADD COLUMN session_id TEXT');
   return db;
 }
 
@@ -265,11 +267,11 @@ export class LeaseLostError extends Error {
 
 // ---------------- usage ----------------
 
-export interface UsageRow { jobId?: string | null; ticketId?: string | null; role: AgentRole; model?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; durationMs?: number; outcome?: string }
+export interface UsageRow { jobId?: string | null; ticketId?: string | null; sessionId?: string | null; role: AgentRole; model?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; durationMs?: number; outcome?: string }
 
 export function recordUsage(db: Db, u: UsageRow) {
-  db.prepare('INSERT INTO usage (ts, job_id, ticket_id, role, model, cost_usd, input_tokens, output_tokens, cache_read_tokens, duration_ms, outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-    .run(now(), u.jobId ?? null, u.ticketId ?? null, u.role, u.model ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.cacheReadTokens ?? 0, u.durationMs ?? 0, u.outcome ?? null);
+  db.prepare('INSERT INTO usage (ts, job_id, ticket_id, session_id, role, model, cost_usd, input_tokens, output_tokens, cache_read_tokens, duration_ms, outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(now(), u.jobId ?? null, u.ticketId ?? null, u.sessionId ?? null, u.role, u.model ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.cacheReadTokens ?? 0, u.durationMs ?? 0, u.outcome ?? null);
   if (u.jobId) db.prepare('UPDATE jobs SET cost_usd = cost_usd + ? WHERE id = ?').run(u.costUsd, u.jobId);
 }
 

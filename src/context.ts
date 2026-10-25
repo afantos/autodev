@@ -18,6 +18,7 @@ import type { SecondReviewer } from './agents/second-review.ts';
 import { ClaudeRunner } from './agents/runner.ts';
 import { reserveBudget, clearApiErrorStreak, clearUsageLimitStreak, pauseForApiError, pauseForUsageLimit } from './budget.ts';
 import { runSandboxed } from './command-sandbox.ts';
+import { sessionUsageDelta } from './agent-usage.ts';
 
 export interface Ctx {
   cfg: Config;
@@ -118,8 +119,9 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
   try { res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths, gitReadPaths }); }
   catch (e) { if (repository) await ctx.ws.verifyAgentWorkspace(guardedWorktree!); throw e; }
   tx(ctx.db, () => {
+    res = sessionUsageDelta(ctx.db, res, !!spec.resume, meta);
     recordUsage(ctx.db, {
-      jobId: meta.jobId, ticketId: meta.ticketId, role: spec.role, model: spec.model, costUsd: res.costUsd,
+      jobId: meta.jobId, ticketId: meta.ticketId, sessionId: res.sessionId, role: spec.role, model: spec.model, costUsd: res.costUsd,
       inputTokens: res.inputTokens, outputTokens: res.outputTokens, cacheReadTokens: res.cacheReadTokens, durationMs: res.durationMs,
       outcome: res.usageComplete === false ? 'usage_unknown' : res.ok ? 'ok' : res.errorKind,
     });
