@@ -49,9 +49,19 @@ export const SECOND_REVIEW_JSON_SCHEMA = {
   },
 } as const;
 
+/** A resolved human decision on the ticket (an answer or clarification): part of its requirements. */
+export interface HumanDecision { question: string; decision: string }
+
+/** The decisions block shared by both prompts; every decision that keys a cached verdict appears here. */
+function decisionsBlock(decisions: HumanDecision[]): string {
+  return decisions.length ? decisions.map((d, i) => untrusted(`human-decision:${i + 1}`, `Q: ${d.question}\nA: ${d.decision}`)).join('\n') : '(none)';
+}
+
 export interface SecondReviewInput {
   repo: string;
   ticket: Ticket;
+  /** Resolved human decisions; they clarify or override the ticket text. */
+  decisions: HumanDecision[];
   baseSha: string;
   candidateSha: string;
   docs: { path: string; content: string }[];
@@ -187,6 +197,8 @@ export interface TestUpdateReviewInput {
   superseding: { source: string; text: string }[];
   /** Test files this change ADDS (new coverage must go in new files), so coverage the requirement asks for is visible. */
   newTests: { path: string; content: string }[];
+  /** Resolved human decisions on the ticket. */
+  decisions: HumanDecision[];
 }
 
 export interface TestUpdateReviewOutcome { verdict: TestIntegrityVerdict; model: string; costUsd: number | null; inputTokens: number; outputTokens: number }
@@ -217,6 +229,9 @@ ${untrusted('ticket', input.ticket.description || '(no description)')}
 
 Recorded superseding requirement(s):
 ${input.superseding.map((r) => untrusted(`requirement:${r.source}`, r.text)).join('\n\n')}
+
+Recorded human decisions on this ticket:
+${decisionsBlock(input.decisions)}
 
 Original tests (before the change):
 ${input.originalTests.map((t) => untrusted(`original:${t.path}`, t.content)).join('\n\n')}
@@ -286,6 +301,10 @@ Candidate commit to merge: ${input.candidateSha}
 
 Ticket ${input.ticket.identifier}: ${input.ticket.title}
 ${untrusted('ticket', input.ticket.description || '(no description)')}
+
+Recorded human decisions on this ticket (the owner's answers and clarifications; where they differ from the ticket
+text, the decisions apply):
+${decisionsBlock(input.decisions)}
 
 Project design documents (authoritative requirements):
 ${docs || '(none)'}

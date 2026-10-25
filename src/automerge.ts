@@ -109,7 +109,7 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   let verdict = cachedVerdict(ctx, job, verdictKey, SecondReviewSchema, 'second_review');
   if (!verdict) {
     const input = {
-      repo: job.repo, ticket, baseSha: job.base_sha!, candidateSha: sha,
+      repo: job.repo, ticket, baseSha: job.base_sha!, candidateSha: sha, decisions: humanDecisions(ctx, ticket),
       docs: await reviewDocs(ctx, job.worktree, sha, project),
       diffStat: await ws.diff(job.worktree, job.base_branch, true),
       diff: await ws.diff(job.worktree, job.base_branch),
@@ -168,8 +168,15 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
 /** Hash of what the ticket requires: title, description and resolved human decisions (answers, clarifications). */
 export function requirementsHash(ctx: Ctx, ticket: Ticket): string {
-  const decisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved').map((d) => d.decision ?? '');
-  return createHash('sha256').update(JSON.stringify([ticket.title, ticket.description, decisions])).digest('hex').slice(0, 16);
+  return createHash('sha256').update(JSON.stringify([ticket.title, ticket.description, humanDecisions(ctx, ticket)])).digest('hex').slice(0, 16);
+}
+
+/**
+ * Resolved human decisions for the ticket. The single source for both the verdict cache key (requirementsHash) and the
+ * reviewer prompts, so a decision that invalidates a cached verdict is always shown to the fresh review.
+ */
+export function humanDecisions(ctx: Ctx, ticket: Ticket): { question: string; decision: string }[] {
+  return decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved').map((d) => ({ question: d.question, decision: d.decision ?? '' }));
 }
 
 export function conflictFeedback(base: string, files: string[]): string {
@@ -198,8 +205,8 @@ async function testIntegrityGate(ctx: Ctx, job: Job, ticket: Ticket, policy: Pol
   const files = policy.testUpdates.map((u) => u.file);
   const latest = (await tracker.getTicket(ticket.id)) ?? ticket;
   const comments = await tracker.listComments(ticket.id).catch(() => []);
-  const humanDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved');
-  const superseding = findSupersedingRequirement({ description: latest.description, comments, humanDecisions });
+  const resolvedHuman = decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved');
+  const superseding = findSupersedingRequirement({ description: latest.description, comments, humanDecisions: resolvedHuman });
   if (!superseding.length) {
     return hold(`Existing tests were updated (only test names and expected values: ${files.join(', ')}), but neither the ticket nor a recorded human decision says the old behavior is superseded. A human needs to confirm.`);
   }
@@ -219,7 +226,7 @@ async function testIntegrityGate(ctx: Ctx, job: Job, ticket: Ticket, policy: Pol
       budget -= content.length;
       newTests.push({ path: f, content });
     }
-    const input: TestUpdateReviewInput = { repo: job.repo, ticket: latest, candidateSha: sha, originalTests, testDiff, superseding, newTests };
+    const input: TestUpdateReviewInput = { repo: job.repo, ticket: latest, candidateSha: sha, originalTests, testDiff, superseding, newTests, decisions: humanDecisions(ctx, latest) };
     const r = await reservedReview(ctx, job, sha, 'test_integrity', 'test-integrity-failures', reviewer.maxTestUpdateCostUsd(input), async () => {
       const out = await reviewer.reviewTestUpdate(input);
       return { value: out.verdict, model: out.model, costUsd: out.costUsd, inputTokens: out.inputTokens, outputTokens: out.outputTokens, outcome: testIntegrityApproved(out.verdict) ? 'approve' : 'reject', summary: out.verdict.summary };

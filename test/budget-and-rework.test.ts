@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { makeEnv, job } from './helpers.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
 import type { FakeBehavior } from '../src/agents/fake.ts';
+import { secondReviewPrompt, testIntegrityPrompt } from '../src/agents/second-review.ts';
+import { recordHumanDecision } from '../src/decisions.ts';
 
 // 2026-10-25: DEV-56 reached its $3 ticket budget in a rework loop (GPT's cached verdict predated the owner's
 // clarification; the coding agent correctly changed nothing), then retried every ~14 s forever, holding the project's
@@ -91,4 +93,31 @@ test('a clarified ticket gets a fresh second review: the cached verdict predates
   assert.equal(reviewer.inputs.length, 2, 'reviewed again with the clarification');
   assert.match(reviewer.inputs[1]!.ticket.description, /Owner clarification/);
   assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'merged');
+});
+
+test('regression: a recorded human decision (description unchanged) reaches the fresh review, not just its cache key', async () => {
+  const reviewer = new Reviewer([CHANGES, APPROVE]);
+  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true } }, behaviors: { coding: sameEveryTime } });
+  const t = await ticket(e, 'Engine fix');
+  await cycles(e, 10);
+  assert.equal(reviewer.inputs.length, 1);
+  const before = (await e.tracker.getTicket(t.id))!.description;
+  recordHumanDecision(e.ctx, null, 'The simulator skip is removed in DEV-17; do not change the simulator here.', { ticket: (await e.tracker.getTicket(t.id))!, repo: e.repo, question: 'Should this ticket remove the simulator skip?' });
+  await cycles(e, 3);
+  assert.equal((await e.tracker.getTicket(t.id))!.description, before, 'the description was not edited');
+  assert.equal(reviewer.inputs.length, 2, 'the decision invalidated the cached verdict');
+  const [first, second] = reviewer.inputs;
+  assert.deepEqual(first!.decisions, []);
+  assert.deepEqual(second!.decisions, [{ question: 'Should this ticket remove the simulator skip?', decision: 'The simulator skip is removed in DEV-17; do not change the simulator here.' }]);
+  assert.notEqual(secondReviewPrompt(first!), secondReviewPrompt(second!), 'the two reviews did not get identical prompts');
+  assert.match(secondReviewPrompt(second!), /<untrusted source="human-decision:1">[\s\S]*Q: Should this ticket remove the simulator skip\?\nA: The simulator skip is removed in DEV-17; do not change the simulator here\./);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'merged');
+});
+
+test('both review prompts show recorded human decisions (the test-integrity cache is keyed on them too)', () => {
+  const ticketX = { identifier: 'X-1', title: 't', description: 'd' } as never;
+  const decisions = [{ question: 'Is 5 → 0 superseded?', decision: 'Yes, the Hand now completes.' }];
+  assert.match(secondReviewPrompt({ repo: 'o/r', ticket: ticketX, baseSha: 'a', candidateSha: 'b', decisions, docs: [], diffStat: '', diff: '' }), /Q: Is 5 → 0 superseded\?\nA: Yes, the Hand now completes\./);
+  assert.match(testIntegrityPrompt({ repo: 'o/r', ticket: ticketX, candidateSha: 'b', originalTests: [], testDiff: '', superseding: [], newTests: [], decisions }), /Recorded human decisions on this ticket:\n<untrusted source="human-decision:1">[\s\S]*A: Yes, the Hand now completes\./);
+  assert.match(secondReviewPrompt({ repo: 'o/r', ticket: ticketX, baseSha: 'a', candidateSha: 'b', decisions: [], docs: [], diffStat: '', diff: '' }), /clarifications; where they differ from the ticket\ntext, the decisions apply\):\n\(none\)/);
 });
