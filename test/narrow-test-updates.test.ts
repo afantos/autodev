@@ -629,3 +629,25 @@ test('weakening check: a class constructor and escapes inside strings are not fl
     "const s = 'safe' + \\u0070rocess.argv;",
   ]) assert.equal(flagged(line), true, line);
 });
+
+test('regression (review of ee02fc1): ${…} code and quotes inside regexes cannot hide an escaped identifier', async () => {
+  const { testWeakening, withoutStringContents } = await import('../src/policy.ts');
+  const flagged = (line: string) => testWeakening('test/a.test.js', [line], false).length > 0;
+  // Template interpolations are executable code, kept as written (including nested templates and strings).
+  for (const line of [
+    '`${\\u0070rocess.exit(0)}`;',
+    'const s = `x${ "a" + \\u0070rocess.argv }y`;',
+    'const s = `a${`b${\\u0070rocess}`}`;',
+  ]) assert.equal(flagged(line), true, line);
+  // A quote inside a regex literal must not open a "string" that swallows code: any '/' in code is ambiguous, so the
+  // raw line is checked.
+  for (const line of [
+    "/'/.test(s) || \\u0070rocess.exit(0); //'",
+    'const r = /"/; \\u0070rocess.exit(0); // "',
+  ]) assert.equal(flagged(line), true, line);
+  assert.equal(withoutStringContents("/'/.test(s)"), null, 'ambiguous slash → no exemption');
+  assert.equal(withoutStringContents('const t = `open'), null, 'unterminated template → no exemption');
+  assert.equal(withoutStringContents("x('a\\u0000', `t${y}u`)"), "x('', `${y}`)", 'only literal data is blanked');
+  // Proven string data stays exempt.
+  for (const line of ["for (const raw of ['A\\tB', 'Ann\\u0000', 'A\\u007fB']) {", 'const t = `n ${x} \\u0000`;']) assert.equal(flagged(line), false, line);
+});

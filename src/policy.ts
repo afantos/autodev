@@ -108,21 +108,42 @@ const WEAKENING_ADDED: [RegExp, string][] = [
  */
 const ESCAPED_IDENTIFIER = /\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})(?=[\w$]{2})|[A-Za-z_$]{2}\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})|(?:^|[^\w$'"\x60\\])\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})/;
 
-/** The line with the contents of single-line '...', "..." and `...` literals blanked (quotes kept); escapes respected. */
-export function withoutStringContents(line: string): string {
+/**
+ * The line with only proven string data blanked: the contents of '...' and "..." literals and the literal text of
+ * `...` templates. Code inside ${...} interpolations is kept as written (including any strings nested in it). Returns
+ * null when the line is ambiguous for a one-line scan: a '/' in code (regex literal, division or comment), an
+ * unterminated literal or template (multi-line), or unbalanced braces. Callers then check the raw line.
+ */
+export function withoutStringContents(line: string): string | null {
   let out = '';
-  let quote: string | null = null;
+  // Stack of contexts: 'code' (with a brace depth for ${...} bodies), or a quote char for a literal/template.
+  const stack: { kind: 'code' | "'" | '"' | '`'; depth: number }[] = [{ kind: 'code', depth: 0 }];
   for (let i = 0; i < line.length; i++) {
     const c = line[i]!;
-    if (quote) {
+    const top = stack[stack.length - 1]!;
+    if (top.kind === "'" || top.kind === '"') {
       if (c === '\\') { i++; continue; }
-      if (c === quote) { quote = null; out += c; }
-      continue;
+      if (c === top.kind) { stack.pop(); out += c; }
+      continue; // literal contents are data: blanked
     }
-    if (c === "'" || c === '"' || c === '`') quote = c;
+    if (top.kind === '`') {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { stack.pop(); out += c; continue; }
+      if (c === '$' && line[i + 1] === '{') { stack.push({ kind: 'code', depth: 0 }); out += '${'; i++; continue; }
+      continue; // template text is data: blanked
+    }
+    // code
+    if (c === '/') return null; // regex literal, division or comment: not provable on one line
+    if (c === "'" || c === '"' || c === '`') { stack.push({ kind: c, depth: 0 }); out += c; continue; }
+    if (c === '{') top.depth++;
+    if (c === '}') {
+      if (top.depth > 0) top.depth--;
+      else if (stack.length > 1) { stack.pop(); out += c; continue; } // end of a ${...} body
+      else return null; // unbalanced
+    }
     out += c;
   }
-  return out;
+  return stack.length === 1 && stack[0]!.depth >= 0 ? out : null; // inside a literal, template or ${ at end of line
 }
 /**
  * Conservative test-weakening check for one changed test file. Any change to a file that existed on the base
@@ -135,7 +156,7 @@ export function testWeakening(file: string, addedLines: string[], existedOnBase:
   if (existedOnBase) out.add(existingTestReason(file));
   for (const l of addedLines) {
     for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
-    if (ESCAPED_IDENTIFIER.test(withoutStringContents(l))) out.add(`${file}: added test code reaches the process object or runs dynamic code`);
+    if (ESCAPED_IDENTIFIER.test(withoutStringContents(l) ?? l)) out.add(`${file}: added test code reaches the process object or runs dynamic code`);
   }
   return [...out];
 }
