@@ -71,6 +71,12 @@ const ConfigSchema = z.object({
     }).prefault({}),
     /** Only tickets with this label are touched by the orchestrator (empty = all Ready tickets in configured teams). */
     requireLabel: z.string().default(''),
+    /**
+     * Owner hold: while a ticket carries this label, auto-merge never approves or merges its PR. Labels survive status
+     * changes and branch refreshes; the merge gate re-reads the ticket before every attempt, approval and merge.
+     * Empty string disables it.
+     */
+    holdMergeLabel: z.string().default('hold-merge'),
   }).prefault({}),
   concurrency: z.object({
     global: z.number().int().min(1).default(2),
