@@ -262,3 +262,82 @@ test('agents are told about the narrow exception only when auto-merge is on', as
   assert.match(hint, /Narrow exception: when this ticket or a recorded human decision explicitly says earlier behavior is SUPERSEDED/);
   assert.match(hint, /Never delete, skip, comment out, add or otherwise edit lines in an existing test file/);
 });
+
+// ---------------------------------------------------------------- lexical context (review of 90d0c63, P1)
+
+import { lexLines } from '../src/test-updates.ts';
+
+/** Reproduction: assertion-looking text inside a template literal; the "expected value" edit breaks out of the template. */
+const TEMPLATE_OLD = `import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const fixture = \`
+  assert.equal(s.lastFullRaiseIncrement, 2);
+\`;
+
+test('real check', () => {
+  assert.equal(compute(), 2);
+});
+`;
+const TEMPLATE_BYPASS = TEMPLATE_OLD.replace("  assert.equal(s.lastFullRaiseIncrement, 2);", "  assert.equal(s.lastFullRaiseIncrement, '`+process.exit(0)+`');");
+
+test('P1 reproduction: an "expected value" edit inside a template literal that breaks out into code is ineligible', () => {
+  // Sanity: line patterns alone would accept it ('`+process.exit(0)+`' looks like a single-quoted literal) ...
+  assert.equal(isLiteral("'`+process.exit(0)+`'"), true);
+  // ... but in context it closes the template and runs process.exit(0) before the real test.
+  const r = analyzeTestUpdate(TEMPLATE_OLD, TEMPLATE_BYPASS);
+  assert.equal(r.eligible, false);
+  assert.match(String(r.why), /inside \(or leaves open\) a string, template literal, comment or regular expression/);
+});
+
+test('P1: a harmless-looking value edit on a line inside a template literal is ineligible too', () => {
+  const r = analyzeTestUpdate(TEMPLATE_OLD, TEMPLATE_OLD.replace('lastFullRaiseIncrement, 2);', 'lastFullRaiseIncrement, 18);'));
+  assert.equal(r.eligible, false);
+});
+
+test('P1: edits inside a block comment, or that open or close one, are ineligible', () => {
+  const inComment = OLD.replace("  assert.equal(s.currentBet, 20);\n  assert.equal(s.lastFullRaiseIncrement, 2);", "  /* assert.equal(s.currentBet, 20);\n  assert.equal(s.lastFullRaiseIncrement, 2); */");
+  assert.equal(analyzeTestUpdate(inComment, inComment.replace('lastFullRaiseIncrement, 2); */', 'lastFullRaiseIncrement, 18); */')).eligible, false);
+});
+
+test('P1: a ${...} expression inside a template is not top-level code', () => {
+  const src = 'const t = `x ${\n  assert.equal(a, 1)\n} y`;\n';
+  const l = lexLines(src);
+  assert.equal(l.ok, true);
+  assert.deepEqual(l.codeAtStart, [true, false, false, true]);
+  assert.equal(analyzeTestUpdate(src, src.replace('assert.equal(a, 1)', 'assert.equal(a, 2)')).eligible, false);
+});
+
+test('P1: files that cannot be lexed unambiguously are ineligible (unterminated template, string line continuation)', () => {
+  assert.equal(lexLines('const a = `open\n').ok, false);
+  assert.equal(lexLines("const a = 'one \\\ntwo';\n").ok, false);
+  const unterminated = OLD + 'const tail = `\n';
+  assert.equal(analyzeTestUpdate(unterminated, unterminated.replace('lastFullRaiseIncrement, 2);', 'lastFullRaiseIncrement, 18);')).eligible, false);
+});
+
+test('P1: legitimate files with regex literals, strings and templates elsewhere stay eligible', () => {
+  const rich = OLD.replace("test('an all-in raise", "const re = /a\\/b[/]c/g;\nconst msg = `t ${ {a: 1}.a } \\` done`;\nassert.match('x/y', /x\\/y/);\nconst half = 4 / 2 / 1;\ntest('an all-in raise");
+  const l = lexLines(rich);
+  assert.equal(l.ok, true);
+  const r = analyzeTestUpdate(rich, rich.replace("test('an all-in raise sets currentBet but preserves lastFullRaiseIncrement'", "test('a full-sized all-in raise sets currentBet and updates lastFullRaiseIncrement'").replace('assert.equal(s.lastFullRaiseIncrement, 2);', 'assert.equal(s.lastFullRaiseIncrement, 18);'));
+  assert.equal(r.eligible, true, r.why ?? '');
+});
+
+test('P1 e2e: the template-literal bypass is never deferred; it blocks for a human even with authorization', async () => {
+  const reviewer = new Reviewer();
+  const e = makeEnv({
+    secondReviewer: reviewer, project: { autoMerge: true, protectTests: true }, config: { secondReview: { enabled: true } },
+    behaviors: { coding: async (spec) => {
+      writeFileSync(join(spec.cwd, TEST_PATH), TEMPLATE_BYPASS);
+      writeFileSync(join(spec.cwd, 'CHANGES.md'), 'x\n');
+      return { structured: { status: 'completed', summary: 'done', filesChanged: [TEST_PATH], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
+    } },
+  });
+  seedMain(e.repo, { [TEST_PATH]: TEMPLATE_OLD });
+  const t = await ticket(e);
+  authorize(e, t.id);
+  await cycles(e, 2);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(reviewer.integrityInputs.length, 0);
+  assert.equal(event(e, 'policy.test_update_deferred'), false);
+});

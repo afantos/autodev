@@ -22,8 +22,17 @@ export function analyzeTestUpdate(oldText: string, newText: string): TestUpdateA
   const changes: TestUpdateChange[] = [];
   const fail = (why: string): TestUpdateAnalysis => ({ eligible: false, why, changes });
   if (a.length !== b.length) return fail(`lines were ${a.length < b.length ? 'added to' : 'removed from'} an existing test file (only in-place renames and expected values may change; add new coverage in new test files)`);
+  // Line patterns alone ignore surrounding syntax: text that looks like an assertion may sit inside a template literal,
+  // string or comment, and an edit there can break out into executable code. Lex both whole files and require every
+  // changed line to start AND end in top-level code in both versions; anything ambiguous is ineligible.
+  const la = lexLines(oldText);
+  const lb = lexLines(newText);
+  if (!la.ok || !lb.ok) return fail('the test file could not be lexed unambiguously');
   for (let i = 0; i < a.length; i++) {
     if (a[i] === b[i]) continue;
+    if (!la.codeAtStart[i] || !la.codeAtEnd[i] || !lb.codeAtStart[i] || !lb.codeAtEnd[i]) {
+      return fail(`line ${i + 1}: the edit is inside (or leaves open) a string, template literal, comment or regular expression`);
+    }
     const kind = classifyPair(a[i]!, b[i]!);
     if (typeof kind !== 'string' || (kind !== 'name' && kind !== 'expected')) return fail(`line ${i + 1}: ${kind.why}`);
     changes.push({ kind, line: i + 1, before: a[i]!, after: b[i]! });
@@ -142,4 +151,84 @@ export function findSupersedingRequirement(input: { description: string; comment
   for (const c of input.comments) if (!c.byAutomation && SUPERSEDE.test(c.body)) out.push({ source: 'human comment', text: c.body });
   for (const d of input.humanDecisions) if (d.decision && SUPERSEDE.test(d.decision)) out.push({ source: 'human decision', text: `Q: ${d.question}\nA: ${d.decision}` });
   return out;
+}
+
+/**
+ * Conservative JavaScript/TypeScript lexer for line context. Tracks strings, template literals (with nested ${...}
+ * expressions), line and block comments, and regex literals (classic heuristic: '/' starts a regex after an operator,
+ * an opening bracket, a keyword or at the start of input). For each line it records whether that line starts and ends
+ * in top-level code. `ok` is false if the file ends inside a string, template, comment, regex or ${...} expression.
+ */
+export function lexLines(text: string): { ok: boolean; codeAtStart: boolean[]; codeAtEnd: boolean[] } {
+  type Mode = 'code' | 'line' | 'block' | 'sq' | 'dq' | 'tpl' | 'regex' | 'regexClass';
+  let mode: Mode = 'code';
+  const exprDepth: number[] = []; // one entry per open ${...}: its current {} nesting depth
+  let lastSig = ''; // last significant code token, for the regex/division decision
+  const codeAtStart: boolean[] = [];
+  const codeAtEnd: boolean[] = [];
+  const topLevel = () => mode === 'code' && exprDepth.length === 0;
+  const REGEX_AFTER = new Set(['', '(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '~', '^']);
+  const REGEX_KEYWORDS = new Set(['return', 'typeof', 'case', 'do', 'else', 'in', 'of', 'new', 'delete', 'void', 'throw', 'yield', 'await', 'instanceof']);
+  codeAtStart.push(true);
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    const n = text[i + 1];
+    if (c === '\n') {
+      if (mode === 'line') mode = 'code';
+      codeAtEnd.push(topLevel());
+      if (mode === 'sq' || mode === 'dq' || mode === 'regex' || mode === 'regexClass') return { ok: false, codeAtStart, codeAtEnd }; // unterminated
+      codeAtStart.push(topLevel());
+      continue;
+    }
+    switch (mode) {
+      case 'line': break;
+      case 'block': if (c === '*' && n === '/') { mode = 'code'; i++; } break;
+      case 'sq': case 'dq':
+        if (c === '\\') { if (n === '\n') return { ok: false, codeAtStart, codeAtEnd }; i++; break; } // no line continuations
+        if ((mode === 'sq' && c === "'") || (mode === 'dq' && c === '"')) { mode = 'code'; lastSig = 'str'; }
+        break;
+      case 'tpl':
+        if (c === '\\') { i++; break; }
+        if (c === '`') { mode = 'code'; lastSig = 'str'; break; }
+        if (c === '$' && n === '{') { exprDepth.push(0); mode = 'code'; lastSig = '{'; i++; }
+        break;
+      case 'regex':
+        if (c === '\\') { i++; break; }
+        if (c === '[') { mode = 'regexClass'; break; }
+        if (c === '/') { mode = 'code'; lastSig = 'regex'; while (/[a-z]/i.test(text[i + 1] ?? '')) i++; }
+        break;
+      case 'regexClass':
+        if (c === '\\') { i++; break; }
+        if (c === ']') mode = 'regex';
+        break;
+      case 'code': {
+        if (/\s/.test(c)) break;
+        if (c === '/' && n === '/') { mode = 'line'; i++; break; }
+        if (c === '/' && n === '*') { mode = 'block'; i++; break; }
+        if (c === "'") { mode = 'sq'; break; }
+        if (c === '"') { mode = 'dq'; break; }
+        if (c === '`') { mode = 'tpl'; break; }
+        if (c === '/') {
+          if (REGEX_AFTER.has(lastSig) || REGEX_KEYWORDS.has(lastSig)) { mode = 'regex'; break; }
+          lastSig = '/'; break;
+        }
+        if (exprDepth.length) {
+          if (c === '{') exprDepth[exprDepth.length - 1]!++;
+          if (c === '}') {
+            if (exprDepth[exprDepth.length - 1] === 0) { exprDepth.pop(); mode = 'tpl'; break; }
+            exprDepth[exprDepth.length - 1]!--;
+          }
+        }
+        const word = /^[A-Za-z_$][\w$]*/.exec(text.slice(i));
+        if (word) { lastSig = word[0]; i += word[0].length - 1; break; }
+        const num = /^\d[\w.]*/.exec(text.slice(i));
+        if (num) { lastSig = 'num'; i += num[0].length - 1; break; }
+        lastSig = c;
+        break;
+      }
+    }
+  }
+  codeAtEnd.push(mode === 'line' ? exprDepth.length === 0 : topLevel());
+  const ok = (mode === 'code' || mode === 'line') && exprDepth.length === 0;
+  return { ok, codeAtStart, codeAtEnd };
 }
