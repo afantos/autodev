@@ -83,6 +83,8 @@ export function clearanceAccepted(v: Clearance, matches: KeywordMatch[]): boolea
 export async function clearKeywordFlags(ctx: Ctx, job: Job, project: ProjectConfig, policy: PolicyInspection): Promise<ClearanceOutcome> {
   if (!triageEnabled(ctx, project) || !onlyKeywordFindings(policy)) return { kind: 'human', note: 'not eligible for triage' };
   if (isCleared(ctx, job, policy)) return { kind: 'cleared', note: 'cleared earlier for this exact diff' };
+  const count = Number(kvGet(ctx.db, `triage-count:${job.id}`) ?? 0);
+  if (count >= ctx.cfg.secondReview.triage.maxPerJob) return { kind: 'human', note: `triage already resolved ${count} blocker(s) on this job (limit ${ctx.cfg.secondReview.triage.maxPerJob})` };
   const limit = ctx.cfg.secondReview.triage.maxKeywordMatches;
   if (policy.keywordMatches.length > limit) return { kind: 'human', note: `${policy.keywordMatches.length} keyword matches (more than ${limit}) are not treated as incidental` };
   const matches: KeywordMatch[] = policy.keywordMatches.map((m, i) => ({ id: `m${i + 1}`, ...m }));
@@ -96,6 +98,7 @@ export async function clearKeywordFlags(ctx: Ctx, job: Job, project: ProjectConf
   const detail = v.matches.map((m) => `- ${m.id} ${m.restricted ? 'restricted' : 'mention'}: ${m.explanation}`).join('\n');
   if (!clearanceAccepted(v, matches)) return { kind: 'human', note: `${r.model} did not clear the flag(s): ${v.summary}\n${detail}` };
   kvSet(ctx.db, clearedKey(job, policy.hash), JSON.stringify({ model: r.model, summary: v.summary }));
+  kvSet(ctx.db, `triage-count:${job.id}`, String(count + 1));
   const categories = [...new Set(matches.map((m) => m.category))].join(', ');
   logEvent(ctx.db, 'triage.policy_cleared', `${job.ticket_identifier}: keyword flag(s) [${categories}] cleared for diff ${policy.hash.slice(0, 12)} by ${r.model}`, { jobId: job.id, ticketId: job.ticket_id });
   await ctx.tracker.comment(job.ticket_id, `🧭 **Triage (${r.model})** cleared the diff-policy keyword flag(s) [${categories}] for diff ${policy.hash.slice(0, 12)}: they are mentions, not restricted changes. CI and both reviews still apply.\n\n${v.summary}\n${matches.map((m) => `- ${m.id} \`${m.file}\`: ${m.text}`).join('\n')}`).catch(() => {});
@@ -104,10 +107,26 @@ export async function clearKeywordFlags(ctx: Ctx, job: Job, project: ProjectConf
 
 // ---------------------------------------------------------------- blocking questions
 
-/** Tickets autodev suggested while working on `ticket` (the only ones triage may promote or depend on). */
-async function suggestedFrom(ctx: Ctx, job: Job, ticket: Ticket): Promise<Ticket[]> {
+/** Events that start a new attempt on a job: suggestions older than the latest one may already have been seen and held. */
+const ATTEMPT_START = ['job.claimed', 'job.unblocked', 'triage.resolved', 'triage.prerequisites_merged'];
+
+/**
+ * The only tickets triage may promote or depend on: suggested (labelled and marked) from this ticket by THIS job during
+ * its CURRENT attempt, so the owner can't have reviewed and held them yet, with no human comment (any human comment is
+ * the owner's call, e.g. "keep this in Backlog") and no hold label.
+ */
+export async function eligibleFixTickets(ctx: Ctx, job: Job, ticket: Ticket): Promise<Ticket[]> {
+  const since = (ctx.db.prepare(`SELECT MAX(ts) AS t FROM events WHERE job_id = ? AND type IN (${ATTEMPT_START.map(() => '?').join(',')})`).get(job.id, ...ATTEMPT_START) as { t: number | null }).t ?? 0;
+  const fresh = new Set((ctx.db.prepare(`SELECT message FROM events WHERE job_id = ? AND type = 'ticket.suggested' AND ts >= ?`).all(job.id, since) as { message: string }[]).map((r) => r.message.split(':')[0]!));
   const all = await ctx.tracker.listTickets({ projectKey: job.project });
-  return all.filter((t) => t.labels.includes(LABEL_SUGGESTED) && t.description.includes(`while working on ${ticket.identifier}.`) && !['canceled', 'failed'].includes(t.status));
+  const out: Ticket[] = [];
+  for (const t of all) {
+    if (!fresh.has(t.identifier) || !t.labels.includes(LABEL_SUGGESTED) || !t.description.includes(`while working on ${ticket.identifier}.`)) continue;
+    if (!['backlog', 'ready'].includes(t.status) || t.labels.some((l) => /hold/i.test(l))) continue;
+    if ((await ctx.tracker.listComments(t.id)).some((c) => !c.byAutomation)) continue;
+    out.push(t);
+  }
+  return out;
 }
 
 export async function triageBlocker(ctx: Ctx, job: Job, b: Blocker): Promise<TriageOutcome | null> {
@@ -122,7 +141,7 @@ export async function triageBlocker(ctx: Ctx, job: Job, b: Blocker): Promise<Tri
   kvSet(db, `triage-seen:${job.id}:${q}`, '1');
 
   const ticket = (await ctx.tracker.getTicket(job.ticket_id))!;
-  const candidates = await suggestedFrom(ctx, job, ticket);
+  const candidates = await eligibleFixTickets(ctx, job, ticket);
   let diff = await ctx.ws.diff(job.worktree, job.base_branch);
   if (diff.length > limits.maxDiffChars) diff = `${diff.slice(0, limits.maxDiffChars)}\n[diff truncated at ${limits.maxDiffChars} characters]`;
   const task = triageTask({
@@ -193,7 +212,7 @@ async function sequenceDefect(ctx: Ctx, job: Job, ticket: Ticket, b: Blocker, v:
   if (!v.instructions.trim()) return human('No follow-up instructions for this ticket were given.');
   const allowed = new Map(candidates.map((t) => [t.identifier, t]));
   const outside = v.fixTickets.filter((id) => !allowed.has(id));
-  if (outside.length) return human(`Proposed fix tickets outside the allowed set (suggested from ${ticket.identifier}): ${outside.join(', ')}.`);
+  if (outside.length) return human(`Proposed fix tickets outside the allowed set (suggested from ${ticket.identifier} in this attempt, with no owner comment or hold): ${outside.join(', ')}.`);
   if (v.fixTickets.length > 3) return human(`${v.fixTickets.length} fix tickets proposed (limit 3).`);
   let fixes = [...new Set(v.fixTickets)].map((id) => allowed.get(id)!);
   if (!fixes.length) {

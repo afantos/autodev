@@ -136,8 +136,8 @@ export interface PolicyInspection {
   testUpdates: (TestUpdateAnalysis & { file: string })[];
   /** Added code lines that matched a HUMAN_PATTERNS topic (the source of each "diff touches …" reason), for triage. */
   keywordMatches: { category: string; file: string; text: string }[];
-  /** Fingerprint of the change itself, independent of where the base is (see diffFingerprint). */
-  fingerprint: string;
+  /** Fingerprint of the change itself, independent of where the base is; null when it can't be trusted (see diffFingerprint). */
+  fingerprint: string | null;
 }
 
 const KEYWORD_REASON = 'diff touches ';
@@ -155,8 +155,12 @@ export function onlyKeywordFindings(r: PolicyInspection): boolean {
 /**
  * Like `git patch-id`: a hash of the diff with index lines and hunk positions removed, so the same change on a moved
  * base fingerprints the same, while any change to its content or surrounding context does not.
+ * Null when the diff shows any file as binary (a real binary, or a text file marked -diff in .gitattributes): its
+ * content is then only identified by the abbreviated blob hash on the stripped index line, so two different payloads
+ * would fingerprint the same. Such changes never carry an approval over.
  */
-export function diffFingerprint(diff: string): string {
+export function diffFingerprint(diff: string): string | null {
+  if (/^(?:Binary files .* differ|GIT binary patch)$/m.test(diff)) return null;
   const normalized = diff.split('\n').filter((l) => !l.startsWith('index ')).map((l) => (l.startsWith('@@') ? '@@' : l)).join('\n');
   return createHash('sha256').update(normalized).digest('hex');
 }

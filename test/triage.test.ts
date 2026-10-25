@@ -10,6 +10,7 @@ import type { Clearance, Evidence, KeywordMatch, StructuredTask, Triage } from '
 import type { FakeBehavior } from '../src/agents/fake.ts';
 import { clearanceAccepted } from '../src/triage.ts';
 import { diffFingerprint, onlyKeywordFindings } from '../src/policy.ts';
+import { kvGet } from '../src/db.ts';
 import type { PolicyInspection } from '../src/policy.ts';
 
 const APPROVE: SecondReviewVerdict = { verdict: 'approve', summary: 'Correct.', findings: [], specConformance: 'ok' };
@@ -309,7 +310,7 @@ test('a defect that names a ticket outside the allowed set (not suggested from t
   assert.equal(job(e, t.identifier).status, 'blocked');
   assert.equal((await e.tracker.getTicket(held.id))!.status, 'backlog');
   assert.deepEqual((await e.tracker.getTicket(t.id))!.blockedBy, []);
-  assert.match(await comments(e, t.id), /outside the allowed set \(suggested from DEMO-2\): DEMO-1/);
+  assert.match(await comments(e, t.id), /outside the allowed set \(suggested from DEMO-2 in this attempt, with no owner comment or hold\): DEMO-1/);
 });
 
 test('product and permission questions go to the human with the model\'s classification and recommendation', async () => {
@@ -332,4 +333,118 @@ test('a blocker that is not a question (e.g. a policy flag on a protected path) 
   await cycles(e, 3);
   assert.equal(job(e, t.identifier).status, 'blocked');
   assert.equal(reviewer.asked.length, 0);
+});
+
+// ---------------------------------------------------------------- review of cdbfc70
+
+test('regression (P1): a diff with any binary change has no fingerprint, so two different payloads never share an approval', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bin-'));
+  git(dir, 'init', '-q'); git(dir, 'commit', '-q', '--allow-empty', '-m', 'root');
+  const base = git(dir, 'rev-parse', 'HEAD').trim();
+  const diffOf = (files: Record<string, string | Buffer>) => {
+    git(dir, 'checkout', '-q', '--detach', base);
+    for (const [p, c] of Object.entries(files)) writeFileSync(join(dir, p), c);
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'change');
+    // The exact flags Workspaces.diff uses.
+    return git(dir, 'diff', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', `${base}...HEAD`);
+  };
+  const a = diffOf({ 'payload.bin': Buffer.from([0, 1, 2, 3, 0, 255]), 'note.js': '// production\n' });
+  const b = diffOf({ 'payload.bin': Buffer.from([0, 9, 9, 9, 0, 255]), 'note.js': '// production\n' });
+  assert.match(a, /^Binary files \/dev\/null and b\/payload\.bin differ$/m);
+  assert.equal(a.replace(/^index .*$/gm, ''), b.replace(/^index .*$/gm, ''), 'without index lines the two diffs are identical (the reported collision)');
+  assert.equal(diffFingerprint(a), null);
+  assert.equal(diffFingerprint(b), null);
+  // A text file the repository marks -diff is shown as binary too, and gets no fingerprint either.
+  const hidden = diffOf({ '.gitattributes': 'secret.txt -diff\n', 'secret.txt': 'anything\n' });
+  assert.match(hidden, /^Binary files \/dev\/null and b\/secret\.txt differ$/m);
+  assert.equal(diffFingerprint(hidden), null);
+  assert.equal(typeof diffFingerprint(diffOf({ 'note.js': '// production\n' })), 'string');
+});
+
+test('regression (P1) e2e: an approved flagged diff that includes a binary file is asked again after the base moves (no carry-over)', async () => {
+  const reviewer = new TriageReviewer();
+  const binary: FakeBehavior = async (spec, n) => {
+    await writes(PROD_COMMENT)(spec, n);
+    writeFileSync(join(spec.cwd, 'assets.bin'), Buffer.from([0, 1, 2, 0, 3]));
+    return { structured: { status: 'completed', summary: 'done', filesChanged: ['assets.bin'], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
+  };
+  const e = env(reviewer, { coding: binary }, { secondReview: { triage: { enabled: false } } });
+  const t = await ticket(e);
+  await cycles(e, 3);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  e.tracker.humanComment(t.id, '/answer approve - ok');
+  await e.tracker.setStatus(t.id, 'ready');
+  await cycles(e, 4);
+  assert.equal(job(e, t.identifier).status, 'awaiting_merge');
+  pushToMain(e.repo, { 'other.txt': 'unrelated\n' });
+  await cycles(e, 5);
+  assert.equal(events(e, 'policy.approval_carried').length, 0);
+  assert.equal(events(e, 'job.blocked').length, 2, 'the moved diff with a binary change needs a new human approval');
+  assert.equal(job(e, t.identifier).status, 'blocked');
+});
+
+/** Simulates the owner reacting to a suggestion the moment it appears (before triage looks at it). */
+function ownerHolds(e: ReturnType<typeof makeEnv>, how: 'comment' | 'label') {
+  const create = e.tracker.createTicket.bind(e.tracker);
+  e.tracker.createTicket = async (t) => {
+    const created = await create(how === 'label' ? { ...t, labels: [...(t.labels ?? []), 'owner-hold'] } : t);
+    if (how === 'comment') e.tracker.humanComment(created.id, 'Do not promote this; keep it in Backlog.');
+    return created;
+  };
+}
+
+for (const how of ['comment', 'label'] as const) {
+  test(`regression (P1): a same-ticket suggestion the owner held (${how}) is never promoted`, async () => {
+    const defect: Triage = { kind: 'defect', summary: 'Existing bug.', claim: '', checks: [], fixTickets: ['DEMO-2'], newTicket: null, instructions: 'Then assert the fix.', recommendation: 'Fix first.' };
+    const reviewer = new TriageReviewer({ blocker_triage: [defect] });
+    const e = env(reviewer, { coding: writes({ 'src/a.js': '1\n' }), review: async () => blockingReview('Engine bug; wait for a fix?', [{ title: 'Engine: fix it', description: 'The engine is wrong.' }]) });
+    ownerHolds(e, how);
+    const t = await ticket(e);
+    await cycles(e, 3);
+    const fix = (await e.tracker.listTickets({ projectKey: 'demo' })).find((x) => x.identifier === 'DEMO-2')!;
+    assert.equal(fix.status, 'backlog', 'stays in Backlog');
+    assert.deepEqual((await e.tracker.getTicket(t.id))!.blockedBy, []);
+    assert.equal(job(e, t.identifier).status, 'blocked');
+    assert.match(await comments(e, t.id), /outside the allowed set .*: DEMO-2/);
+    assert.doesNotMatch(reviewer.asked[0]!.prompt, /### DEMO-2/, 'held tickets are not even offered to the model');
+  });
+}
+
+test('regression (P1): a suggestion from an earlier attempt of the same job is not eligible (the owner may have held it outside Linear)', async () => {
+  const reviewer = new TriageReviewer({ blocker_triage: [
+    { kind: 'permission', summary: 'Owner call.', claim: '', checks: [], fixTickets: [], newTicket: null, instructions: '', recommendation: 'Ask.' },
+    { kind: 'defect', summary: 'Existing bug.', claim: '', checks: [], fixTickets: ['DEMO-2'], newTicket: null, instructions: 'Then assert the fix.', recommendation: 'Fix first.' },
+  ] });
+  let n = 0;
+  const e = env(reviewer, { coding: writes({ 'src/a.js': '1\n' }), review: async () => (++n === 1 ? blockingReview('First question?', [{ title: 'Engine: fix it', description: 'x' }]) : blockingReview('Second question?')) });
+  const t = await ticket(e);
+  await cycles(e, 3);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  e.tracker.humanComment(t.id, '/answer continue');
+  await e.tracker.setStatus(t.id, 'ready');
+  await cycles(e, 4);
+  assert.equal(reviewer.count('blocker_triage'), 2);
+  assert.equal((await e.tracker.listTickets({ projectKey: 'demo' })).find((x) => x.identifier === 'DEMO-2')!.status, 'backlog');
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.match(await comments(e, t.id), /outside the allowed set .*: DEMO-2/);
+});
+
+test('regression (P2): keyword clearance counts against maxPerJob; with the limit at 0 nothing is cleared or merged', async () => {
+  const reviewer = new TriageReviewer({ keyword_flag_clearance: [CLEAR] });
+  const e = env(reviewer, { coding: writes(PROD_COMMENT) }, { secondReview: { triage: { maxPerJob: 0 } } });
+  const t = await ticket(e);
+  await cycles(e, 5);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(reviewer.asked.length, 0);
+  assert.equal(await merged(e, t.identifier), false);
+  assert.match(await comments(e, t.id), /\*\*Triage:\*\* triage already resolved 0 blocker\(s\) on this job \(limit 0\)/);
+});
+
+test('regression (P2): a clearance uses one resolution; reusing it at the merge gate for the same diff does not', async () => {
+  const reviewer = new TriageReviewer({ keyword_flag_clearance: [CLEAR] });
+  const e = env(reviewer, { coding: writes(PROD_COMMENT) }, { secondReview: { triage: { maxPerJob: 1 } } });
+  const t = await ticket(e);
+  await cycles(e, 6);
+  assert.equal(await merged(e, t.identifier), true);
+  assert.equal(kvGet(e.ctx.db, `triage-count:${job(e, t.identifier).id}`), '1');
 });

@@ -306,10 +306,10 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
   const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
   // A human approved this same change (same fingerprint) with the same or more findings; only the base moved since.
-  const carried = kvGet(ctx.db, `policy-approved-change:${job.id}:${result.fingerprint}`);
+  const carried = result.fingerprint ? kvGet(ctx.db, `policy-approved-change:${job.id}:${result.fingerprint}`) : null;
   if (carried && result.reasons.every((r) => (JSON.parse(carried) as string[]).includes(r))) {
     kvSet(ctx.db, `policy-approved:${job.id}:${result.hash}`, 'human (carried over: same change, moved base)');
-    logEvent(ctx.db, 'policy.approval_carried', `${job.ticket_identifier}: human approval carried over to diff ${result.hash.slice(0, 12)} (same change ${result.fingerprint.slice(0, 12)}, base moved)`, { jobId: job.id, ticketId: job.ticket_id });
+    logEvent(ctx.db, 'policy.approval_carried', `${job.ticket_identifier}: human approval carried over to diff ${result.hash.slice(0, 12)} (same change ${result.fingerprint!.slice(0, 12)}, base moved)`, { jobId: job.id, ticketId: job.ticket_id });
     return;
   }
   if (isCleared(ctx, job, result)) return;
@@ -333,7 +333,7 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
   }
   throw new Divert('blocked', 'mandatory diff policy requires human approval', {
     reason: `${result.reasons.join('; ')}${triageNote ? `\n\n**Triage:** ${triageNote}` : ''}`, policyHash: result.hash,
-    policyFingerprint: result.fingerprint, policyReasons: result.reasons,
+    ...(result.fingerprint ? { policyFingerprint: result.fingerprint } : {}), policyReasons: result.reasons,
     question: `Review the local diff (${result.hash.slice(0, 12)}). Remove the flagged changes, or explicitly approve this exact diff with /answer approve.`,
     options: ['Remove or revise flagged changes', 'Approve this exact diff with /answer approve'],
     recommendation: 'Remove or revise flagged changes', decisionId: null,
