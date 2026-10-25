@@ -88,8 +88,8 @@ const WEAKENING_ADDED: [RegExp, string][] = [
     String.raw`\b(?:globalThis|global|self|window)\b\s*(?:\?\.\s*)?(?:\[|\.\s*process\b|[,)])`,
     String.raw`(?:[=(,:]|\?\?|\|\||&&|\.\.\.)\s*process\b(?!\s*\.\s*env\b)`,
     String.raw`\bprocess\s*\)`,
-    String.raw`\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})(?=[\w$]{2})|[A-Za-z_$]{2}\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})`,
-    String.raw`\beval\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\bconstructor\s*(?:\(|\.\s*constructor\b)|\[\s*['"\x60]constructor['"\x60]\s*\]`,
+    // Member access only (x.constructor(...), [].constructor.constructor): a class's own `constructor(...)` is fine.
+    String.raw`\beval\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\.\s*constructor\s*(?:\(|\.\s*constructor\b)|\[\s*['"\x60]constructor['"\x60]\s*\]`,
     String.raw`(?:\b(?:require|import)\s*\(\s*|\bfrom\s+|\bimport\s+)['"\x60](?:node:)?(?:process|vm|child_process|worker_threads|cluster|module|inspector)['"\x60]`,
   ].join('|')), 'reaches the process object or runs dynamic code'],
   // Dotted, computed and optional member writes (assert.equal =, assert["equal"] =, assert?.strict.equal +=), the
@@ -101,6 +101,29 @@ const WEAKENING_ADDED: [RegExp, string][] = [
   ].join('|')), 'replaces assertion functions'],
   [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
 ];
+
+/**
+ * Unicode-escaped identifiers (\u0070rocess.exit, pro\u0063ess): checked on the line with string-literal contents
+ * removed, because inside a string an escape is just data (a control-character test case such as 'Ann\u0000').
+ */
+const ESCAPED_IDENTIFIER = /\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})(?=[\w$]{2})|[A-Za-z_$]{2}\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})|(?:^|[^\w$'"\x60\\])\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})/;
+
+/** The line with the contents of single-line '...', "..." and `...` literals blanked (quotes kept); escapes respected. */
+export function withoutStringContents(line: string): string {
+  let out = '';
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (quote) {
+      if (c === '\\') { i++; continue; }
+      if (c === quote) { quote = null; out += c; }
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c;
+    out += c;
+  }
+  return out;
+}
 /**
  * Conservative test-weakening check for one changed test file. Any change to a file that existed on the base
  * (edit, insertion, deletion) goes to a human: position-based exceptions (import header, end of file) were
@@ -110,7 +133,10 @@ const WEAKENING_ADDED: [RegExp, string][] = [
 export function testWeakening(file: string, addedLines: string[], existedOnBase: boolean): string[] {
   const out = new Set<string>();
   if (existedOnBase) out.add(existingTestReason(file));
-  for (const l of addedLines) for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
+  for (const l of addedLines) {
+    for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
+    if (ESCAPED_IDENTIFIER.test(withoutStringContents(l))) out.add(`${file}: added test code reaches the process object or runs dynamic code`);
+  }
   return [...out];
 }
 

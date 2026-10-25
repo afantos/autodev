@@ -606,3 +606,26 @@ test('the test-integrity review sees test files the change adds (DEV-57: require
   assert.match(reviewer.integrityInputs[0]!.newTests[0]!.content, /short all-in raise leaves the increment unchanged/);
   assert.ok(!reviewer.integrityInputs[0]!.newTests.some((x) => x.path === TEST_PATH), 'the edited existing test is not listed as new');
 });
+
+// ---------------------------------------------------------------- false positives seen on poker (DEV-78, DEV-91)
+
+test('weakening check: a class constructor and escapes inside strings are not flagged; real escapes and constructor chains still are', async () => {
+  const { testWeakening } = await import('../src/policy.ts');
+  const flagged = (line: string) => testWeakening('test/a.test.js', [line], false).length > 0;
+  for (const line of [
+    'constructor(url: string) {', // DEV-91: a class's own constructor
+    'class FakeSocket { constructor() { this.sent = []; } }',
+    "for (const raw of ['A\\tB', 'A\\nB', '\\tAnn', 'Ann\\u0000', 'A\\u007fB']) {", // DEV-78: control characters in strings
+    'const s = "caf\\u00e9clair";',
+    'const t = `name\\u0000x`;',
+  ]) assert.equal(flagged(line), false, line);
+  for (const line of [
+    "[].constructor.constructor('return process')()().exit(0);",
+    "x.constructor('return 1')();",
+    "obj['constructor']('x');",
+    '\\u0070rocess.exit(0);',
+    'pro\\u0063ess.exit(0);',
+    'const p = \\u{70}rocess;',
+    "const s = 'safe' + \\u0070rocess.argv;",
+  ]) assert.equal(flagged(line), true, line);
+});
