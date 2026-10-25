@@ -79,7 +79,19 @@ const TEST_FILE = /(^|\/)(test|tests|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
 const WEAKENING_ADDED: [RegExp, string][] = [
   [/\.\s*(?:skip|only|todo)\b/, 'skips, focuses or marks a test todo'],
   [/\b(?:skip|only|todo)\s*:/, 'sets a skip/only/todo test option'],
-  [/\bprocess\s*(?:\.\s*(?:exit|abort|kill|exitCode|reallyExit)\b|\[)/, 'can end the test process early'],
+  [/\bprocess\s*(?:\??\.\s*(?:exit|abort|kill|exitCode|reallyExit)\b|(?:\?\.\s*)?\[)/, 'can end the test process early'],
+  // Indirect routes to the same thing. Heuristic, so it errs towards a human: computed or optional access through the
+  // global object (globalThis['process']['exit']), aliasing or passing `process` (Reflect.get(process, 'exit')),
+  // unicode-escaped identifiers (\u0070rocess), dynamic code (eval, Function, a constructor chain) and modules that
+  // can end or replace the process.
+  [new RegExp([
+    String.raw`\b(?:globalThis|global|self|window)\b\s*(?:\?\.\s*)?(?:\[|\.\s*process\b|[,)])`,
+    String.raw`(?:[=(,:]|\?\?|\|\||&&|\.\.\.)\s*process\b(?!\s*\.\s*env\b)`,
+    String.raw`\bprocess\s*\)`,
+    String.raw`\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})(?=[\w$]{2})|[A-Za-z_$]{2}\\u(?:[0-9a-fA-F]{4}|\{[0-9a-fA-F]+\})`,
+    String.raw`\beval\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\bconstructor\s*(?:\(|\.\s*constructor\b)|\[\s*['"\x60]constructor['"\x60]\s*\]`,
+    String.raw`(?:\b(?:require|import)\s*\(\s*|\bfrom\s+|\bimport\s+)['"\x60](?:node:)?(?:process|vm|child_process|worker_threads|cluster|module|inspector)['"\x60]`,
+  ].join('|')), 'reaches the process object or runs dynamic code'],
   [/\bassert(?:\s*\.\s*\w+)*\s*=(?!=)|\b(?:mock\s*\.\s*method|Object\s*\.\s*(?:defineProperty|assign|setPrototypeOf))\s*\(\s*assert\b/, 'replaces assertion functions'],
   [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
 ];

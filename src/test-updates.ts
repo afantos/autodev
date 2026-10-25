@@ -28,6 +28,7 @@ export function analyzeTestUpdate(oldText: string, newText: string): TestUpdateA
   const la = lexLines(oldText);
   const lb = lexLines(newText);
   if (!la.ok || !lb.ok) return fail('the test file could not be lexed unambiguously');
+  if (la.codeAtStart.length !== a.length || lb.codeAtStart.length !== b.length) return fail('line context does not match the file length');
   for (let i = 0; i < a.length; i++) {
     if (a[i] === b[i]) continue;
     if (!la.codeAtStart[i] || !la.codeAtEnd[i] || !lb.codeAtStart[i] || !lb.codeAtEnd[i]) {
@@ -173,6 +174,8 @@ export function lexLines(text: string): { ok: boolean; codeAtStart: boolean[]; c
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
     const n = text[i + 1];
+    // JavaScript also ends lines (and // comments) at a lone CR, U+2028 and U+2029; this lexer only counts '\n'.
+    if ((c === '\r' && n !== '\n') || c === '\u2028' || c === '\u2029') return { ok: false, codeAtStart, codeAtEnd };
     if (c === '\n') {
       if (mode === 'line') mode = 'code';
       codeAtEnd.push(topLevel());
@@ -188,17 +191,19 @@ export function lexLines(text: string): { ok: boolean; codeAtStart: boolean[]; c
         if ((mode === 'sq' && c === "'") || (mode === 'dq' && c === '"')) { mode = 'code'; lastSig = 'str'; }
         break;
       case 'tpl':
-        if (c === '\\') { i++; break; }
+        // An escaped newline is a template line continuation: consume only the backslash so the newline below is
+        // still seen (and recorded) as a physical line break; skipping it would shift every later line's context.
+        if (c === '\\') { if (n !== '\n') i++; break; }
         if (c === '`') { mode = 'code'; lastSig = 'str'; break; }
         if (c === '$' && n === '{') { exprDepth.push(0); mode = 'code'; lastSig = '{'; i++; }
         break;
       case 'regex':
-        if (c === '\\') { i++; break; }
+        if (c === '\\') { if (n !== '\n') i++; break; } // a newline inside a regex is then rejected as unterminated
         if (c === '[') { mode = 'regexClass'; break; }
         if (c === '/') { mode = 'code'; lastSig = 'regex'; while (/[a-z]/i.test(text[i + 1] ?? '')) i++; }
         break;
       case 'regexClass':
-        if (c === '\\') { i++; break; }
+        if (c === '\\') { if (n !== '\n') i++; break; }
         if (c === ']') mode = 'regex';
         break;
       case 'code': {
@@ -229,6 +234,8 @@ export function lexLines(text: string): { ok: boolean; codeAtStart: boolean[]; c
     }
   }
   codeAtEnd.push(mode === 'line' ? exprDepth.length === 0 : topLevel());
-  const ok = (mode === 'code' || mode === 'line') && exprDepth.length === 0;
+  // Every physical line must have exactly one start and one end entry; any mismatch means the lexer lost track.
+  const lines = text.split('\n').length;
+  const ok = (mode === 'code' || mode === 'line') && exprDepth.length === 0 && codeAtStart.length === lines && codeAtEnd.length === lines;
   return { ok, codeAtStart, codeAtEnd };
 }

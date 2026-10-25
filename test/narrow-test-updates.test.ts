@@ -341,3 +341,119 @@ test('P1 e2e: the template-literal bypass is never deferred; it blocks for a hum
   assert.equal(reviewer.integrityInputs.length, 0);
   assert.equal(event(e, 'policy.test_update_deferred'), false);
 });
+
+// ---------------------------------------------------------------- escaped newlines and indirect process access (review of 9461fad)
+
+/** Two template line continuations (backslash-newline) before the assertion-looking fixture line. The old lexer
+ *  skipped each escaped newline without recording it, so every later line's context shifted by two and the fixture
+ *  line was read as top-level code. */
+const CONTINUED_OLD = `import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const fixture = \`a\\
+b\\
+  assert.equal(s.lastFullRaiseIncrement, 2);
+\`;
+
+test('real check', () => {
+  assert.equal(compute(), 2);
+});
+
+test('later check', () => {
+  assert.equal(other(), 3);
+});
+`;
+/** Computed access avoids `process.exit` / `process[`: the earlier pattern never matched it. */
+const COMPUTED_EXIT = `'\`+globalThis["process"]["exit"](0)+\`'`;
+const CONTINUED_BYPASS = CONTINUED_OLD.replace('lastFullRaiseIncrement, 2);', `lastFullRaiseIncrement, ${COMPUTED_EXIT});`);
+
+test('regression: every physical line keeps its own context across template line continuations', () => {
+  const l = lexLines(CONTINUED_OLD);
+  const lines = CONTINUED_OLD.split('\n');
+  assert.equal(l.ok, true);
+  assert.equal(l.codeAtStart.length, lines.length);
+  assert.equal(l.codeAtEnd.length, lines.length);
+  const at = lines.indexOf('  assert.equal(s.lastFullRaiseIncrement, 2);');
+  assert.equal(l.codeAtStart[at], false, 'the fixture line starts inside the template');
+  assert.equal(l.codeAtEnd[at], false, 'and ends inside it');
+  assert.equal(l.codeAtStart[lines.indexOf('b\\')], false);
+  assert.equal(l.codeAtStart[lines.indexOf("test('real check', () => {")], true);
+  assert.equal(l.codeAtEnd[lines.indexOf('`;')], true);
+});
+
+test('regression: the two-continuation template bypass is ineligible on its own (lexer), whatever the payload', () => {
+  assert.equal(isLiteral(COMPUTED_EXIT), true, 'line patterns alone would accept the payload');
+  const r = analyzeTestUpdate(CONTINUED_OLD, CONTINUED_BYPASS);
+  assert.equal(r.eligible, false);
+  assert.match(String(r.why), /inside \(or leaves open\) a string, template literal, comment or regular expression/);
+  assert.equal(analyzeTestUpdate(CONTINUED_OLD, CONTINUED_OLD.replace('lastFullRaiseIncrement, 2);', 'lastFullRaiseIncrement, 18);')).eligible, false);
+});
+
+test('regression: legitimate edits after template continuations stay eligible (contexts line up)', () => {
+  const r = analyzeTestUpdate(CONTINUED_OLD, CONTINUED_OLD.replace('assert.equal(other(), 3);', 'assert.equal(other(), 4);'));
+  assert.equal(r.eligible, true, r.why ?? '');
+});
+
+test('line-count consistency: lexLines returns one start and one end entry per physical line, or is not ok', () => {
+  const inputs = [
+    '', '\n', 'a\n', 'const t = `x\\\ny\\\nz`;\n', 'const t = `x\\\n${ 1 }\\\n`;\nconst u = 1;\n',
+    'const r = /a\\\nb/;\n', 'const r = /[a\\\n]/;\n', "const s = 'a\\\nb';\n", '/* a\n b */\nx;\n', CONTINUED_OLD, OLD,
+  ];
+  for (const text of inputs) {
+    const l = lexLines(text);
+    const lines = text.split('\n').length;
+    if (l.ok) {
+      assert.equal(l.codeAtStart.length, lines, JSON.stringify(text));
+      assert.equal(l.codeAtEnd.length, lines, JSON.stringify(text));
+    }
+  }
+  // A backslash-newline inside a regex literal or class is not a continuation: the file is rejected.
+  assert.equal(lexLines('const r = /a\\\nb/;\n').ok, false);
+  assert.equal(lexLines('const r = /[a\\\n]/;\n').ok, false);
+});
+
+test('lexer: line terminators other than \\n (lone CR, U+2028, U+2029) make a file ineligible', () => {
+  for (const t of ['\r', ' ', ' ']) {
+    const text = OLD.replace('assert.equal(s.currentBet, 20);', `assert.equal(s.currentBet, 20); //${t}process.exit(0)`);
+    assert.equal(lexLines(text).ok, false, JSON.stringify(t));
+  }
+  assert.equal(lexLines('a;\r\nb;\r\n').ok, true, 'CRLF files still lex');
+});
+
+test('weakening check: computed, optional, aliased, escaped and dynamic routes to the process are flagged', async () => {
+  const { testWeakening } = await import('../src/policy.ts');
+  const flagged = (line: string) => testWeakening('test/a.test.js', [line], false).length > 0;
+  for (const line of [
+    "process['exit'](0);", "process?.['exit'](0);", 'process?.exit(0);', "globalThis['process']['exit'](0);", "global['pro' + 'cess'].exit(0);",
+    'self.process.exit();', "Reflect.get(process, 'exit')(0);", "Reflect.get(globalThis, 'process').exit(0);", 'const p = process; p.exit(0);',
+    'const { exit } = process;', '\\u0070rocess.exit(0);', 'pro\\u0063ess.exit(0);', "[].constructor.constructor('return process')()()",
+    "eval('process.exit(0)');", "new Function('process.exit(0)')();", "Function('return process')().exit(0);",
+    "import('node:process').then((p) => p.exit(0));", "import p from 'node:process';", "const vm = require('vm');", "import { execSync } from 'node:child_process';",
+    `x = ${COMPUTED_EXIT};`,
+  ]) assert.equal(flagged(line), true, line);
+  for (const line of [
+    "assert.equal(process.env.SEED, undefined);", "test('process the queue', () => {});", "assert.equal(card, '\\u2660');",
+    'const half = 4 / 2;', "import { applyAction } from '../src/apply-action.ts';", 'assert.equal(s.lastFullRaiseIncrement, 18);',
+  ]) assert.equal(flagged(line), false, line);
+});
+
+test('regression e2e: the two-continuation bypass with computed process access blocks for a human, even with authorization', async () => {
+  const reviewer = new Reviewer();
+  const e = makeEnv({
+    secondReviewer: reviewer, project: { autoMerge: true, protectTests: true }, config: { secondReview: { enabled: true } },
+    behaviors: { coding: async (spec) => {
+      writeFileSync(join(spec.cwd, TEST_PATH), CONTINUED_BYPASS);
+      writeFileSync(join(spec.cwd, 'CHANGES.md'), 'x\n');
+      return { structured: { status: 'completed', summary: 'done', filesChanged: [TEST_PATH], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
+    } },
+  });
+  seedMain(e.repo, { [TEST_PATH]: CONTINUED_OLD });
+  const t = await ticket(e);
+  authorize(e, t.id);
+  await cycles(e, 2);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(reviewer.integrityInputs.length, 0);
+  assert.equal(event(e, 'policy.test_update_deferred'), false);
+  const pr = job(e, t.identifier).pr_number;
+  assert.ok(pr == null || !(await merged(e, t)), 'nothing merged');
+});
