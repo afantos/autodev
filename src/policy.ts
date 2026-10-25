@@ -92,7 +92,13 @@ const WEAKENING_ADDED: [RegExp, string][] = [
     String.raw`\beval\s*\(|\bFunction\s*\(|\bnew\s+Function\b|\bconstructor\s*(?:\(|\.\s*constructor\b)|\[\s*['"\x60]constructor['"\x60]\s*\]`,
     String.raw`(?:\b(?:require|import)\s*\(\s*|\bfrom\s+|\bimport\s+)['"\x60](?:node:)?(?:process|vm|child_process|worker_threads|cluster|module|inspector)['"\x60]`,
   ].join('|')), 'reaches the process object or runs dynamic code'],
-  [/\bassert(?:\s*\.\s*\w+)*\s*=(?!=)|\b(?:mock\s*\.\s*method|Object\s*\.\s*(?:defineProperty|assign|setPrototypeOf))\s*\(\s*assert\b/, 'replaces assertion functions'],
+  // Dotted, computed and optional member writes (assert.equal =, assert["equal"] =, assert?.strict.equal +=), the
+  // reflective ways to do the same, and aliasing or passing `assert` itself somewhere it could be rewritten.
+  [new RegExp([
+    String.raw`\bassert\s*(?:(?:\?\.|\.)\s*[\w$]+|(?:\?\.\s*)?\[[^\]]*\])*\s*(?:[-+*/%&|^]|\*\*|<<|>>>?|&&|\|\||\?\?)?=(?![=>])`,
+    String.raw`\b(?:mock\s*\.\s*method|Object\s*\.\s*(?:defineProperty|defineProperties|assign|setPrototypeOf)|Reflect\s*\.\s*(?:set|defineProperty|setPrototypeOf|deleteProperty))\s*\(\s*assert\b`,
+    String.raw`(?:[=(,:]|\?\?|\|\||&&|\.\.\.)\s*assert\s*(?:[;,)}\]]|$)`,
+  ].join('|')), 'replaces assertion functions'],
   [/--test-(?:skip-pattern|name-pattern|only)\b/, 'filters which tests run'],
 ];
 /**
@@ -203,7 +209,7 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
       if (existed) {
         const before = await content(ref, f);
         const after = await content(head, f);
-        testUpdates.push({ file: f, ...(before === null || after === null ? { eligible: false, why: 'existing test file removed', changes: [] } : analyzeTestUpdate(before, after)) });
+        testUpdates.push({ file: f, ...(before === null || after === null ? { eligible: false, why: 'existing test file removed', changes: [] } : analyzeTestUpdate(before, after, f)) });
       }
     }
   }

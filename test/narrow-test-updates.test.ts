@@ -457,3 +457,138 @@ test('regression e2e: the two-continuation bypass with computed process access b
   const pr = job(e, t.identifier).pr_number;
   assert.ok(pr == null || !(await merged(e, t)), 'nothing merged');
 });
+
+// ---------------------------------------------------------------- regex after if (...) (review of d7b1b53)
+
+import { v8CodeAtBoundaries } from '../src/test-updates.ts';
+import { spawnSync } from 'node:child_process';
+
+/** Reproduction: `if (s) /`/.test(...)` is a regex, but the old heuristic read the '/' after ')' as a division, so the
+ *  backtick inside it opened a "template" and every later template boundary was read inverted. The fixture line then
+ *  looked like top-level code while JavaScript sees it inside a template literal. */
+const REGEX_OLD = `import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+const s = { lastFullRaiseIncrement: 2 };
+if (s) /\`/.test('x');
+
+const fixture = \`
+  assert.equal(s.lastFullRaiseIncrement, 2);
+\`;
+// \` keeps the misreading lexer balanced
+
+test('real check', () => {
+  assert.equal(1 + 1, 3);
+});
+`;
+const ASSERT_PATCH = `'\`+(assert["equal"] = () => {})+\`'`;
+const REGEX_BYPASS = REGEX_OLD.replace('lastFullRaiseIncrement, 2);', `lastFullRaiseIncrement, ${ASSERT_PATCH});`);
+const FIXTURE_LINE = REGEX_OLD.split('\n').indexOf('  assert.equal(s.lastFullRaiseIncrement, 2);');
+
+test('reproduction (regex after if): when node runs it, the "expected-value update" makes a failing assertion pass', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'regex-bypass-'));
+  const run = (name: string, text: string) => {
+    writeFileSync(join(dir, name), text);
+    const childEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT'));
+    return spawnSync(process.execPath, ['--test', join(dir, name)], { encoding: 'utf8', env: childEnv, timeout: 60_000 }).status;
+  };
+  assert.notEqual(run('old.test.mjs', REGEX_OLD), 0, 'the original real check fails');
+  assert.equal(run('new.test.mjs', REGEX_BYPASS), 0, 'after the edit, assert.equal is replaced and the failing check passes');
+  assert.equal(isLiteral(ASSERT_PATCH), true, 'line patterns alone would accept the payload');
+});
+
+test('regression (regex after if): the edit is ineligible', () => {
+  const r = analyzeTestUpdate(REGEX_OLD, REGEX_BYPASS, 'test/apply-action.test.js');
+  assert.equal(r.eligible, false);
+  assert.match(String(r.why), new RegExp(`line ${FIXTURE_LINE + 1}: `));
+});
+
+test('regression (regex after if): the lexer resolves `)` by its opener, so it now reads the regex and the template correctly', () => {
+  const l = lexLines(REGEX_OLD);
+  assert.equal(l.ok, true);
+  assert.equal(l.codeAtStart[FIXTURE_LINE], false, 'the fixture line is inside the template');
+  assert.equal(l.codeAtEnd[FIXTURE_LINE], false);
+  assert.equal(l.codeAtStart[REGEX_OLD.split('\n').indexOf("test('real check', () => {")], true);
+});
+
+test('regression (regex after if): V8 independently reads the fixture line as template text, not code', () => {
+  for (const text of [REGEX_OLD, REGEX_BYPASS]) {
+    const v = v8CodeAtBoundaries(text, false, [FIXTURE_LINE, FIXTURE_LINE + 1, FIXTURE_LINE + 3]);
+    assert.deepEqual(v, { ok: true, code: [false, false, true] });
+  }
+});
+
+test('V8 cross-check contract: boundaries inside templates and block comments are not code; unparsable files are not ok', () => {
+  const src = 'const t = `\nassert.equal(a, 1);\n`;\n';
+  assert.deepEqual(v8CodeAtBoundaries(src, false, [0, 1, 2, 3]), { ok: true, code: [true, false, false, true] });
+  // Inside a block comment too, and in TypeScript after type stripping.
+  assert.deepEqual(v8CodeAtBoundaries('/*\nx\n*/\nconst n: number = 1;\n', true, [1, 3]), { ok: true, code: [false, true] });
+  // Anything V8 cannot parse (or TypeScript that is not erasable) is not ok.
+  assert.equal(v8CodeAtBoundaries('const = ;\n', false, [0]).ok, false);
+  assert.equal(v8CodeAtBoundaries('enum E { A }\n', true, [0]).ok, false);
+});
+
+test('lexer: a "/" whose meaning depends on context it does not track makes the file not ok', () => {
+  for (const src of [
+    'const o = {} / 2;\n', 'function f() {}\n/re/.test(s);\n', 'const a = b! / 2;\n', 'const a = i++ / 2;\n', 'const a = f<T> / 2;\n',
+    'async function g() { await (x) / 2; }\n', 'const of = 4; const h = of / 2;\n', 'const a = x?./re/;\n',
+    'const a = 1; <!-- comment\n', 'x = 1;\n--> comment\n',
+  ]) assert.equal(lexLines(src).ok, false, src);
+});
+
+test('lexer: unambiguous slashes still lex (division after values and non-control parens, regex after operators and keywords)', () => {
+  for (const src of [
+    'if (x) /re/.test(s);\n', 'while (x) /a`b/.exec(s);\n', 'const a = f(x) / 2 / 1;\n', 'const a = b[0] / 2;\n', 'const a = o.return / 2;\n',
+    'const f = (s) => /re/.test(s);\n', 'function g() { return /re/; }\n', 'export default /x/;\n', 'assert.match(msg, /a\\/b/);\n',
+    'const a = x != /re/.source;\n', 'const half = total / 2;\n', '#!/usr/bin/env node\nconst a = 1;\n',
+  ]) assert.equal(lexLines(src).ok, true, src);
+  // The regex after `while (...)` holds a backtick; the line after it is still top-level code.
+  assert.deepEqual(lexLines('while (x) /a`b/.exec(s);\nconst y = 1;\n').codeAtStart, [true, true, true]);
+});
+
+test('file types: JSX and non-JS files are ineligible; TypeScript is checked after type stripping', () => {
+  const update = (t: string) => t.replace('assert.equal(s.lastFullRaiseIncrement, 2);', 'assert.equal(s.lastFullRaiseIncrement, 18);');
+  assert.equal(analyzeTestUpdate(OLD, update(OLD), 'test/a.test.tsx').eligible, false);
+  assert.equal(analyzeTestUpdate(OLD, update(OLD), 'test/a.test.jsx').eligible, false);
+  assert.equal(analyzeTestUpdate(OLD, update(OLD), 'test/a.test.md').eligible, false);
+  const TS = OLD.replace('test(', 'const seats: number = 2;\ntest(');
+  const r = analyzeTestUpdate(TS, update(TS), 'packages/engine/test/a.test.ts');
+  assert.equal(r.eligible, true, r.why ?? '');
+  const notErasable = TS.replace('const seats', 'enum E { A }\nconst seats');
+  assert.equal(analyzeTestUpdate(notErasable, update(notErasable), 'packages/engine/test/a.test.ts').eligible, false);
+});
+
+test('weakening check: computed, chained, compound and reflective assertion replacement is flagged', async () => {
+  const { testWeakening } = await import('../src/policy.ts');
+  const flagged = (line: string) => testWeakening('test/a.test.js', [line], false).some((r) => r.includes('replaces assertion functions'));
+  for (const line of [
+    'assert["equal"] = () => {};', "assert['strict']['equal'] = f;", 'assert.strict.equal = f;', 'assert . equal = f;', 'assert.equal ||= f;',
+    'assert.equal ??= f;', `x = ${ASSERT_PATCH};`, "Reflect.set(assert, 'equal', f);", 'Object.defineProperties(assert, { equal: { value: f } });',
+    "Reflect.defineProperty(assert, 'equal', { value: f });", 'const a = assert;', 'const { equal } = assert;', 'patch(assert);', 't.assert.equal = f;',
+  ]) assert.equal(flagged(line), true, line);
+  for (const line of [
+    'assert.equal(a, 1);', 'assert.equal(x == y, true);', 'assert.ok(a >= b);', "import assert from 'node:assert/strict';",
+    'assert.deepEqual(r, { a: 1 });', "assert.equal(s, '=>');", 'assert.strictEqual(f(x), 2);', 'assert.notEqual(a, b);',
+  ]) assert.equal(flagged(line), false, line);
+});
+
+test('regression e2e: the regex-after-if bypass blocks for a human, even with authorization', async () => {
+  const reviewer = new Reviewer();
+  const e = makeEnv({
+    secondReviewer: reviewer, project: { autoMerge: true, protectTests: true }, config: { secondReview: { enabled: true } },
+    behaviors: { coding: async (spec) => {
+      writeFileSync(join(spec.cwd, TEST_PATH), REGEX_BYPASS);
+      writeFileSync(join(spec.cwd, 'CHANGES.md'), 'x\n');
+      return { structured: { status: 'completed', summary: 'done', filesChanged: [TEST_PATH], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
+    } },
+  });
+  seedMain(e.repo, { [TEST_PATH]: REGEX_OLD });
+  const t = await ticket(e);
+  authorize(e, t.id);
+  await cycles(e, 2);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(reviewer.integrityInputs.length, 0);
+  assert.equal(event(e, 'policy.test_update_deferred'), false);
+  const pr = job(e, t.identifier).pr_number;
+  assert.ok(pr == null || !(await merged(e, t)), 'nothing merged');
+});
