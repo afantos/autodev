@@ -107,3 +107,37 @@ test('the hold label is configurable and can be disabled', async () => {
   await cycles(e, 6);
   assert.equal(await merged(e, t.identifier), true, 'with the label name empty, hold-merge has no effect');
 });
+
+// ---------------------------------------------------------------- review of 13d7472
+
+for (const failure of ['missing', 'error'] as const) {
+  test(`regression (P1): if the ticket can't be read after approval (${failure}), the merge stops (fails closed)`, async () => {
+    const reviewer = new Reviewer();
+    const e = env(reviewer);
+    const t = await ticket(e);
+    let approved = false;
+    const approve = e.scm.approve.bind(e.scm);
+    e.scm.approve = async (repo, n, sha, body) => { await approve(repo, n, sha, body); approved = true; };
+    const getTicket = e.tracker.getTicket.bind(e.tracker);
+    e.tracker.getTicket = async (id) => {
+      if (approved && id === t.id) { if (failure === 'missing') return null; throw new Error('Linear 503'); }
+      return getTicket(id);
+    };
+    await cycles(e, 6);
+    assert.ok(approved, 'it got as far as approval');
+    assert.equal(await merged(e, t.identifier), false, 'but did not merge on unverifiable ticket state');
+    assert.match(holds(e).at(-1)!, failure === 'missing' ? /could not be found/ : /could not be verified \(Linear 503\)/);
+  });
+}
+
+test('regression (P2): a hold added while the PR is marked ready stops the approval (rechecked after markReady)', async () => {
+  const reviewer = new Reviewer();
+  const e = env(reviewer);
+  const t = await ticket(e);
+  const markReady = e.scm.markReady.bind(e.scm);
+  e.scm.markReady = async (repo, pr) => { await markReady(repo, pr); await e.tracker.addLabel(t.id, 'hold-merge'); };
+  await cycles(e, 6);
+  assert.equal(approval(e, job(e, t.identifier).pr_number), null, 'not approved');
+  assert.equal(await merged(e, t.identifier), false);
+  assert.match(holds(e).at(-1)!, /hold-merge/);
+});

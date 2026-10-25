@@ -49,11 +49,22 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
   // Only a ticket a human hasn't moved elsewhere (Canceled, Backlog, Done, back to Ready...) may merge.
   if (ticket.status !== 'review') return 'skipped';
-  // Owner hold, checked first (before any refresh or review spend) and again right before approval and merge.
+  // Owner hold, checked first (before any refresh or review spend), again after marking the PR ready and before
+  // approving, and once more before merging. Fails closed: a ticket that can't be read stops the merge.
   const holdLabel = cfg.linear.holdMergeLabel;
-  const ownerHold = async (): Promise<boolean> => !!holdLabel && !!(await tracker.getTicket(ticket.id))?.labels.includes(holdLabel);
   const holdReason = `The ticket carries the \`${holdLabel}\` label, so auto-merge is on hold. Remove the label to let it continue.`;
-  if (await ownerHold()) return hold(holdReason);
+  const mayProceed = async (): Promise<'ok' | 'held' | 'skipped'> => {
+    let current: Ticket | null = null;
+    try { current = await tracker.getTicket(ticket.id); } catch (e) {
+      await hold(`The ticket's state could not be verified (${(e as Error).message.slice(0, 200)}), so auto-merge stopped; it retries on the next pass.`);
+      return 'held';
+    }
+    if (!current) { await hold('The ticket could not be found, so its hold state could not be verified; auto-merge stopped.'); return 'held'; }
+    if (holdLabel && current.labels.includes(holdLabel)) { await hold(holdReason); return 'held'; }
+    if (current.status !== 'review') return 'skipped';
+    return 'ok';
+  };
+  { const g = await mayProceed(); if (g !== 'ok') return g; }
   const pr = await scm.getPr(job.repo, job.pr_number);
   if (pr.state !== 'open') return 'skipped';
   if (pr.baseBranch !== job.base_branch) return hold(`The PR now targets \`${pr.baseBranch}\`, but autodev validated it against \`${job.base_branch}\`. It won't merge a retargeted PR.`);
@@ -167,9 +178,11 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   const notes = decision.notes.length ? `\n\nNon-blocking notes from the second review:\n${fmt(decision.notes)}` : '';
   const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: ${policyNote}\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}`;
   await scm.markReady(job.repo, pr);
+  // A hold added while marking the PR ready stops the approval.
+  { const g = await mayProceed(); if (g !== 'ok') return g; }
   await scm.approve(job.repo, pr.number, sha, body);
   // Last check: a hold added while approving still stops the merge (the approval alone merges nothing).
-  if (await ownerHold()) return hold(holdReason);
+  { const g = await mayProceed(); if (g !== 'ok') return g; }
   await scm.mergePr(job.repo, pr.number, sha, `${job.ticket_identifier}: ${ticket.title} (#${pr.number})`);
   logEvent(db, 'automerge.merged', `${job.ticket_identifier}: PR #${pr.number} merged at ${sha.slice(0, 12)}`, { jobId: job.id, ticketId: job.ticket_id });
   await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy ${policyNote === 'clean' ? 'clean' : `(${policyNote})`}, up to date with ${job.base_branch}.${notes}`).catch(() => {});
