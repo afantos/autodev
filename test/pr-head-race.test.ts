@@ -99,3 +99,70 @@ test('the window is bounded: the PR stage gives up after prHeadConvergeSeconds r
   assert.equal(job(e, t.identifier).status, 'blocked');
   assert.ok(Date.now() - t0 < 20_000, 'bounded by the 1 s window plus normal pipeline time');
 });
+
+// ---------------------------------------------------------------- cancellation (review of adf1e85)
+
+import { getEventListeners } from 'node:events';
+import { abortableSleep, awaitPrHead } from '../src/pipeline.ts';
+import type { Job } from '../src/types.ts';
+
+const CANDIDATE = 'c'.repeat(40);
+const fakeJob = { id: 'j1', ticket_id: 't1', ticket_identifier: 'X-1', repo: 'o/r', candidate_sha: CANDIDATE, base_sha: 'b'.repeat(40), worktree: '/w' } as unknown as Job;
+const stalePr = (headSha = 'a'.repeat(40)): PullRequest => ({ number: 8, url: 'u', headBranch: 'h', baseBranch: 'main', headSha, state: 'open', draft: false });
+
+function unitCtx(windowSeconds: number, getPr: () => Promise<PullRequest>) {
+  const e = makeEnv({ config: { loop: { prHeadConvergeSeconds: windowSeconds } } });
+  e.ctx.scm.getPr = getPr;
+  return e.ctx;
+}
+
+test('cancellation during an API read stops the wait at once: no further reads (reproduced: 8 reads with a 2 s window)', async () => {
+  const ac = new AbortController();
+  let reads = 0;
+  const ctx = unitCtx(2, async () => { reads++; if (reads === 1) ac.abort(new Error('lease lost')); return stalePr(); });
+  const t0 = Date.now();
+  await assert.rejects(awaitPrHead(ctx, fakeJob, stalePr(), ac.signal), /lease lost/);
+  assert.equal(reads, 1, 'the read that observed cancellation is the last one');
+  assert.ok(Date.now() - t0 < 1_000, 'returns well before the 2 s window');
+  assert.equal(getEventListeners(ac.signal, 'abort').length, 0);
+});
+
+test('a read that completes after cancellation is never acted on, even if it shows the candidate', async () => {
+  const ac = new AbortController();
+  const ctx = unitCtx(2, async () => { ac.abort(new Error('canceled')); return stalePr(CANDIDATE); });
+  await assert.rejects(awaitPrHead(ctx, fakeJob, stalePr(), ac.signal), /canceled/);
+  assert.equal(ctx.db.prepare("SELECT 1 FROM events WHERE type = 'pr.head_converged'").get(), undefined);
+});
+
+test('cancellation during the wait between reads rejects promptly without another read', async () => {
+  const ac = new AbortController();
+  let reads = 0;
+  const ctx = unitCtx(5, async () => { reads++; return stalePr(); }); // interval 500 ms
+  setTimeout(() => ac.abort(new Error('stop')), 50);
+  const t0 = Date.now();
+  await assert.rejects(awaitPrHead(ctx, fakeJob, stalePr(), ac.signal), /stop/);
+  assert.equal(reads, 0);
+  assert.ok(Date.now() - t0 < 400);
+});
+
+test('an already-cancelled signal makes no reads at all', async () => {
+  const ac = new AbortController();
+  ac.abort(new Error('already'));
+  let reads = 0;
+  const ctx = unitCtx(2, async () => { reads++; return stalePr(); });
+  await assert.rejects(awaitPrHead(ctx, fakeJob, stalePr(), ac.signal), /already/);
+  assert.equal(reads, 0);
+});
+
+test('sleep listeners are cleaned up: none remain after convergence or on an already-aborted sleep', async () => {
+  const ac = new AbortController();
+  let reads = 0;
+  const ctx = unitCtx(2, async () => (++reads >= 3 ? stalePr(CANDIDATE) : stalePr()));
+  const pr = await awaitPrHead(ctx, fakeJob, stalePr(), ac.signal);
+  assert.equal(pr.headSha, CANDIDATE);
+  assert.equal(getEventListeners(ac.signal, 'abort').length, 0, 'every sleep removed its listener');
+  const done = new AbortController();
+  done.abort(new Error('x'));
+  await assert.rejects(abortableSleep(1_000, done.signal), /x/);
+  assert.equal(getEventListeners(done.signal, 'abort').length, 0, 'no listener registered on an aborted signal');
+});

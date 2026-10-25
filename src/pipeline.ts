@@ -258,7 +258,7 @@ function candidate(job: Job): string {
  * PR for a bounded window and return as soon as it reports exactly the candidate. Nothing else is accepted: if the head
  * still differs when the window ends, the caller's assertPrCandidate blocks the job as tampering, as before.
  */
-async function awaitPrHead(ctx: Ctx, job: Job, pr: PullRequest, signal: AbortSignal): Promise<PullRequest> {
+export async function awaitPrHead(ctx: Ctx, job: Job, pr: PullRequest, signal: AbortSignal): Promise<PullRequest> {
   const want = candidate(job);
   if (pr.headSha === want) return pr;
   const windowMs = ctx.cfg.loop.prHeadConvergeSeconds * 1000;
@@ -266,11 +266,10 @@ async function awaitPrHead(ctx: Ctx, job: Job, pr: PullRequest, signal: AbortSig
   const started = Date.now();
   const firstSeen = pr.headSha;
   while (Date.now() - started < windowMs) {
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(resolve, intervalMs);
-      signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason); }, { once: true });
-    });
+    signal.throwIfAborted(); // a cancellation that fired during the previous read stops here, not after the window
+    await abortableSleep(intervalMs, signal);
     pr = await ctx.scm.getPr(job.repo, pr.number);
+    signal.throwIfAborted(); // never act on a read that finished after cancellation
     if (pr.headSha === want) {
       logEvent(ctx.db, 'pr.head_converged', `#${pr.number}: API reported ${firstSeen.slice(0, 12)} after the push; converged to the candidate ${want.slice(0, 12)} after ${Date.now() - started} ms`, { jobId: job.id, ticketId: job.ticket_id });
       return pr;
@@ -278,6 +277,16 @@ async function awaitPrHead(ctx: Ctx, job: Job, pr: PullRequest, signal: AbortSig
   }
   logEvent(ctx.db, 'pr.head_mismatch', `#${pr.number}: head still ${pr.headSha.slice(0, 12)} (candidate ${want.slice(0, 12)}) after ${windowMs} ms`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
   return pr;
+}
+
+/** Sleep that rejects on abort, checks an already-aborted signal first, and always removes its listener. */
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function assertPrCandidate(job: Job, pr: PullRequest) {
