@@ -153,3 +153,35 @@ test('one job failing in reconciliation does not stop the others', async () => {
   assert.match(events(e, 'reconcile.job_error')[0]!, /DEMO-1: Linear 502/);
   assert.equal(events(e, 'reconcile.job_error').length, 1, 'the same error is logged once');
 });
+
+test('regression: a policy-approved resume whose base refresh conflicts goes back through coding, not to a false tampering hold', async () => {
+  // The flagged change (a keyword in a comment, triage off) and a later change on main touch the same line.
+  let calls = 0;
+  const e = makeEnv({ secondReviewer: new Reviewer(), project: { autoMerge: true }, config: { secondReview: { enabled: true, triage: { enabled: false } } }, behaviors: {
+    coding: async (spec) => {
+      calls++;
+      // First run: the ticket's change. Later runs: resolve the merge by writing the combined file (no markers).
+      writeFileSync(join(spec.cwd, 'src', 'main.js'), calls === 1 ? '// production build note\nexport const v = "ticket";\n' : '// production build note\nexport const v = "ticket+main";\n');
+      return done(['src/main.js']);
+    },
+  } });
+  pushToMain(e.repo, { 'CHANGES.md': 'changes\n', 'src/main.js': 'export const v = "base";\n' });
+  const t = await ticket(e, 'Flagged change');
+  await cycles(e, 3);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.match(events(e, 'job.blocked')[0]!, /diff touches production system/);
+  pushToMain(e.repo, { 'src/main.js': 'export const v = "main";\n' });
+  e.tracker.humanComment(t.id, '/answer approve - comment only');
+  await e.tracker.setStatus(t.id, 'ready');
+  await cycles(e, 4);
+  assert.match(events(e, 'job.base_refreshed')[0]!, /conflicts in src\/main\.js/);
+  assert.equal(calls, 2, 'the coding agent ran again to resolve the conflict');
+  assert.ok(e.runner.calls.filter((c) => c.role === 'coding').at(-1)!.prompt.includes('conflicts in'), 'it was given the conflict feedback');
+  const all = (e.ctx.db.prepare("SELECT type || ' ' || message AS m FROM events").all() as { m: string }[]).map((r) => r.m).join('\n');
+  assert.doesNotMatch(all, /tamper|changed after capture|private HEAD differs/i, 'no false tampering');
+  assert.equal(events(e, 'job.failed').length, 0);
+  // The resolved change is a different diff, so the policy asks for a fresh human approval of it (not carried over).
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(events(e, 'job.blocked').length, 2);
+  assert.match(events(e, 'job.blocked')[1]!, /diff touches production system/);
+});

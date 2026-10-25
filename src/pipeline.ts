@@ -645,18 +645,19 @@ function baseRefreshNote(ctx: Ctx, job: Job): string | null {
  * locally (hardened git; never pushed before validation), then bring the base up to date if it moved (refreshBase keeps
  * its tamper checks). Any failure is returned, never thrown, so the caller can hold the ticket.
  */
-export async function prepareResume(ctx: Ctx, job: Job): Promise<{ ok: true; patch: Partial<Job>; note: string } | { ok: false; error: string }> {
-  if (!job.worktree || !job.base_branch) return { ok: true, patch: {}, note: '' };
+export async function prepareResume(ctx: Ctx, job: Job): Promise<{ ok: true; patch: Partial<Job>; note: string; conflict: boolean } | { ok: false; error: string }> {
+  if (!job.worktree || !job.base_branch) return { ok: true, patch: {}, note: '', conflict: false };
   try {
     const preserved = await ctx.ws.commitAll(job.worktree, `WIP ${job.ticket_identifier} (autodev: preserved before resuming)`);
     const r = await ctx.ws.refreshBase(job.worktree, job.base_branch);
     const st = ctx.ws.trustedState(job.worktree);
     const changed = preserved || r.status !== 'current' || st.head_sha !== job.candidate_sha;
     const patch: Partial<Job> = changed ? { base_sha: st.base_sha, candidate_sha: st.head_sha, validated_sha: null, reviewed_sha: null, candidate_worktree: null } : {};
-    if (r.status === 'current') return { ok: true, patch, note: '' };
+    if (r.status === 'current') return { ok: true, patch, note: '', conflict: false };
     markBaseRefreshed(ctx, job, r.baseSha);
     logEvent(ctx.db, 'job.base_refreshed', `${job.ticket_identifier}: merged the latest ${job.base_branch} before resuming${r.status === 'conflict' ? ` (conflicts in ${r.files.join(', ')})` : ''}`, { jobId: job.id, ticketId: job.ticket_id });
-    return { ok: true, patch, note: r.status === 'conflict' ? conflictFeedback(job.base_branch, r.files) : '' };
+    if (r.status === 'conflict') return { ok: true, patch, note: conflictFeedback(job.base_branch, r.files), conflict: true };
+    return { ok: true, patch, note: '', conflict: false };
   } catch (e) {
     return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 500) };
   }
@@ -755,7 +756,9 @@ export async function resumeBlocked(ctx: Ctx, job: Job, explicitAnswer?: string)
     ...prep.patch,
     status: 'queued', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, decision_count: Math.max(0, job.decision_count - 1),
     pending_feedback: `A human answered the blocking question.\nQuestion: ${b.question}\nAnswer: ${answer}\nContinue the implementation accordingly.${prep.note ? `\n\n${prep.note}` : ''}`,
-    ...(approved ? { stage: 'implement' as const } : {}),
+    // A conflicting base merge leaves markers for the coding agent to resolve, so it always goes back through coding
+    // (stage 'workspace'), even after a policy approval that would otherwise go straight to validation.
+    ...(prep.conflict ? { stage: 'workspace' as const } : approved ? { stage: 'implement' as const } : {}),
   });
   await ctx.tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});
   logEvent(ctx.db, 'job.unblocked', `${job.ticket_identifier}: human answer recorded`, { jobId: job.id, ticketId: job.ticket_id });
