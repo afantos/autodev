@@ -49,8 +49,8 @@ concurrency:
   global: 1                              # first supervised runs: one agent at a time
 
 budget:                                  # USD, SDK estimates; the Claude Console monthly limit is the hard stop
-  dailyUsd: 5
-  monthlyUsd: 50
+  dailyUsd: 50
+  monthlyUsd: 500
   perTicketUsd: 3
   perRunUsd: 1.5
   perDecisionUsd: 0.5
