@@ -21,6 +21,14 @@ const ProjectSchema = z.object({
   setup: z.array(z.string()).default([]),
   /** Dedicated offline npm cache, populated by the operator; never use a credential directory. */
   npmCacheDir: z.string().optional(),
+  /**
+   * Prime npmCacheDir automatically when a candidate's lockfile adds packages (see src/npm-cache-prime.ts): only registry
+   * tarballs with integrity, only packages reachable from approvedDependencies or the base lockfile, bounded and
+   * script-free. Off by default: the operator primes the cache by hand.
+   */
+  npmCachePrime: z.boolean().default(false),
+  npmCachePrimeMaxNewPackages: z.number().int().positive().default(400),
+  npmCachePrimeTimeoutMinutes: z.number().positive().default(10),
   /** Extra env for agents and validation. `{{jobId}}` and `{{port}}` are templated. Never put production secrets here. */
   env: z.record(z.string(), z.string()).default({}),
   /** Required GitHub check names; empty = all reported checks must pass. */

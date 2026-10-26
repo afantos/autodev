@@ -18,6 +18,7 @@ import type { SecondReviewer } from './agents/second-review.ts';
 import { ClaudeRunner } from './agents/runner.ts';
 import { reserveBudget, clearApiErrorStreak, clearUsageLimitStreak, pauseForApiError, pauseForUsageLimit } from './budget.ts';
 import { runSandboxed } from './command-sandbox.ts';
+import { primeNpmCache } from './npm-cache-prime.ts';
 import { sessionUsageDelta } from './agent-usage.ts';
 
 export interface Ctx {
@@ -30,11 +31,13 @@ export interface Ctx {
   /** Lease owner identity for this process. */
   owner: string;
   runCommand: typeof runSandboxed;
+  /** Online npm cache priming (host, outside the sandbox); replaceable in tests. */
+  primeNpmCache: typeof primeNpmCache;
   /** Independent second reviewer (another vendor), when secondReview is enabled. */
   secondReviewer?: SecondReviewer;
 }
 
-export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 'scm' | 'runner' | 'db' | 'runCommand' | 'secondReviewer'>> = {}): Ctx {
+export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 'scm' | 'runner' | 'db' | 'runCommand' | 'secondReviewer' | 'primeNpmCache'>> = {}): Ctx {
   const db = overrides.db ?? openDb(join(cfg.dataDir, 'autodev.db'));
   const tracker = overrides.tracker ?? (cfg.tracker === 'linear' ? new LinearTracker(cfg, secret('LINEAR_API_KEY')!) : new LocalTracker(db));
   const autoMerge = cfg.secondReview.enabled && cfg.projects.some((p) => p.autoMerge);
@@ -46,7 +49,7 @@ export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 
   const secondReviewer = overrides.secondReviewer ?? (cfg.secondReview.enabled
     ? new OpenAiReviewer(secret('OPENAI_API_KEY')!, cfg.secondReview.model, { pricing: cfg.secondReview.pricing, maxOutputTokens: cfg.secondReview.maxOutputTokens, timeoutMs: cfg.secondReview.timeoutSeconds * 1000 })
     : undefined);
-  return { cfg, db, tracker, scm, runner, secondReviewer, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
+  return { cfg, db, tracker, scm, runner, secondReviewer, ws: new Workspaces(cfg.dataDir, cfg.workspaceDir, scm, db), runCommand: overrides.runCommand ?? runSandboxed, primeNpmCache: overrides.primeNpmCache ?? primeNpmCache, owner: `${hostname()}:${process.pid}:${Date.now().toString(36)}` };
 }
 
 /** Trees agents may never read: the orchestrator's home (credentials), config (.env) and state. */

@@ -51,6 +51,7 @@ projects:
       teamKey: LWC
     setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
     npmCacheDir: /opt/autodev/instance/cache/luckywinclub/npm   # operator-seeded from luckywinclub's package-lock.json (2026-10-26, main 312d81a)
+    npmCachePrime: true                              # 2026-10-26 (owner): prime the cache automatically for approved/transitive registry packages (src/npm-cache-prime.ts)
     validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # offline, unit-level only (ADR 0001); Compose/Playwright run in GitHub CI
     requiredChecks: ["checks", "integration"]        # both required by branch protection (integration = Postgres via Compose, since PR #12)
     env:

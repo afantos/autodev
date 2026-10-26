@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { runAgent, RunGateClosed } from './context.ts';
@@ -20,6 +21,7 @@ import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
 import { conflictFeedback } from './automerge.ts';
+import { looksLikeOfflineMiss, planPrime, readBaseLockfile } from './npm-cache-prime.ts';
 export { scanSecrets } from './secrets.ts';
 
 const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
@@ -167,8 +169,15 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       job.candidate_worktree = view;
       const validationJob = { ...job, worktree: view };
       for (const cmd of project.setup) {
-        const r = await projectCommand(ctx, validationJob, project, cmd, 20 * 60_000, signal);
-        if (r.code !== 0) return feedbackLoop(ctx, job, 'validation setup', tail(r.stderr || r.stdout, 2000));
+        let r = await projectCommand(ctx, validationJob, project, cmd, 20 * 60_000, signal);
+        let primeNote = '';
+        if (r.code !== 0 && project.npmCachePrime && project.npmCacheDir && looksLikeOfflineMiss(r.stderr + '\n' + r.stdout)) {
+          // The candidate's lockfile adds packages the offline cache lacks: prime the cache once per candidate, then retry.
+          const prime = await primeCacheForCandidate(ctx, job, project, view, signal);
+          if (prime.primed) r = await projectCommand(ctx, validationJob, project, cmd, 20 * 60_000, signal);
+          else if (prime.note) primeNote = `\n\nAutomatic npm cache priming did not run: ${prime.note}\nOnly registry packages that are approved for this project (or dependencies of approved/existing ones) can be primed automatically; anything else needs the operator.`;
+        }
+        if (r.code !== 0) return feedbackLoop(ctx, job, 'validation setup', tail(r.stderr || r.stdout, 2000) + primeNote);
         await ws.assertSnapshot(view, job.worktree!, candidate(job));
       }
       const failures: string[] = [];
@@ -376,6 +385,32 @@ function feedbackLoop(ctx: Ctx, job: Job, source: string, feedback: string): nev
   updateJob(ctx.db, job.id, { fix_attempts: job.fix_attempts + 1, pending_feedback: feedback, stage: 'workspace' }, ctx.owner);
   logEvent(ctx.db, `fix.${source}`, `queued fix attempt ${job.fix_attempts + 1}/${max}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
   throw new Divert('requeue', `${source} failed; retrying with feedback`);
+}
+
+/**
+ * Prime the project's offline npm cache from the candidate snapshot's lockfile, at most once per candidate. Returns true
+ * when the cache was primed (the caller retries setup); false when priming was refused or failed, with the reason logged
+ * and left in the job's feedback so the agent (or a human) sees why.
+ */
+async function primeCacheForCandidate(ctx: Ctx, job: Job, project: ProjectConfig, snapshot: string, signal: AbortSignal): Promise<{ primed: boolean; note?: string }> {
+  const { db } = ctx;
+  const key = `npm-cache-primed:${job.id}:${candidate(job)}`;
+  if (kvGet(db, key)) return { primed: false, note: 'already attempted for this candidate' };
+  kvSet(db, key, 'attempted');
+  const cacheDir = resolve(ctx.cfg.configDir, project.npmCacheDir!);
+  const lockPath = join(snapshot, 'package-lock.json');
+  const candidateLock = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : null;
+  if (!candidateLock) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: no package-lock.json in the candidate`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: 'no package-lock.json in the candidate' }; }
+  const baseLock = job.base_sha ? await readBaseLockfile(job.worktree!, job.base_sha) : null;
+  const plan = planPrime(candidateLock, baseLock, project.approvedDependencies, project.npmCachePrimeMaxNewPackages);
+  if (!plan.ok) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: ${plan.reason}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: plan.reason }; }
+  if (!plan.newPackages.length) return { primed: false, note: 'the lockfile adds no packages, so the cache is not the cause' };
+  signal.throwIfAborted();
+  const out = await ctx.primeNpmCache({ worktree: snapshot, cacheDir, timeoutMs: project.npmCachePrimeTimeoutMinutes * 60_000 });
+  if (!out.ok) { logEvent(db, 'cache.prime.failed', `${job.ticket_identifier}: ${out.reason.slice(0, 400)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: `npm failed: ${out.reason.slice(0, 300)}` }; }
+  kvSet(db, key, 'primed');
+  logEvent(db, 'cache.primed', `${job.ticket_identifier}: ${plan.newPackages.length} new package(s) of ${plan.totalPackages} (${(out.bytesAdded / 1e6).toFixed(1)} MB added, ${Math.round(out.durationMs / 1000)}s): ${plan.newPackages.slice(0, 12).join(', ')}${plan.newPackages.length > 12 ? ', …' : ''}`, { jobId: job.id, ticketId: job.ticket_id });
+  return { primed: true };
 }
 
 async function projectCommand(ctx: Ctx, job: Job, project: ProjectConfig, cmd: string, timeoutMs: number, signal: AbortSignal) {
