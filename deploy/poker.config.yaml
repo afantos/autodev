@@ -24,8 +24,10 @@ projects:
     stackedBranches: false
     # Approved 2026-10-24 (poker ADRs 0002, 0007). Lockfile changes still always go to human review.
     approvedDependencies: [ws, react, react-dom, vite, "@types/ws", "@types/react", "@types/react-dom"]
-    # Import boundaries (poker ADR 0006) and CI are human-only; .github/ and manifests are covered by the base policy.
-    humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
+    # Import boundaries (poker ADR 0006) and CI are human-only; .github/ and manifests are covered by the base policy
+    # (package.json scripts/fields and unapproved dependencies, and every lockfile change, still go to a human).
+    # 2026-10-26 (owner): package.json/package-lock.json dropped from humanReviewPaths, same as luckywinclub.
+    humanReviewPaths: ['^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
     protectTests: true                               # any change to an existing test file goes to a human; new test files are scanned
     # Clean PRs merge without a human: CI, Claude review, second review (secondReview below), policy clean, up to date.
     # Anything the policy flags still waits for a human. Needs GITHUB_REVIEWER_TOKEN and OPENAI_API_KEY in .env.
@@ -36,7 +38,9 @@ projects:
   # luckywinclub (Linear team LWC, repo afantos/luckywinclub), onboarded 2026-10-25. The repository starts
   # with documents only; the scaffold (package.json, tsconfig, ESLint, node:test) is the first ticket.
   # Scaffold merged 2026-10-26 (LWC-9, main 312d81a): setup/validate are live; the npm cache is operator-seeded from the lockfile.
-  # autoMerge stays off until the owner has seen a few supervised tickets through.
+  # 2026-10-26 (owner): autoMerge on, milestone 1 dependencies approved (ADR 0001, 85c2f78), package.json/package-lock.json
+  # dropped from humanReviewPaths. The base policy still sends manifest script/field changes, unapproved dependencies
+  # and every lockfile change to a human.
   - key: luckywinclub
     repo: afantos/luckywinclub
     linear:
@@ -49,10 +53,10 @@ projects:
       NODE_ENV: test
     maxConcurrent: 1
     stackedBranches: false
-    approvedDependencies: []                         # the scaffold's dev dependencies go through human review (package.json is protected)
-    humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/']
+    approvedDependencies: [drizzle-orm, drizzle-kit, pg, "@types/pg", pg-boss, next, react, react-dom, "@types/react", "@types/react-dom", tailwindcss, "@tailwindcss/postcss", better-auth, "@playwright/test"]
+    humanReviewPaths: ['(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/']
     protectTests: true
-    autoMerge: false                                 # supervised until the scaffold merges and validation runs in the sandbox
+    autoMerge: true                                  # clean PRs merge after CI + Claude review + second review; flagged PRs wait for a human
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr]
 
 linear:
