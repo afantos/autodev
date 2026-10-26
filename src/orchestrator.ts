@@ -1,8 +1,9 @@
 import { hostname } from 'node:os';
 import type { Ctx } from './context.ts';
 import { canStartRun } from './budget.ts';
-import { acquireInstanceLock, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, updateJob } from './db.ts';
-import { blockJob, resumeBlocked, runJob } from './pipeline.ts';
+import { acquireInstanceLock, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
+import { blockJob, markBaseRefreshed, resumeBlocked, runJob } from './pipeline.ts';
+import { conflictFeedback } from './automerge.ts';
 import { approvePlan } from './planning.ts';
 import { autoMergeStep } from './automerge.ts';
 import { resumeIfFixesMerged } from './triage.ts';
@@ -185,6 +186,10 @@ export class Orchestrator {
         if (checks.state !== 'pending') {
           db.prepare(`UPDATE jobs SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'waiting_ci'`).run(now(), job.id);
           logEvent(db, 'ci.done', `${job.ticket_identifier}: CI ${checks.state}`, { jobId: job.id, ticketId: job.ticket_id });
+        } else if (pr.mergeable === 'conflicting' && job.worktree && job.base_branch) {
+          // GitHub runs no pull_request workflow on a PR that conflicts with its base, so CI would never report. Merge the
+          // base now and send the job back through coding (as auto-merge does) instead of waiting ciTimeoutMinutes for a human.
+          if (acquireLease(db, job.id, ctx.owner, cfg.loop.leaseSeconds * 1000, ['waiting_ci'])) await this.refreshConflictingPr({ ...job, lease_owner: ctx.owner });
         } else if (now() - (job.heartbeat_at ?? job.updated_at) > cfg.limits.ciTimeoutMinutes * 60_000) {
           if (acquireLease(db, job.id, ctx.owner, cfg.loop.leaseSeconds * 1000, ['waiting_ci'])) {
             await blockJob(ctx, { ...job, lease_owner: ctx.owner }, { reason: `CI did not finish within ${cfg.limits.ciTimeoutMinutes} minutes`, question: 'CI appears stuck. Check the workflow runs, then move this ticket back to Ready.', options: [], recommendation: null, decisionId: null });
@@ -193,6 +198,44 @@ export class Orchestrator {
       } catch (e) {
         logEvent(db, 'ci.poll.error', String(e).slice(0, 500), { jobId: job.id, level: 'warn' });
       }
+    }
+  }
+
+  /** A waiting_ci job whose PR conflicts with its base (lease held): merge the base and revalidate, or resolve through coding. */
+  private async refreshConflictingPr(job: Job) {
+    const { ctx } = this;
+    const { cfg, db, ws, tracker } = ctx;
+    const base = job.base_branch!;
+    const requeue = async (patch: Partial<Job>, event: string, note: string) => {
+      updateJob(db, job.id, { status: 'queued', lease_owner: null, lease_expires_at: null, validated_sha: null, reviewed_sha: null, candidate_worktree: null, ...patch });
+      await tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});
+      await tracker.comment(job.ticket_id, note).catch(() => {});
+      logEvent(db, event, `${job.ticket_identifier}: ${note.split('\n')[0]}`, { jobId: job.id, ticketId: job.ticket_id });
+    };
+    if (job.fix_attempts >= cfg.limits.maxFixAttempts) {
+      return blockJob(ctx, job, {
+        reason: `PR #${job.pr_number} conflicts with ${base}, so CI cannot run, and the fix-attempt limit (${cfg.limits.maxFixAttempts}) is used up`,
+        question: `Resolve the conflict with ${base} on the PR branch (or raise the limit), then move the ticket back to Ready.`,
+        options: [], recommendation: null, decisionId: null,
+      });
+    }
+    try {
+      const r = await ws.refreshBase(job.worktree!, base);
+      if (r.status === 'current') {
+        // GitHub reports a conflict but the base has not moved past what the branch contains: nothing to merge; keep waiting.
+        releaseLease(db, job.id, ctx.owner, 'waiting_ci', {});
+        return;
+      }
+      markBaseRefreshed(ctx, job, r.baseSha);
+      if (r.status === 'merged') {
+        return requeue({ stage: 'implement', candidate_sha: r.headSha, base_sha: r.baseSha },
+          'ci.refresh', `🔄 PR #${job.pr_number} conflicted with ${base}, so GitHub ran no CI. autodev merged the latest ${base} into the branch cleanly and is revalidating (checks, CI, review).`);
+      }
+      return requeue({ stage: 'workspace', base_sha: r.baseSha, fix_attempts: job.fix_attempts + 1, pending_feedback: conflictFeedback(base, r.files) },
+        'ci.conflict', `🔀 PR #${job.pr_number} conflicts with ${base} in ${r.files.map((f) => `\`${f}\``).join(', ')}, so GitHub runs no CI. The coding agent will resolve it, then everything is revalidated.`);
+    } catch (e) {
+      releaseLease(db, job.id, ctx.owner, 'waiting_ci', {});
+      logEvent(db, 'ci.refresh.error', `${job.ticket_identifier}: ${String((e as Error)?.message ?? e).slice(0, 400)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
     }
   }
 

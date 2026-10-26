@@ -56,8 +56,10 @@ export class GitHubScm implements Scm {
     return (await this.gh.repos.get(split(repo))).data.default_branch;
   }
 
-  private toPr(p: { number: number; html_url: string; head: { ref: string; sha: string }; base: { ref: string }; state: string; merged_at?: string | null; draft?: boolean }): PullRequest {
-    return { number: p.number, url: p.html_url, headBranch: p.head.ref, baseBranch: p.base.ref, headSha: p.head.sha, state: p.merged_at ? 'merged' : (p.state as 'open' | 'closed'), draft: !!p.draft };
+  private toPr(p: { number: number; html_url: string; head: { ref: string; sha: string }; base: { ref: string }; state: string; merged_at?: string | null; draft?: boolean; mergeable?: boolean | null; mergeable_state?: string }): PullRequest {
+    // pulls.get reports mergeability (null while GitHub computes it); pulls.list does not.
+    const mergeable = p.mergeable === false || p.mergeable_state === 'dirty' ? 'conflicting' : p.mergeable === true ? 'mergeable' : 'unknown';
+    return { number: p.number, url: p.html_url, headBranch: p.head.ref, baseBranch: p.base.ref, headSha: p.head.sha, state: p.merged_at ? 'merged' : (p.state as 'open' | 'closed'), draft: !!p.draft, mergeable };
   }
 
   async findPr(repo: string, head: string) {

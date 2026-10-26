@@ -57,6 +57,8 @@ export interface PullRequest {
   headSha: string;
   state: 'open' | 'closed' | 'merged';
   draft: boolean;
+  /** Whether the PR can merge into its base; 'conflicting' means GitHub runs no pull_request CI on it. Unknown when not reported. */
+  mergeable?: 'mergeable' | 'conflicting' | 'unknown';
 }
 
 export type CheckState = 'none' | 'pending' | 'success' | 'failure';
