@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { closeSync, constants, cpSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import semver from 'semver';
 import { run } from './exec.ts';
 import type { ExecResult } from './exec.ts';
 
@@ -11,27 +12,33 @@ import type { ExecResult } from './exec.ts';
  * The validation sandbox installs with `npm ci --offline`, so a ticket that adds dependencies fails setup until the
  * cache holds the new tarballs. The agent that writes package.json / package-lock.json is untrusted, so nothing it
  * wrote is executed or handed to an online resolver. Instead:
- *  1. every lockfile entry must be an https://registry.npmjs.org/ tarball with an integrity hash (git+, file:, link:,
- *     http:, other registries, query strings, aliases and workspace entries outside the repo are refused);
- *  2. every entry that is new or changed against the base lockfile (name, version, resolved URL or integrity) is
- *     checked against the registry packument for that exact name@version: the packument's name, version,
- *     dist.tarball and dist.integrity must match the entry. That binds the entry to the package it claims to be
- *     and gives trusted dependency edges, taken from the registry rather than from the candidate lockfile;
- *  3. every package new to the candidate must be reachable through those trusted edges from a package already in
- *     the base lockfile or in the project's approvedDependencies; otherwise nothing is primed;
- *  4. only the verified tarballs are fetched, one `npm cache add <exact URL>` each, with --ignore-scripts, null
- *     user/global configs, an explicit registry, a scratch HOME and an environment of PATH/HOME/TMPDIR only, under a
- *     per-call timeout; after each add the cache must hold content for the lockfile's sha512, and the artifact count
- *     and bytes added are bounded outside npm. No manifest ever reaches npm.
+ *  1. the lockfile is read only after the candidate snapshot is re-verified, through a no-follow, regular-file,
+ *     size-capped read, and every entry must be an https://registry.npmjs.org/ tarball for its own name and version
+ *     with an integrity hash (git+, file:, link:, http:, other registries, query strings, aliases and workspace
+ *     entries outside the repo are refused);
+ *  2. every entry that is new or changed against the base lockfile is checked against the registry packument for
+ *     that exact name@version: name, version, dist.tarball and dist.integrity must match. That binds the entry to the
+ *     package it claims to be and gives trusted dependency specs, taken from the registry rather than from the
+ *     candidate lockfile;
+ *  3. reachability is artifact-level: a parent authorizes a child only when the child's name is the spec's target
+ *     (npm: aliases and non-registry specs authorize nothing) and the child's version satisfies the spec's range.
+ *     Roots are approved names and artifacts unchanged from the base lockfile. Anything unreachable → refused;
+ *  4. only the verified tarballs are fetched, one `npm cache add <exact URL>` each into a scratch cache, with
+ *     --ignore-scripts, two distinct empty config files, an explicit registry, a scratch HOME and an environment of
+ *     PATH/HOME/TMPDIR only, under a per-call timeout. The scratch cache must then hold content for the lockfile's
+ *     sha512 and stay within the byte budget; only then is it promoted into the shared cache. No manifest ever
+ *     reaches npm.
  */
 
 export const REGISTRY = 'https://registry.npmjs.org/';
+export const MAX_PACKUMENT_BYTES = 2_000_000;
+export const MAX_LOCKFILE_BYTES = 50_000_000;
 
 export interface LockfilePackage { name?: string; version?: string; resolved?: string; integrity?: string; link?: boolean; dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
 export interface Lockfile { lockfileVersion?: number; packages?: Record<string, LockfilePackage> }
 
-/** A registry entry of the candidate lockfile that passed the shape checks. */
-export interface Artifact { key: string; name: string; version: string; resolved: string; integrity: string; edges: string[] }
+/** A registry entry of the candidate lockfile that passed the shape checks; `specs` are its declared dependency specs. */
+export interface Artifact { key: string; name: string; version: string; resolved: string; integrity: string; specs: Record<string, string>; unpackedSize?: number }
 export interface Packument { name?: string; version?: string; dist?: { tarball?: string; integrity?: string; unpackedSize?: number }; dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
 export type FetchPackument = (name: string, version: string) => Promise<Packument | null>;
 
@@ -47,6 +54,7 @@ export function packageName(key: string): string | null {
 }
 
 const SRI = /^sha(256|384|512)-[A-Za-z0-9+/]+={0,2}$/;
+const NAME = /^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
 
 /** The exact registry tarball URL for name@version. */
 export function tarballUrl(name: string, version: string): string {
@@ -54,8 +62,20 @@ export function tarballUrl(name: string, version: string): string {
   return `${REGISTRY}${name}/-/${base}-${version}.tgz`;
 }
 
-function edgesOf(p: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }): string[] {
-  return [...new Set([...Object.keys(p.dependencies ?? {}), ...Object.keys(p.optionalDependencies ?? {}), ...Object.keys(p.peerDependencies ?? {})])];
+function specsOf(p: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }): Record<string, string> {
+  return { ...(p.peerDependencies ?? {}), ...(p.optionalDependencies ?? {}), ...(p.dependencies ?? {}) };
+}
+
+/**
+ * Does the dependency spec `spec` (as a parent declares it for `depName`) authorize the artifact `child`?
+ * Only plain registry ranges count: npm: aliases, git/github/http/file/link/workspace specs and tags authorize nothing.
+ */
+export function specAuthorizes(depName: string, spec: string, child: { name: string; version: string }): boolean {
+  if (child.name !== depName) return false;
+  const s = spec.trim();
+  if (!s || /^(npm:|git|github:|gitlab:|bitbucket:|gist:|https?:|file:|link:|workspace:|\.|\/)/i.test(s)) return false;
+  if (!semver.validRange(s, { includePrerelease: true })) return false;
+  return semver.satisfies(child.version, s, { includePrerelease: true });
 }
 
 /** Parse and shape-check a lockfile. Returns the registry entries or the first refusal. */
@@ -79,17 +99,19 @@ export function parseLockfile(text: string): { ok: true; entries: Artifact[]; na
       if (workspaceNames.has(name) && (!pkg.resolved || !/^(https?:|git|file:)/i.test(pkg.resolved))) continue;
       return { ok: false, reason: `"${name}" is a link, not a registry package` };
     }
+    if (!NAME.test(name)) return { ok: false, reason: `"${name}" is not a valid package name` };
     if (pkg.name && pkg.name !== name) return { ok: false, reason: `"${name}" is an alias for "${pkg.name}"; aliases are not primed` };
-    if (!pkg.version || !/^[0-9A-Za-z.+-]+$/.test(pkg.version)) return { ok: false, reason: `"${name}" has no usable version` };
+    if (!pkg.version || !semver.valid(pkg.version)) return { ok: false, reason: `"${name}" has no usable version` };
     const resolved = String(pkg.resolved ?? '');
     if (resolved !== tarballUrl(name, pkg.version)) return { ok: false, reason: `"${name}@${pkg.version}" does not resolve to its registry tarball: ${resolved.slice(0, 120) || '(none)'}` };
     if (!pkg.integrity || !SRI.test(pkg.integrity)) return { ok: false, reason: `"${name}" has no usable integrity hash` };
-    entries.push({ key, name, version: pkg.version, resolved, integrity: pkg.integrity, edges: edgesOf(pkg) });
+    entries.push({ key, name, version: pkg.version, resolved, integrity: pkg.integrity, specs: specsOf(pkg) });
   }
   return { ok: true, entries, names: new Set(entries.map((e) => e.name)) };
 }
 
-const ident = (a: { name: string; version: string; resolved: string; integrity: string }) => `${a.name}@${a.version}|${a.resolved}|${a.integrity}`;
+const ident = (a: Artifact) => `${a.name}@${a.version}|${a.resolved}|${a.integrity}`;
+const sameSpecs = (a: Record<string, string>, b: Record<string, string>) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
 
 /**
  * Decide what may be primed. Pure apart from the registry lookups, which go through `fetchPackument` (seam for tests).
@@ -102,23 +124,26 @@ export async function planPrime(candidate: string, base: string | null, approved
   const baseByIdent = new Map<string, Artifact>();
   const baseNames = new Set<string>();
   if (baseParsed?.ok) for (const e of baseParsed.entries) { baseByIdent.set(ident(e), e); baseNames.add(e.name); }
-  // Unchanged entries (same name, version, URL, integrity AND the same declared edges as the base) are trusted as the base.
+  // Trusted specs per artifact: from the base lockfile for unchanged entries, from the registry for new/changed ones.
+  const trusted = new Map<Artifact, Record<string, string>>();
+  const unchanged: Artifact[] = [];
   const changed: Artifact[] = [];
-  const trustedEdges = new Map<string, Set<string>>();
-  const addEdges = (name: string, edges: string[]) => { const s = trustedEdges.get(name) ?? new Set<string>(); for (const d of edges) s.add(d); trustedEdges.set(name, s); };
   const seen = new Set<string>();
   for (const e of cand.entries) {
     const b = baseByIdent.get(ident(e));
-    const sameEdges = !!b && b.edges.length === e.edges.length && b.edges.every((d) => e.edges.includes(d));
-    if (b && sameEdges) { addEdges(e.name, b.edges); continue; }
-    if (seen.has(`${e.name}@${e.version}`)) { continue; }
-    seen.add(`${e.name}@${e.version}`);
+    if (b && sameSpecs(b.specs, e.specs)) { trusted.set(e, b.specs); unchanged.push(e); continue; }
+    const id = `${e.name}@${e.version}`;
+    if (seen.has(id)) { const first = changed.find((c) => `${c.name}@${c.version}` === id)!; trusted.set(e, trusted.get(first) ?? {}); continue; }
+    seen.add(id);
     changed.push(e);
   }
   const newNames = [...cand.names].filter((n) => !baseNames.has(n));
+  // Artifacts to fetch: new name@version tarballs. A base artifact whose only change is its declared specs is
+  // re-verified against the registry (below) but its tarball is already in the cache.
+  const toFetch = changed.filter((e) => !baseByIdent.has(ident(e)));
   if (!changed.length) return { ok: true, artifacts: [], newNames: [], totalEntries: cand.entries.length };
-  if (changed.length > limits.maxArtifacts) return { ok: false, reason: `${changed.length} new or changed artifacts exceed the limit of ${limits.maxArtifacts}` };
-  // Registry verification of every new/changed entry: identity, tarball, integrity and trusted edges.
+  if (toFetch.length > limits.maxArtifacts) return { ok: false, reason: `${toFetch.length} new or changed artifacts exceed the limit of ${limits.maxArtifacts}` };
+  // Registry verification of every new/changed entry: identity, tarball, integrity, size hint and trusted specs.
   for (const e of changed) {
     let p: Packument | null;
     try { p = await fetchPackument(e.name, e.version); } catch (err) { return { ok: false, reason: `registry lookup failed for ${e.name}@${e.version}: ${String((err as Error)?.message ?? err).slice(0, 200)}` }; }
@@ -126,31 +151,36 @@ export async function planPrime(candidate: string, base: string | null, approved
     if (p.name !== e.name || p.version !== e.version) return { ok: false, reason: `registry packument for ${e.name}@${e.version} describes ${p.name}@${p.version}` };
     if (!p.dist?.tarball || !p.dist.tarball.startsWith(REGISTRY) || p.dist.tarball !== e.resolved) return { ok: false, reason: `${e.name}@${e.version}: lockfile tarball ${e.resolved} differs from the registry's ${p.dist?.tarball ?? '(none)'}` };
     if (!p.dist?.integrity || p.dist.integrity !== e.integrity) return { ok: false, reason: `${e.name}@${e.version}: lockfile integrity differs from the registry's` };
-    addEdges(e.name, edgesOf(p));
+    if (typeof p.dist.unpackedSize === 'number') { e.unpackedSize = p.dist.unpackedSize; if (p.dist.unpackedSize > limits.maxBytes) return { ok: false, reason: `${e.name}@${e.version} unpacks to ${p.dist.unpackedSize} bytes, above the budget of ${limits.maxBytes}` }; }
+    const specs = specsOf(p);
+    trusted.set(e, specs);
+    for (const dup of cand.entries) if (dup !== e && dup.name === e.name && dup.version === e.version) trusted.set(dup, specs);
   }
-  // Reachability over trusted edges only, from approved names and base names that are still present.
-  const reachable = new Set<string>([...cand.names].filter((n) => baseNames.has(n) || approved.includes(n)));
+  // Artifact-level reachability over trusted specs: roots are approved names and artifacts the base already had
+  // (same name, version, URL and integrity; their specs are now registry-verified when they differed).
+  const all = cand.entries;
+  const reachable = new Set<Artifact>([...unchanged, ...all.filter((a) => approved.includes(a.name) || baseByIdent.has(ident(a)))]);
   const queue = [...reachable];
   while (queue.length) {
-    const n = queue.shift()!;
-    for (const dep of trustedEdges.get(n) ?? []) if (cand.names.has(dep) && !reachable.has(dep)) { reachable.add(dep); queue.push(dep); }
+    const parent = queue.shift()!;
+    for (const [depName, spec] of Object.entries(trusted.get(parent) ?? {})) {
+      for (const child of all) if (!reachable.has(child) && specAuthorizes(depName, spec, child)) { reachable.add(child); queue.push(child); }
+    }
   }
-  const unreachable = newNames.filter((n) => !reachable.has(n));
-  if (unreachable.length) return { ok: false, reason: `new packages are neither approved nor dependencies of approved/existing ones: ${unreachable.slice(0, 10).join(', ')}${unreachable.length > 10 ? ', …' : ''}` };
-  return { ok: true, artifacts: changed, newNames, totalEntries: cand.entries.length };
+  const unreachable = toFetch.filter((a) => !reachable.has(a));
+  if (unreachable.length) return { ok: false, reason: `new packages are neither approved nor dependencies of approved/existing ones: ${unreachable.slice(0, 10).map((a) => `${a.name}@${a.version}`).join(', ')}${unreachable.length > 10 ? ', …' : ''}` };
+  return { ok: true, artifacts: toFetch, newNames, totalEntries: cand.entries.length };
 }
 
 /** Packument URL for one exact version; scoped names are encoded (`@s/n` → `@s%2Fn`). */
 export function packumentUrl(name: string, version: string): string {
-  if (!/^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i.test(name)) throw new Error(`invalid package name: ${name}`);
+  if (!NAME.test(name)) throw new Error(`invalid package name: ${name}`);
   return `${REGISTRY}${name.replace('/', '%2F')}/${encodeURIComponent(version)}`;
 }
 
-export const MAX_PACKUMENT_BYTES = 2_000_000;
-
 /**
  * The registry packument for one exact version via global fetch: registry.npmjs.org only, no redirects followed,
- * a timeout and a response size cap. Anything else throws, which the planner reports as a refusal.
+ * a timeout and a streamed response size cap. Anything else throws, which the planner reports as a refusal.
  */
 export async function fetchRegistryPackument(name: string, version: string, timeoutMs = 20_000): Promise<Packument | null> {
   const url = packumentUrl(name, version);
@@ -160,14 +190,50 @@ export async function fetchRegistryPackument(name: string, version: string, time
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   const length = Number(res.headers.get('content-length') ?? 0);
   if (length > MAX_PACKUMENT_BYTES) throw new Error(`packument for ${name}@${version} is too large (${length} bytes)`);
-  const text = await res.text();
-  if (text.length > MAX_PACKUMENT_BYTES) throw new Error(`packument for ${name}@${version} is too large`);
-  return JSON.parse(text) as Packument;
+  return JSON.parse(await readCapped(res.body, MAX_PACKUMENT_BYTES, `packument for ${name}@${version}`)) as Packument;
+}
+
+/** Read a response body with a byte counter, cancelling the stream as soon as the cap is exceeded. */
+export async function readCapped(body: ReadableStream<Uint8Array> | null, cap: number, what: string): Promise<string> {
+  if (!body) return '';
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) { await reader.cancel().catch(() => {}); throw new Error(`${what} is too large (over ${cap} bytes)`); }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 /** The npm offline-miss signatures that mean "the cache lacks this lockfile's packages" (and nothing else is wrong). */
 export function looksLikeOfflineMiss(output: string): boolean {
   return /ENOTCACHED|only-if-cached|no cached response/i.test(output);
+}
+
+/**
+ * Read a lockfile from a candidate snapshot that untrusted commands ran in: no symlink following, regular files
+ * only, size-capped. Returns null when the file is absent; throws on anything suspicious.
+ */
+export function readLockfileSafely(path: string, cap = MAX_LOCKFILE_BYTES): string | null {
+  let fd: number;
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return null;
+    throw new Error(`refusing to read ${path}: ${code ?? String(e)}`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`refusing to read ${path}: not a regular file`);
+    if (st.size > cap) throw new Error(`refusing to read ${path}: ${st.size} bytes exceeds the ${cap}-byte cap`);
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < st.size) { const n = readSync(fd, buf, off, st.size - off, off); if (n <= 0) break; off += n; }
+    return buf.subarray(0, off).toString('utf8');
+  } finally { closeSync(fd); }
 }
 
 export interface PrimeRequest {
@@ -182,28 +248,42 @@ export type PrimeOutcome =
   | { ok: true; artifacts: number; bytesAdded: number; durationMs: number; command: string[] }
   | { ok: false; reason: string; artifacts: number; bytesAdded: number };
 
-/** Fetch the verified tarballs into the cache, one at a time, bounded by bytes and a per-call timeout. */
+/** npm flags that keep every host and repository configuration out of the run. The two config files must differ. */
+export function npmIsolationArgs(scratch: string, cacheDir: string): string[] {
+  const user = join(scratch, 'npmrc-user'); const global = join(scratch, 'npmrc-global');
+  for (const f of [user, global]) if (!existsSync(f)) writeFileSync(f, '');
+  return ['--ignore-scripts', '--no-audit', '--no-fund', '--cache', cacheDir, '--userconfig', user, '--globalconfig', global, '--registry', REGISTRY, '--loglevel', 'error'];
+}
+
+/**
+ * Fetch the verified tarballs: each into its own scratch cache, checked for integrity content and the byte budget,
+ * then promoted into the shared cache. A failure or timeout leaves the shared cache without that artifact.
+ */
 export async function primeNpmCache(req: PrimeRequest): Promise<PrimeOutcome> {
   const exec = req.exec ?? run;
   const scratch = mkdtempSync(join(tmpdir(), 'autodev-npm-prime-'));
   const home = join(scratch, 'home'); mkdirSync(home);
   const started = Date.now();
-  const before = cacheBytes(req.cacheDir);
   let done = 0;
+  let bytes = 0;
   let command: string[] = [];
   try {
     for (const a of req.artifacts) {
-      const args = ['cache', 'add', a.resolved, '--ignore-scripts', '--no-audit', '--no-fund', '--cache', req.cacheDir,
-        '--userconfig', '/dev/null', '--globalconfig', '/dev/null', '--registry', REGISTRY, '--loglevel', 'error'];
+      const stage = join(scratch, `stage-${done}`); mkdirSync(stage);
+      const args = ['cache', 'add', a.resolved, ...npmIsolationArgs(scratch, stage)];
       command = ['npm', ...args];
-      const r: ExecResult = await exec('npm', args, { cwd: scratch, timeoutMs: req.timeoutMs, env: { PATH: process.env.PATH ?? '', HOME: home, TMPDIR: scratch, npm_config_cache: req.cacheDir } });
-      if (r.code !== 0) return { ok: false, reason: `npm cache add ${a.name}@${a.version} exited ${r.code}${r.timedOut ? ' (timed out)' : ''}: ${(r.stderr || r.stdout).slice(-800)}`, artifacts: done, bytesAdded: Math.max(0, cacheBytes(req.cacheDir) - before) };
-      if (!existsSync(contentPath(req.cacheDir, a.integrity))) return { ok: false, reason: `${a.name}@${a.version}: the cache holds no content for the lockfile's integrity after the fetch (registry served different bytes?)`, artifacts: done, bytesAdded: Math.max(0, cacheBytes(req.cacheDir) - before) };
-      done++;
-      const added = Math.max(0, cacheBytes(req.cacheDir) - before);
-      if (added > req.maxBytes) return { ok: false, reason: `priming exceeded the byte budget (${added} > ${req.maxBytes}) after ${done} artifact(s)`, artifacts: done, bytesAdded: added };
+      const r: ExecResult = await exec('npm', args, { cwd: scratch, timeoutMs: req.timeoutMs, env: { PATH: process.env.PATH ?? '', HOME: home, TMPDIR: scratch, npm_config_cache: stage } });
+      if (r.code !== 0) return { ok: false, reason: `npm cache add ${a.name}@${a.version} exited ${r.code}${r.timedOut ? ' (timed out)' : ''}: ${(r.stderr || r.stdout).slice(-800)}`, artifacts: done, bytesAdded: bytes };
+      if (!existsSync(contentPath(stage, a.integrity))) return { ok: false, reason: `${a.name}@${a.version}: the fetched content does not match the lockfile's integrity (registry served different bytes?)`, artifacts: done, bytesAdded: bytes };
+      const size = cacheBytes(stage);
+      if (bytes + size > req.maxBytes) return { ok: false, reason: `priming would exceed the byte budget (${bytes + size} > ${req.maxBytes}) at ${a.name}@${a.version}; nothing from it was promoted`, artifacts: done, bytesAdded: bytes };
+      // Promote: cacache paths are content/key hashed, so merging the staged tree into the shared cache is safe.
+      mkdirSync(join(req.cacheDir, '_cacache'), { recursive: true });
+      cpSync(join(stage, '_cacache'), join(req.cacheDir, '_cacache'), { recursive: true, force: true, dereference: false });
+      rmSync(stage, { recursive: true, force: true });
+      bytes += size; done++;
     }
-    return { ok: true, artifacts: done, bytesAdded: Math.max(0, cacheBytes(req.cacheDir) - before), durationMs: Date.now() - started, command };
+    return { ok: true, artifacts: done, bytesAdded: bytes, durationMs: Date.now() - started, command };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -222,7 +302,7 @@ export function sriOf(bytes: Buffer, algo: 'sha512' | 'sha256' = 'sha512'): stri
 }
 
 function readdirSafe(dir: string) { try { return readdirSync(dir, { withFileTypes: true }); } catch { return []; } }
-function cacheBytes(cacheDir: string): number {
+export function cacheBytes(cacheDir: string): number {
   const root = join(cacheDir, '_cacache');
   if (!existsSync(root)) return 0;
   let total = 0;
@@ -232,5 +312,5 @@ function cacheBytes(cacheDir: string): number {
 }
 
 export function readBaseLockfile(worktree: string, baseSha: string): Promise<string | null> {
-  return run('git', ['-C', worktree, 'show', `${baseSha}:package-lock.json`], { maxOutput: 50_000_000 }).then((r) => (r.code === 0 ? r.stdout : null));
+  return run('git', ['-C', worktree, 'show', `${baseSha}:package-lock.json`], { maxOutput: MAX_LOCKFILE_BYTES }).then((r) => (r.code === 0 ? r.stdout : null));
 }

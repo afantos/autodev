@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { join, resolve } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { runAgent, RunGateClosed } from './context.ts';
@@ -21,7 +20,7 @@ import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
 import { conflictFeedback } from './automerge.ts';
-import { looksLikeOfflineMiss, planPrime, readBaseLockfile } from './npm-cache-prime.ts';
+import { looksLikeOfflineMiss, planPrime, readBaseLockfile, readLockfileSafely } from './npm-cache-prime.ts';
 export { scanSecrets } from './secrets.ts';
 
 const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? null;
@@ -398,8 +397,14 @@ async function primeCacheForCandidate(ctx: Ctx, job: Job, project: ProjectConfig
   if (kvGet(db, key)) return { primed: false, note: 'already attempted for this candidate' };
   kvSet(db, key, 'attempted');
   const cacheDir = resolve(ctx.cfg.configDir, project.npmCacheDir!);
-  const lockPath = join(snapshot, 'package-lock.json');
-  const candidateLock = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : null;
+  // Untrusted setup commands just ran in the snapshot: re-verify it against the candidate before reading anything,
+  // then read the lockfile without following symlinks, regular files only, size-capped.
+  await ctx.ws.assertSnapshot(snapshot, job.worktree!, candidate(job));
+  let candidateLock: string | null;
+  try { candidateLock = readLockfileSafely(join(snapshot, 'package-lock.json')); } catch (e) {
+    const note = String((e as Error).message ?? e).slice(0, 300);
+    logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: ${note}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note };
+  }
   if (!candidateLock) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: no package-lock.json in the candidate`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: 'no package-lock.json in the candidate' }; }
   const baseLock = job.base_sha ? await readBaseLockfile(job.worktree!, job.base_sha) : null;
   const limits = { maxArtifacts: project.npmCachePrimeMaxArtifacts, maxBytes: Math.round(project.npmCachePrimeMaxMb * 1e6) };
