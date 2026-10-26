@@ -72,13 +72,10 @@ concurrency:
   global: 2                              # 2026-10-26 (owner): poker and luckywinclub run side by side; each project keeps maxConcurrent 1
 
 budget:                                  # USD, SDK estimates; the Claude Console monthly limit is the hard stop
-  dailyUsd: 100                          # 2026-10-26: raised from $50 (owner decision); monthly unchanged
+  dailyUsd: 200                          # 2026-10-26: owner decision
   monthlyUsd: 500
-  perTicketUsd: 3
-  perTicketOverrides:                    # owner-approved exceptions to perTicketUsd, by ticket
-    DEV-56: 4.5                          # 2026-10-25: one-time +$1.50 after a rework loop on a stale GPT verdict
-    DEV-85: 4.75                         # 2026-10-26: one-time cap to fix the retained-record memory bug; raised from $4 for its final reviews (owner decision)
-    DEV-89: 5.5                          # 2026-10-26: one-time cap to drop an unsupported former-Host exclusion; raised from $4 for that rework (owner decision)
+  perTicketUsd: 15                       # 2026-10-26: owner decision; replaces the one-time per-ticket overrides (all were below $15)
+  perTicketOverrides: {}                 # owner-approved exceptions to perTicketUsd, by ticket
   perRunUsd: 1.5
   perDecisionUsd: 0.5
   onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically
