@@ -69,7 +69,7 @@ linear:
   requireLabel: autodev                  # only tickets carrying this label are touched (safe default)
 
 concurrency:
-  global: 1                              # first supervised runs: one agent at a time
+  global: 2                              # 2026-10-26 (owner): poker and luckywinclub run side by side; each project keeps maxConcurrent 1
 
 budget:                                  # USD, SDK estimates; the Claude Console monthly limit is the hard stop
   dailyUsd: 100                          # 2026-10-26: raised from $50 (owner decision); monthly unchanged
