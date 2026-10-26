@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { excerptCiLog } from '../src/ci-log.ts';
 import { failingTestFiles, failingTestFilesOfChecks, inDiff } from '../src/ci-flake.ts';
+import { GitHubScm } from '../src/scm/github.ts';
 import { makeEnv, job } from './helpers.ts';
 import type { Env } from './helpers.ts';
 import type { CheckResult, PullRequest } from '../src/types.ts';
@@ -30,6 +31,9 @@ test('every failing check must name a failing test file; absolute runner paths m
   assert.equal(failingTestFilesOfChecks(failure(two, ['test', 'lint'])), null, 'lint failed too: not a flake');
   assert.deepEqual(failingTestFilesOfChecks(failure(two.replace('error  no-unused-vars', 'test at test/c.test.ts:1:1'), ['test', 'lint'])), ['test/a.test.ts', 'test/c.test.ts']);
   assert.equal(failingTestFilesOfChecks(failure('exit 1')), null);
+  // Two failing checks with one name (different workflows): their logs cannot be told apart, so neither explains the other.
+  const sameName = '===== test =====\n✖ failing tests:\ntest at test/a.test.ts:1:1\n===== test =====\nerror TS2304: Cannot find name';
+  assert.equal(failingTestFilesOfChecks(failure(sameName, ['test', 'test'])), null);
   assert.ok(inDiff('/home/runner/work/app/app/test/a.test.ts', ['test/a.test.ts']));
   assert.ok(!inDiff('test/a.test.ts', ['src/a.ts']));
 });
@@ -37,10 +41,10 @@ test('every failing check must name a failing test file; absolute runner paths m
 const FLAKY = `✖ failing tests:\n\ntest at test-integration/entry-concurrency.test.ts:1:1\n✖ concurrent entries (812ms)\n  Error: Test hook "after" at test-integration/entry-concurrency.test.ts:20:3 generated asynchronous activity after the test ended`;
 
 /** The PR's CI reports `results` in turn (the last one repeats); the base branch reports `base`. Re-runs are counted. */
-function scriptedCi(e: Env, results: CheckResult[], base: CheckResult = { state: 'success', failures: [], logExcerpt: '' }) {
+function scriptedCi(e: Env, results: CheckResult[], base: CheckResult = { state: 'success', failures: [], logExcerpt: '' }, opts: { realRerun?: boolean } = {}) {
   const calls = { checks: 0, reruns: [] as string[] };
   e.ctx.scm.checks = async (_repo: string, pr: PullRequest) => (pr.headBranch === 'main' ? base : results[Math.min(calls.checks++, results.length - 1)]!);
-  e.ctx.scm.rerunFailedJobs = async (_repo: string, pr: PullRequest) => { calls.reruns.push(pr.headSha); };
+  if (!opts.realRerun) e.ctx.scm.rerunFailedJobs = async (_repo: string, pr: PullRequest) => { calls.reruns.push(pr.headSha); };
   return calls;
 }
 const failed = (logExcerpt: string): CheckResult => ({ state: 'failure', failures: [{ name: 'test', summary: 'failure' }], logExcerpt });
@@ -154,4 +158,49 @@ test('when the re-run cannot be requested, the agent gets the failure with a neu
   assert.equal(j.fix_attempts, 1);
   assert.match(String(j.pending_feedback), /does not touch \(`test-integration\/entry-concurrency\.test\.ts`\)\. These tests are not in your diff but may test code you changed/);
   assert.doesNotMatch(String(j.pending_feedback), /flaky|predates/, 'without a re-run there is no evidence of flakiness');
+});
+
+test('local CI cannot re-run jobs: its cached failure is never read as a re-run result', async () => {
+  const e = makeEnv({ config: { loop: { ciPollSeconds: 0 } } });
+  scriptedCi(e, [failed(FLAKY), passed], undefined, { realRerun: true });
+  const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Local', description: '', status: 'ready', priority: 2 });
+  await e.cycle();
+  const j = job(e, t.identifier);
+  assert.match(events(e, 'ci.flake_retry_error')[0]?.message ?? '', /local CI cannot re-run jobs/);
+  assert.equal(events(e, 'ci.flake_retry').length, 0);
+  assert.equal(j.fix_attempts, 1);
+  assert.doesNotMatch(String(j.pending_feedback), /re-run on this commit|flaky|predates/);
+});
+
+/** A GitHubScm whose Actions API is faked: one failed run (attempt 1) that GitHub reports re-run after `registerAfter` polls. */
+function githubWithRun(registerAfter: number) {
+  const scm = new GitHubScm('token');
+  scm.rerunPollMs = 1;
+  const calls = { reruns: [] as number[], polls: 0 };
+  const actions = {
+    listWorkflowRunsForRepo: async () => ({ data: { workflow_runs: [
+      { id: 7, status: 'completed', conclusion: 'failure', run_attempt: 1 },
+      { id: 8, status: 'completed', conclusion: 'success', run_attempt: 1 },
+    ] } }),
+    reRunWorkflowFailedJobs: async ({ run_id }: { run_id: number }) => { calls.reruns.push(run_id); },
+    getWorkflowRun: async () => (++calls.polls > registerAfter
+      ? { data: { status: 'queued', run_attempt: 2 } }
+      : { data: { status: 'completed', conclusion: 'failure', run_attempt: 1 } }),
+  };
+  Object.assign(scm, { gh: { actions } });
+  const pr: PullRequest = { number: 1, url: '', headBranch: 'b', baseBranch: 'main', headSha: 'abcdef1234567890', state: 'open', draft: false };
+  return { scm, calls, pr };
+}
+
+test('GitHub re-run waits for GitHub to register the new attempt, re-running only failed runs', async () => {
+  const { scm, calls, pr } = githubWithRun(4);
+  await scm.rerunFailedJobs('o/r', pr);
+  assert.deepEqual(calls.reruns, [7]);
+  assert.equal(calls.polls, 5, 'returned on the first poll that showed the new attempt');
+});
+
+test('GitHub re-run that never registers throws, so the old failed attempt is not taken for the re-run result', async () => {
+  const { scm, calls, pr } = githubWithRun(Infinity);
+  await assert.rejects(scm.rerunFailedJobs('o/r', pr), /did not register the re-run of workflow run 7/);
+  assert.equal(calls.polls, 10);
 });
