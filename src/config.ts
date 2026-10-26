@@ -93,6 +93,8 @@ const ConfigSchema = z.object({
   }).prefault({}),
   loop: z.object({
     tickSeconds: z.number().default(30),
+    /** How long a Done/Canceled dependency ticket fetched during reconcile is reused before Linear is asked again. */
+    dependencyCacheSeconds: z.number().nonnegative().default(600),
     leaseSeconds: z.number().default(300),
     heartbeatSeconds: z.number().default(30),
     ciPollSeconds: z.number().default(60),

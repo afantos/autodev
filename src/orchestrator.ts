@@ -19,6 +19,8 @@ export class Orchestrator {
   workers = new Map<string, Promise<void>>();
   stopping = false;
   private lastCiPoll = new Map<string, number>();
+  /** Dependency tickets outside the listed statuses (Done/Canceled), fetched one by one: cached so each tick is not N requests. */
+  private dependencyCache = new Map<string, { ticket: Ticket | null; at: number }>();
   private wake: (() => void) | null = null;
 
   constructor(ctx: Ctx) { this.ctx = ctx; }
@@ -90,7 +92,7 @@ export class Orchestrator {
    */
   async reconcile(): Promise<Map<string, Ticket>> {
     const { ctx } = this;
-    const { db, tracker, scm } = ctx;
+    const { cfg, db, tracker, scm } = ctx;
     const statuses = ['ready', 'in_progress', 'review', 'blocked', 'failed'] as const;
     let listed = await tracker.listTickets({ statuses: [...statuses] });
     let approvedAny = false;
@@ -105,7 +107,13 @@ export class Orchestrator {
     const byId = new Map(listed.map((t) => [t.id, t]));
     const fetchMissing = async (id: string) => {
       if (byId.has(id)) return byId.get(id)!;
+      // A dependency outside the listed statuses is almost always Done or Canceled, which does not change from tick to
+      // tick: reuse it for dependencyCacheSeconds instead of one Linear request per link per tick (2,500/h budget).
+      const cached = this.dependencyCache.get(id);
+      const ttl = cfg.loop.dependencyCacheSeconds * 1000;
+      if (cached && now() - cached.at < ttl) { if (cached.ticket) byId.set(id, cached.ticket); return cached.ticket; }
       const t = await tracker.getTicket(id).catch(() => null);
+      this.dependencyCache.set(id, { ticket: t, at: now() });
       if (t) byId.set(id, t);
       return t;
     };
