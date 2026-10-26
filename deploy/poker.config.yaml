@@ -78,7 +78,7 @@ budget:                                  # USD, SDK estimates; the Claude Consol
   perTicketOverrides:                    # owner-approved exceptions to perTicketUsd, by ticket
     DEV-56: 4.5                          # 2026-10-25: one-time +$1.50 after a rework loop on a stale GPT verdict
     DEV-85: 4.75                         # 2026-10-26: one-time cap to fix the retained-record memory bug; raised from $4 for its final reviews (owner decision)
-    DEV-89: 4.0                          # 2026-10-26: one-time cap to drop an unsupported former-Host exclusion (owner decision)
+    DEV-89: 5.5                          # 2026-10-26: one-time cap to drop an unsupported former-Host exclusion; raised from $4 for that rework (owner decision)
   perRunUsd: 1.5
   perDecisionUsd: 0.5
   onExhausted: manual                    # stay paused until `autodev resume` rather than resuming automatically
