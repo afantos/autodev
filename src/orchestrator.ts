@@ -11,7 +11,6 @@ import { rank } from './scheduler.ts';
 import { LABEL_PLAN } from './tracker/types.ts';
 import type { Job, Ticket } from './types.ts';
 import { ACTIVE_JOB_STATUSES } from './types.ts';
-import { sleep } from './exec.ts';
 import { maybeSendMorningReport } from './report.ts';
 
 export class Orchestrator {
@@ -40,7 +39,12 @@ export class Orchestrator {
         logEvent(db, 'tick.error', String((e as Error)?.stack ?? e).slice(0, 2000), { level: 'error' });
       }
       if (opts.once) break;
-      await new Promise<void>((r) => { this.wake = r; setTimeout(r, cfg.loop.tickSeconds * 1000); });
+      // stop() and finishing workers wake the loop early; the timer is cleared so it cannot hold the process open.
+      await new Promise<void>((r) => {
+        const timer = setTimeout(r, cfg.loop.tickSeconds * 1000);
+        this.wake = () => { clearTimeout(timer); r(); };
+      });
+      this.wake = null;
     }
     await this.drain(opts.once ? Infinity : 60_000);
     if (!this.workers.size) releaseInstanceLock(db, owner);
@@ -51,7 +55,14 @@ export class Orchestrator {
 
   async drain(timeoutMs: number) {
     const all = Promise.allSettled([...this.workers.values()]);
-    await (timeoutMs === Infinity ? all : Promise.race([all, sleep(timeoutMs)]));
+    if (timeoutMs === Infinity) { await all; return; }
+    // Clear the timeout once the workers settle: a pending 60 s timer kept the process alive after a clean stop.
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([all, new Promise<void>((r) => { timer = setTimeout(r, timeoutMs); })]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async tick() {

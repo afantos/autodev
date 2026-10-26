@@ -77,7 +77,17 @@ async function main() {
       const stop = () => { console.log('stopping: no new work; waiting up to 60s for running stages (leases make the rest resumable)'); orch.stop(); };
       process.on('SIGTERM', stop); process.on('SIGINT', stop);
       await orch.run();
+      // Stop the dashboard, including keep-alive connections that close() alone would wait on.
       dash?.close();
+      dash?.closeAllConnections();
+      if (!orch.workers.size) {
+        // Every lease is released. Anything still holding the event loop (an idle keep-alive socket in an HTTP client,
+        // say) has no work left: exit if it has not let go within 5 s, well inside systemd's TimeoutStopSec.
+        setTimeout(() => {
+          console.log(`exiting: event loop still held by ${process.getActiveResourcesInfo().join(', ') || 'nothing'}`);
+          process.exit(0);
+        }, 5_000).unref();
+      }
       return;
     }
     case 'tick': {
