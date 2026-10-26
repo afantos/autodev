@@ -68,6 +68,19 @@ for (const [label, pkg] of Object.entries({
   });
 }
 
+test('parseLockfile skips bundled dependencies nested in a parent (LWC-23: @emnapi/core inside @tailwindcss/oxide-wasm32-wasi)', () => {
+  const p = parseLockfile(lock({
+    'node_modules/existing': reg('existing'),
+    'node_modules/@tailwindcss/oxide-wasm32-wasi': reg('@tailwindcss/oxide-wasm32-wasi', '4.1.0', { optional: true, bundleDependencies: ['@emnapi/core'] }),
+    'node_modules/@tailwindcss/oxide-wasm32-wasi/node_modules/@emnapi/core': { version: '1.11.1', inBundle: true, optional: true, dev: true },
+  }));
+  assert.ok(p.ok, JSON.stringify(p)); assert.deepEqual([...p.names].sort(), ['@tailwindcss/oxide-wasm32-wasi', 'existing']);
+  const top = parseLockfile(lock({ 'node_modules/existing': reg('existing'), 'node_modules/x': { version: '1.0.0', inBundle: true } }));
+  assert.ok(!top.ok, 'a top-level inBundle entry has no parent tarball to ride in');
+  const withUrl = parseLockfile(lock({ 'node_modules/p': reg('p'), 'node_modules/p/node_modules/x': { version: '1.0.0', inBundle: true, resolved: 'https://evil.example/x.tgz' } }));
+  assert.ok(!withUrl.ok, 'a bundled entry carrying its own URL is refused');
+});
+
 test('parseLockfile refuses a workspace entry outside the repository and lockfile v1 / invalid JSON', () => {
   assert.match((parseLockfile(lock({ '../elsewhere': { name: 'evil', version: '1.0.0' } })) as { reason: string }).reason, /outside the repository/);
   assert.ok(!parseLockfile('{').ok);

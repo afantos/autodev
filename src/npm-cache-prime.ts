@@ -36,7 +36,7 @@ export const REGISTRY = 'https://registry.npmjs.org/';
 export const MAX_PACKUMENT_BYTES = 2_000_000;
 export const MAX_LOCKFILE_BYTES = 50_000_000;
 
-export interface LockfilePackage { name?: string; version?: string; resolved?: string; integrity?: string; link?: boolean; dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
+export interface LockfilePackage { name?: string; version?: string; resolved?: string; integrity?: string; link?: boolean; inBundle?: boolean; dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
 export interface Lockfile { lockfileVersion?: number; packages?: Record<string, LockfilePackage> }
 
 /** A registry entry of the candidate lockfile that passed the shape checks; `specs` are its declared dependency specs. */
@@ -133,6 +133,12 @@ export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { o
   for (const [key, pkg] of Object.entries(lock.packages)) {
     const name = packageName(key);
     if (!name) continue;
+    // A bundled dependency ships inside its parent's tarball (whose integrity is verified); it has no URL or hash of its
+    // own and is never fetched, so it neither needs nor gets priming. It must still live under a parent's node_modules.
+    if (pkg.inBundle === true) {
+      if (!pkg.resolved && !pkg.integrity && key.split('node_modules/').length > 2) continue;
+      return { ok: false, reason: `"${name}" is marked inBundle but is not nested in a parent package or carries its own URL` };
+    }
     if (pkg.link || (!pkg.resolved && !pkg.integrity)) {
       // npm records a workspace package under node_modules/<name> as a link to its in-repo path; accept only those.
       if (workspaceNames.has(name) && (!pkg.resolved || !/^(https?:|git|file:)/i.test(pkg.resolved))) continue;
