@@ -60,3 +60,13 @@ test('the excerpt never exceeds the limit, even with a huge failure summary', ()
   const ex = excerptCiLog(raw, 1000);
   assert.ok(ex.length <= 1000); assert.match(ex, /^✖ failing tests:/); assert.match(ex, /truncated\)$/);
 });
+
+test('real log with an assertion failure: the excerpt is the summary through ##[error], without post-job runner noise', () => {
+  const raw = readFileSync(new URL('./fixtures/ci-node-test-assertion.log', import.meta.url), 'utf8');
+  const ex = excerptCiLog(raw, 5000);
+  assert.match(ex, /test at test-integration\/claims-deadline-dst\.test\.ts:26:3/);
+  assert.match(ex, /AssertionError \[ERR_ASSERTION\]: Expected values to be strictly equal/);
+  assert.match(ex, /expected: 'America\/New_York'/);
+  assert.match(ex, /##\[error\]Process completed with exit code 1\.$/);
+  assert.doesNotMatch(ex, /Post job cleanup|safe\.directory|Cleaning up orphan processes/);
+});
