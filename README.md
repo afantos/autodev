@@ -193,6 +193,12 @@ protection and matching required checks. Auto-merge additionally needs the separ
 reviewer account and `secondReview.enabled`; setup steps are in
 [GitHub setup](docs/SETUP.md#3-github-you) and
 [independent review](docs/SETUP.md#3b-auto-merge-with-an-independent-second-reviewer-optional-you).
+
+By default a policy-flagged diff waits for the owner's `/answer approve`. With
+`flaggedDiffApprover: second-review` (and `autoMerge` plus the second reviewer), the second reviewer
+judges every flagged finding for the exact diff instead; if it accepts all of them, the PR goes on
+through CI, the Claude review and the normal second review and merges. Files matching
+`alwaysHumanPaths` (for example `.github/`, deploy files and credentials) still go to the owner.
 Keep credentials in the instance's gitignored `.env`; tickets can be approved by moving them
 to Ready after the workflow mapping passes `autodev linear-check`.
 

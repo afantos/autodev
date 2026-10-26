@@ -18,7 +18,7 @@ import { STAGES } from './types.ts';
 import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
-import { clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
+import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
 import { conflictFeedback } from './automerge.ts';
 export { scanSecrets } from './secrets.ts';
 
@@ -347,6 +347,16 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
     const c = await clearKeywordFlags(ctx, job, project, result);
     if (c.kind === 'cleared') return;
     triageNote = c.kind === 'waiting' ? 'triage unavailable (second-review budget reached)' : c.note;
+  }
+  // flaggedDiffApprover 'second-review': don't stop for the owner here. The merge gate asks the second reviewer to judge
+  // every finding for the exact diff and holds for a human unless it accepts all of them. Nothing merges on this path alone.
+  if (aiApprovalEligible(ctx, project, result)) {
+    const key = `policy-deferred-ai:${job.id}:${result.hash}`;
+    if (!kvGet(ctx.db, key)) {
+      kvSet(ctx.db, key, '1');
+      logEvent(ctx.db, 'policy.deferred_to_ai_review', `${job.ticket_identifier}: flagged diff ${result.hash.slice(0, 12)} (${result.reasons.length} finding(s)) deferred to the second reviewer (owner-delegated)`, { jobId: job.id, ticketId: job.ticket_id });
+    }
+    return;
   }
   throw new Divert('blocked', 'mandatory diff policy requires human approval', {
     reason: `${result.reasons.join('; ')}${triageNote ? `\n\n**Triage:** ${triageNote}` : ''}`, policyHash: result.hash,

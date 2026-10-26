@@ -29,6 +29,10 @@ projects:
     # 2026-10-26 (owner): package.json/package-lock.json dropped from humanReviewPaths, same as luckywinclub.
     humanReviewPaths: ['^eslint-rules/', '^eslint\.config\.js$', '^test/boundaries\.test\.ts$', '^test/workspaces\.test\.ts$', '(^|/)tsconfig(\.base)?\.json$', '(^|/)vite\.config\.ts$', '^CLAUDE\.md$', '^GLOSSARY\.md$', '^docs/mvp-spec\.md$', '^docs/adr/']
     protectTests: true                               # any change to an existing test file goes to a human; new test files are scanned
+    # 2026-10-26 (owner): the second reviewer approves policy-flagged diffs instead of the owner; CI, the Claude review
+    # and the second review still apply. GitHub workflows, deploy files and credentials always go to the owner.
+    flaggedDiffApprover: second-review
+    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
     # Clean PRs merge without a human: CI, Claude review, second review (secondReview below), policy clean, up to date.
     # Anything the policy flags still waits for a human. Needs GITHUB_REVIEWER_TOKEN and OPENAI_API_KEY in .env.
     autoMerge: true
@@ -56,6 +60,10 @@ projects:
     approvedDependencies: [drizzle-orm, drizzle-kit, pg, "@types/pg", pg-boss, next, react, react-dom, "@types/react", "@types/react-dom", tailwindcss, "@tailwindcss/postcss", better-auth, "@playwright/test"]
     humanReviewPaths: ['(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/']
     protectTests: true
+    # 2026-10-26 (owner): the second reviewer approves policy-flagged diffs instead of the owner; CI, the Claude review
+    # and the second review still apply. GitHub workflows, deploy files and credentials always go to the owner.
+    flaggedDiffApprover: second-review
+    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
     autoMerge: true                                  # clean PRs merge after CI + Claude review + second review; flagged PRs wait for a human
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr]
 

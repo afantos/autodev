@@ -7,8 +7,8 @@ import { kvGet, kvSet, logEvent, releaseLease, updateJob } from './db.ts';
 import { recordTriageDecision } from './decisions.ts';
 import { tail } from './exec.ts';
 import { cachedVerdict, reservedReview } from './external-review.ts';
-import { ClearanceSchema, EvidenceSchema, TriageSchema, clearanceTask, evidenceTask, taskBytes, triageTask } from './agents/triage.ts';
-import type { CheckResult, Clearance, KeywordMatch, StructuredTask, Triage, TriageCandidateTicket } from './agents/triage.ts';
+import { ClearanceSchema, EvidenceSchema, TriageSchema, clearanceTask, evidenceTask, flaggedReviewTask, taskBytes, triageTask } from './agents/triage.ts';
+import type { CheckResult, Clearance, FlaggedReview, KeywordMatch, StructuredTask, Triage, TriageCandidateTicket } from './agents/triage.ts';
 import { onlyKeywordFindings } from './policy.ts';
 import type { PolicyInspection } from './policy.ts';
 import { holdResume, prepareResume, projectEnv } from './pipeline.ts';
@@ -102,6 +102,59 @@ export async function clearKeywordFlags(ctx: Ctx, job: Job, project: ProjectConf
   logEvent(ctx.db, 'triage.policy_cleared', `${job.ticket_identifier}: keyword flag(s) [${categories}] cleared for diff ${policy.hash.slice(0, 12)} by ${r.model}`, { jobId: job.id, ticketId: job.ticket_id });
   await ctx.tracker.comment(job.ticket_id, `🧭 **Triage (${r.model})** cleared the diff-policy keyword flag(s) [${categories}] for diff ${policy.hash.slice(0, 12)}: they are mentions, not restricted changes. CI and both reviews still apply.\n\n${v.summary}\n${matches.map((m) => `- ${m.id} \`${m.file}\`: ${m.text}`).join('\n')}`).catch(() => {});
   return { kind: 'cleared', note: v.summary };
+}
+
+// ---------------------------------------------------------------- flagged-diff approval by the second reviewer
+
+/**
+ * flaggedDiffApprover 'second-review': the owner delegated approval of policy-flagged diffs to the second reviewer.
+ * Eligible only with autoMerge and a second reviewer, and only when the changed files are known and none matches
+ * alwaysHumanPaths (fail closed). Approval is bound to the exact diff hash, like a human `/answer approve`.
+ */
+export function aiApprovalEligible(ctx: Ctx, project: ProjectConfig | undefined, policy: PolicyInspection): boolean {
+  if (!project || project.flaggedDiffApprover !== 'second-review' || !project.autoMerge || !ctx.cfg.secondReview.enabled) return false;
+  const r = ctx.secondReviewer;
+  if (!r?.ask || !r.maxAskCostUsd || !policy.reasons.length || !policy.files) return false;
+  return !policy.files.some((f) => project.alwaysHumanPaths.some((p) => new RegExp(p).test(f)));
+}
+
+const aiApprovedKey = (job: Job, hash: string) => `policy-ai-approved:${job.id}:${hash}`;
+export const isAiApproved = (ctx: Ctx, job: Job, policy: PolicyInspection) => !!kvGet(ctx.db, aiApprovedKey(job, policy.hash));
+
+/** Enforced in code: approve only if the model accepted every finding, each exactly once. */
+export function flaggedReviewAccepted(v: FlaggedReview, ids: string[]): boolean {
+  if (v.verdict !== 'approve' || v.findings.length !== ids.length) return false;
+  const want = new Set(ids);
+  const seen = new Set<string>();
+  for (const f of v.findings) {
+    if (!want.has(f.id) || seen.has(f.id) || !f.acceptable) return false;
+    seen.add(f.id);
+  }
+  return seen.size === want.size;
+}
+
+export type FlaggedApprovalOutcome = { kind: 'approved'; note: string } | { kind: 'human'; note: string } | { kind: 'waiting' };
+
+export async function approveFlaggedDiff(ctx: Ctx, job: Job, project: ProjectConfig, policy: PolicyInspection, decisions: { question: string; decision: string }[]): Promise<FlaggedApprovalOutcome> {
+  if (!aiApprovalEligible(ctx, project, policy)) return { kind: 'human', note: 'not eligible for second-review approval' };
+  if (isAiApproved(ctx, job, policy)) return { kind: 'approved', note: 'approved earlier for this exact diff' };
+  const findings = policy.reasons.map((reason, i) => ({ id: `f${i + 1}`, reason }));
+  const ticket = (await ctx.tracker.getTicket(job.ticket_id))!;
+  const diff = await ctx.ws.diff(job.worktree!, job.base_branch!);
+  const task = flaggedReviewTask({ repo: job.repo, ticket, candidateSha: job.candidate_sha!, findings, decisions, diff });
+  const r = await ask(ctx, job, `flagged-review:${job.id}:${policy.hash}`, 'policy.ai_review', task, (v) => ({ outcome: v.verdict, summary: v.summary }));
+  if (r.kind === 'waiting') return { kind: 'waiting' };
+  if (r.kind === 'failed') return { kind: 'human', note: `second-review approval unavailable: ${r.message.slice(0, 300)}` };
+  const v = r.value;
+  const detail = v.findings.map((f) => `- ${f.id} ${f.acceptable ? 'acceptable' : 'NOT acceptable'}: ${f.explanation}`).join('\n');
+  if (!flaggedReviewAccepted(v, findings.map((f) => f.id))) {
+    logEvent(ctx.db, 'policy.ai_escalated', `${job.ticket_identifier}: ${r.model} did not approve flagged diff ${policy.hash.slice(0, 12)}: ${v.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    return { kind: 'human', note: `${r.model} did not approve the flagged change(s): ${v.summary}\n${detail}` };
+  }
+  kvSet(ctx.db, aiApprovedKey(job, policy.hash), JSON.stringify({ model: r.model, summary: v.summary }));
+  logEvent(ctx.db, 'policy.ai_approved', `${job.ticket_identifier}: flagged diff ${policy.hash.slice(0, 12)} approved by ${r.model} (owner-delegated): ${policy.reasons.length} finding(s)`, { jobId: job.id, ticketId: job.ticket_id });
+  await ctx.tracker.comment(job.ticket_id, `🛡️ **Flagged-diff approval (${r.model}, delegated by the owner)** for diff ${policy.hash.slice(0, 12)}. CI, the Claude review and the second review still apply.\n\n${v.summary}\n${findings.map((f) => `- ${f.reason}`).join('\n')}`).catch(() => {});
+  return { kind: 'approved', note: v.summary };
 }
 
 // ---------------------------------------------------------------- blocking questions

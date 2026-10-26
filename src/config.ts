@@ -39,6 +39,16 @@ const ProjectSchema = z.object({
   humanReviewPaths: z.array(z.string()).default([]),
   /** Send removed/changed assertions and newly skipped tests in test files to human review. */
   protectTests: z.boolean().default(false),
+  /**
+   * Who approves a policy-flagged diff. 'human' (default): the owner, with `/answer approve` for the exact diff.
+   * 'second-review': the second reviewer judges every flagged finding against the ticket and the full diff (needs
+   * autoMerge and secondReview.enabled); if it accepts each one, the diff continues through CI, the Claude review and the
+   * normal second review and merges. A diff touching alwaysHumanPaths, or one the reviewer does not fully accept, still
+   * goes to a human.
+   */
+  flaggedDiffApprover: z.enum(['human', 'second-review']).default('human'),
+  /** Repo-relative path regexes that always need the owner, even with flaggedDiffApprover 'second-review'. */
+  alwaysHumanPaths: z.array(z.string()).default([]),
   /** Docs the agents should read first (paths relative to repo root). */
   docs: z.array(z.string()).default(['CLAUDE.md', 'AGENTS.md', 'README.md', 'docs/adr', 'CONTRIBUTING.md']),
   adrDir: z.string().default('docs/adr'),

@@ -4,7 +4,7 @@ import { kvGet, kvSet, logEvent, updateJob } from './db.ts';
 import { cachedVerdict, reservedReview } from './external-review.ts';
 import { markBaseRefreshed } from './pipeline.ts';
 import { TEST_FILE, inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
-import { clearKeywordFlags, triageEnabled } from './triage.ts';
+import { aiApprovalEligible, approveFlaggedDiff, clearKeywordFlags, triageEnabled } from './triage.ts';
 import type { PolicyInspection } from './policy.ts';
 import { decisionsForTicket } from './decisions.ts';
 import { findSupersedingRequirement } from './test-updates.ts';
@@ -114,12 +114,26 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
       if (gate !== 'approved') return gate;
       policyNote = 'narrow existing-test update approved by the test-integrity review';
-    } else if (!humanApproved && onlyKeywordFindings(policy) && triageEnabled(ctx, project)) {
-      const c = await clearKeywordFlags(ctx, job, project, policy);
-      if (c.kind === 'waiting') return 'waiting';
-      if (c.kind !== 'cleared') return hold(`${flagged}\n\nTriage: ${c.note}`);
-      policyNote = 'keyword flag(s) cleared by triage as mentions only';
-    } else return hold(flagged);
+    } else {
+      let triageNote = '';
+      if (!humanApproved && onlyKeywordFindings(policy) && triageEnabled(ctx, project)) {
+        const c = await clearKeywordFlags(ctx, job, project, policy);
+        if (c.kind === 'waiting') return 'waiting';
+        if (c.kind === 'cleared') policyNote = 'keyword flag(s) cleared by triage as mentions only';
+        else triageNote = `\n\nTriage: ${c.note}`;
+      }
+      if (policyNote === 'clean') {
+        // flaggedDiffApprover 'second-review': the owner delegated approval of flagged diffs (outside alwaysHumanPaths).
+        if (!aiApprovalEligible(ctx, project, policy)) return hold(`${flagged}${triageNote}`);
+        if (humanApproved) policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
+        else {
+          const a = await approveFlaggedDiff(ctx, job, project, policy, humanDecisions(ctx, ticket));
+          if (a.kind === 'waiting') return 'waiting';
+          if (a.kind !== 'approved') return hold(`${flagged}${triageNote}\n\nSecond-review approval: ${a.note}`);
+          policyNote = `flagged changes approved by the second reviewer for this exact diff (${policy.hash.slice(0, 12)}), delegated by the owner`;
+        }
+      }
+    }
   }
 
   // 5. Independent second review, once per candidate sha AND requirements: a clarified ticket (description or a recorded

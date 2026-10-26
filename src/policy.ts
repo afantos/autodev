@@ -205,6 +205,8 @@ export interface PolicyInspection {
   keywordMatches: { category: string; file: string; text: string }[];
   /** Fingerprint of the change itself, independent of where the base is; null when it can't be trusted (see diffFingerprint). */
   fingerprint: string | null;
+  /** Every file the diff adds, changes or removes (NUL-delimited listing, used literally). Absent = unknown. */
+  files?: string[];
 }
 
 const KEYWORD_REASON = 'diff touches ';
@@ -319,5 +321,5 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
   for (const keyword of cfg.policy.humanKeywords) if (new RegExp(keyword, 'i').test(diff)) reasons.push(`diff matches configured keyword /${keyword}/`);
   // Include the complete tree, since binary changes can have identical textual diffs.
   const hash = createHash('sha256').update(ref).update(await ws.git(worktree, ['rev-parse', `${head}^{tree}`])).update(diff).digest('hex');
-  return { hash, reasons: [...new Set(reasons)], testUpdates, keywordMatches, fingerprint: diffFingerprint(diff) };
+  return { hash, reasons: [...new Set(reasons)], testUpdates, keywordMatches, fingerprint: diffFingerprint(diff), files };
 }

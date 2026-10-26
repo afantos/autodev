@@ -73,6 +73,65 @@ ${untrusted('diff', input.diff)}`,
   };
 }
 
+// ---------------------------------------------------------------- 1b. flagged-diff approval (flaggedDiffApprover: second-review)
+
+export const FlaggedReviewSchema = z.object({
+  verdict: z.enum(['approve', 'escalate']),
+  findings: z.array(z.object({ id: z.string(), acceptable: z.boolean(), explanation: z.string() })),
+  summary: z.string(),
+});
+export type FlaggedReview = z.infer<typeof FlaggedReviewSchema>;
+
+const FLAGGED_REVIEW_JSON_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['verdict', 'findings', 'summary'],
+  properties: {
+    verdict: { type: 'string', enum: ['approve', 'escalate'] },
+    findings: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['id', 'acceptable', 'explanation'], properties: { id: { type: 'string' }, acceptable: { type: 'boolean' }, explanation: { type: 'string' } } },
+    },
+    summary: { type: 'string' },
+  },
+} as const;
+
+export const FLAGGED_REVIEW_SYSTEM = `You stand in for the human owner of an autonomous development system. Its diff policy flagged the
+changes listed below as needing approval (edited existing tests, test code that reaches the process object, dependency
+manifests, protected paths, sensitive topics, removed files...). The owner has delegated that approval to you.
+
+For EVERY listed finding decide "acceptable":
+- true only if the flagged change is what the ticket asks for, is safe, and does not weaken checks: a test edit must
+  follow a requirement change in the ticket (not hide a regression); test code that reaches the process object or runs
+  dynamic code must do so only to test the behavior under test, in an isolated way; a dependency or manifest change must
+  be needed by the ticket and limited to it; a protected-path change must match the ticket's scope.
+- false if it weakens or skips tests or assertions to make them pass, broadens permissions, leaks secrets or personal
+  data, deletes data or features the ticket doesn't remove, adds unneeded dependencies or scripts, or goes beyond the
+  ticket. When unsure, false.
+Set verdict to "approve" only if every finding is acceptable; otherwise "escalate". Return each finding id exactly once.
+
+${DATA_RULE}`;
+
+export function flaggedReviewTask(input: { repo: string; ticket: Ticket; candidateSha: string; findings: { id: string; reason: string }[]; decisions: { question: string; decision: string }[]; diff: string }): StructuredTask<FlaggedReview> {
+  const list = input.findings.map((f) => `- ${f.id}: ${f.reason}`).join('\n');
+  const decisions = input.decisions.map((d) => `- Q: ${d.question}\n  A: ${d.decision}`).join('\n');
+  return {
+    name: 'flagged_diff_review', system: FLAGGED_REVIEW_SYSTEM, jsonSchema: FLAGGED_REVIEW_JSON_SCHEMA, parser: FlaggedReviewSchema,
+    prompt: `Repository: ${input.repo}
+Candidate commit: ${input.candidateSha}
+
+Ticket ${input.ticket.identifier}: ${input.ticket.title}
+${untrusted('ticket', input.ticket.description || '(no description)')}
+
+Recorded owner decisions on this ticket:
+${decisions ? untrusted('decisions', decisions) : '(none)'}
+
+Policy findings to judge:
+${untrusted('findings', list)}
+
+Full diff (base...candidate):
+${untrusted('diff', input.diff)}`,
+  };
+}
+
 // ---------------------------------------------------------------- 2. blocker triage
 
 export const TriageSchema = z.object({
