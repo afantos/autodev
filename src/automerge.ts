@@ -97,7 +97,8 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (checks.state === 'pending') return 'waiting';
   if (checks.state !== 'success' && !(checks.state === 'none' && !project.requiredChecks.length)) return hold(`CI is not green on ${sha.slice(0, 12)} (${checks.state}).`);
 
-  // 4. Mandatory policy: flagged changes go to a human, even if a human approved them earlier. The single exception
+  // 4. Mandatory policy: flagged changes go to a human, even if a human approved them earlier, unless
+  // secondReview.mergeOwnerApprovedDiffs is on and the owner approved this exact diff hash. The other exception
   // (option B): findings that are ONLY eligible narrow existing-test updates, not human-approved, may pass a recorded
   // superseding requirement plus a dedicated test-integrity review of this exact candidate.
   // Triage exception: findings that come only from the keyword heuristic, cleared for this exact diff hash.
@@ -106,7 +107,10 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (policy.reasons.length) {
     const humanApproved = !!kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
     const flagged = `The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`;
-    if (!humanApproved && onlyNarrowTestUpdates(policy)) {
+    if (humanApproved && cfg.secondReview.mergeOwnerApprovedDiffs) {
+      // The owner approved this exact diff (by hash); the second review and the CI/head gates still apply.
+      policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
+    } else if (!humanApproved && onlyNarrowTestUpdates(policy)) {
       const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
       if (gate !== 'approved') return gate;
       policyNote = 'narrow existing-test update approved by the test-integrity review';

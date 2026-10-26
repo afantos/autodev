@@ -133,6 +133,11 @@ const ConfigSchema = z.object({
     dailyUsd: z.number().positive().default(50),
     monthlyUsd: z.number().positive().default(300),
     /**
+     * When true, a policy-flagged diff that the owner approved as this exact diff (`/answer approve <hash>`) continues
+     * through the second review and merges like a clean PR instead of waiting for a human merge. Default: hold for a human.
+     */
+    mergeOwnerApprovedDiffs: z.boolean().default(false),
+    /**
      * Standard-tier pricing (USD per 1M tokens) and the long-context rule, from the model's official pricing page
      * (gpt-6.1-sol, checked 2026-10-24): >272K input tokens bills the whole request at 2x input/cache and 1.5x output.
      * Cache writes are 1.25x (30m) / 2.5x (12h) input; requests disable caching, so they only bound the reservation.

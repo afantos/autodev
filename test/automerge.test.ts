@@ -156,6 +156,31 @@ test('policy-flagged changes are never auto-merged, even after a human approved 
   assert.match(await comments(e, t.id), /diff policy flags changes that need a human[\s\S]*protected path/);
 });
 
+test('mergeOwnerApprovedDiffs: a flagged diff the owner approved by hash goes through the second review and is merged', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer, { project: { humanReviewPaths: ['^CHANGES\\.md$'] }, config: { secondReview: { enabled: true, mergeOwnerApprovedDiffs: true } } });
+  const t = await ready(e);
+  await e.cycle();
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  await answerBlocked(e.ctx, getJob(e.ctx.db, job(e, t.identifier).id)!, 'approve');
+  await cycles(e, 4);
+  const j = job(e, t.identifier);
+  assert.equal(j.status, 'done', String(j.blocked_reason ?? j.error));
+  assert.equal(reviewer.inputs.length, 1, 'the second reviewer saw the approved diff');
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
+  assert.doesNotMatch(await comments(e, t.id), /Auto-merge is on hold/);
+});
+
+test('mergeOwnerApprovedDiffs: a flagged diff WITHOUT an owner approval still holds for a human', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  const e = env(reviewer, { project: { humanReviewPaths: ['^CHANGES\\.md$'] }, config: { secondReview: { enabled: true, mergeOwnerApprovedDiffs: true } } });
+  const t = await ready(e);
+  await e.cycle();
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.equal(reviewer.inputs.length, 0);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number ?? 0).catch(() => ({ state: 'none' }))).state, 'none');
+});
+
 test('a commit pushed to the PR branch outside autodev holds the PR', async () => {
   const reviewer = new FakeReviewer([APPROVE]);
   const e = env(reviewer);
