@@ -69,9 +69,34 @@ export function tarballUrl(name: string, version: string): string {
   return `${REGISTRY}${name}/-/${base}-${version}.tgz`;
 }
 
-function specsOf(p: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }): Record<string, string> {
-  // npm's precedence: an optionalDependencies entry overrides the same name in dependencies, so it is merged last.
-  return { ...(p.peerDependencies ?? {}), ...(p.dependencies ?? {}), ...(p.optionalDependencies ?? {}) };
+/** Running totals for one validation pass; refusal as soon as any is exceeded. */
+export interface SpecBudget { edges: number; bytes: number; maxEdges: number; maxBytes: number }
+export const MAX_SPEC_BYTES = 5_000_000;
+export const newSpecBudget = (): SpecBudget => ({ edges: 0, bytes: 0, maxEdges: MAX_EDGES, maxBytes: MAX_SPEC_BYTES });
+
+/**
+ * The dependency specs of one manifest-like object (lockfile entry or registry packument), validated and counted
+ * before anything is copied: each map must be a plain non-array object with string values. npm's precedence applies:
+ * peer, then dependencies, then optionalDependencies (an optional range overrides the same name). Throws on a
+ * malformed map or an exceeded budget.
+ */
+export function readSpecs(p: Record<string, unknown>, budget: SpecBudget, where: string): Record<string, string> {
+  const out: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const field of ['peerDependencies', 'dependencies', 'optionalDependencies'] as const) {
+    const m = p[field];
+    if (m === undefined || m === null) continue;
+    if (typeof m !== 'object' || Array.isArray(m) || Object.getPrototypeOf(m) !== Object.prototype) throw new Error(`${where}: ${field} is not a plain object`);
+    for (const k in m as Record<string, unknown>) {
+      if (!Object.prototype.hasOwnProperty.call(m, k)) continue;
+      const v = (m as Record<string, unknown>)[k];
+      if (typeof v !== 'string') throw new Error(`${where}: ${field}.${k.slice(0, 60)} is not a string`);
+      budget.edges++; budget.bytes += k.length + v.length;
+      if (budget.edges > budget.maxEdges) throw new Error(`dependency edges exceed the limit of ${budget.maxEdges}`);
+      if (budget.bytes > budget.maxBytes) throw new Error(`dependency specs exceed the limit of ${budget.maxBytes} bytes`);
+      out[k] = v;
+    }
+  }
+  return { ...out };
 }
 
 /**
@@ -88,10 +113,15 @@ export function specAuthorizes(depName: string, spec: string, child: { name: str
 }
 
 /** Parse and shape-check a lockfile. Returns the registry entries or the first refusal. */
-export function parseLockfile(text: string): { ok: true; entries: Artifact[]; names: Set<string> } | { ok: false; reason: string } {
+export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { ok: true; entries: Artifact[]; names: Set<string> } | { ok: false; reason: string } {
   let lock: Lockfile;
   try { lock = JSON.parse(text) as Lockfile; } catch { return { ok: false, reason: 'package-lock.json is not valid JSON' }; }
-  if (!lock.packages || typeof lock.packages !== 'object') return { ok: false, reason: 'package-lock.json has no "packages" map (lockfile v1 is not supported)' };
+  if (!lock.packages || typeof lock.packages !== 'object' || Array.isArray(lock.packages)) return { ok: false, reason: 'package-lock.json has no "packages" map (lockfile v1 is not supported)' };
+  // One validation pass bounds everything later stages see: placement count first, then types and edge/byte totals.
+  const placements = Object.keys(lock.packages).length;
+  if (placements > maxPlacements + 1) return { ok: false, reason: `${placements - 1} lockfile placements exceed the limit of ${maxPlacements}` };
+  for (const [key, pkg] of Object.entries(lock.packages)) if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return { ok: false, reason: `lockfile entry "${key.slice(0, 80)}" is not an object` };
+  const budget = newSpecBudget();
   const entries: Artifact[] = [];
   const workspaceNames = new Set<string>();
   for (const [key, pkg] of Object.entries(lock.packages)) {
@@ -114,7 +144,9 @@ export function parseLockfile(text: string): { ok: true; entries: Artifact[]; na
     const resolved = String(pkg.resolved ?? '');
     if (resolved !== tarballUrl(name, pkg.version)) return { ok: false, reason: `"${name}@${pkg.version}" does not resolve to its registry tarball: ${resolved.slice(0, 120) || '(none)'}` };
     if (!pkg.integrity || !SRI.test(pkg.integrity)) return { ok: false, reason: `"${name}" has no usable integrity hash` };
-    entries.push({ key, name, version: pkg.version, resolved, integrity: pkg.integrity, specs: specsOf(pkg) });
+    let specs: Record<string, string>;
+    try { specs = readSpecs(pkg as unknown as Record<string, unknown>, budget, `"${name}"`); } catch (e) { return { ok: false, reason: String((e as Error).message) }; }
+    entries.push({ key, name, version: pkg.version, resolved, integrity: pkg.integrity, specs });
   }
   return { ok: true, entries, names: new Set(entries.map((e) => e.name)) };
 }
@@ -127,13 +159,10 @@ const sameSpecs = (a: Record<string, string>, b: Record<string, string>) => JSON
  * `base` is the base branch's lockfile text (null when the base has none).
  */
 export async function planPrime(candidate: string, base: string | null, approved: readonly string[], limits: PrimeLimits, fetchPackument: FetchPackument, signal?: AbortSignal): Promise<PrimePlan> {
-  const cand = parseLockfile(candidate);
+  const cand = parseLockfile(candidate, limits.maxPlacements ?? MAX_PLACEMENTS);
   if (!cand.ok) return cand;
   // Bound the graph before any work: placements and declared edges, both untrusted input.
-  const maxPlacements = limits.maxPlacements ?? MAX_PLACEMENTS;
-  if (cand.entries.length > maxPlacements) return { ok: false, reason: `${cand.entries.length} lockfile placements exceed the limit of ${maxPlacements}` };
-  const declaredEdges = cand.entries.reduce((n, e) => n + Object.keys(e.specs).length, 0);
-  if (declaredEdges > MAX_EDGES) return { ok: false, reason: `${declaredEdges} declared dependency edges exceed the limit of ${MAX_EDGES}` };
+  // (placement count, entry types, declared edges and spec bytes were bounded by parseLockfile)
   const baseParsed = base ? parseLockfile(base) : null;
   const baseByIdent = new Map<string, Artifact>();
   const baseNames = new Set<string>();
@@ -170,6 +199,7 @@ export async function planPrime(candidate: string, base: string | null, approved
   const maxWork = limits.maxWork ?? MAX_WORK;
   let work = 0;
   let trustedEdgeCount = 0;
+  const registryBudget = newSpecBudget();
   let packumentBytes = 0;
   const reachableNames = new Set<string>([...approved, ...baseNames]);
   for (const a of unchanged) for (const d of Object.keys(trusted.get(a) ?? {})) { if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` }; reachableNames.add(d); }
@@ -198,7 +228,8 @@ export async function planPrime(candidate: string, base: string | null, approved
     if (typeof p.dist.unpackedSize === 'number') { e.unpackedSize = p.dist.unpackedSize; if (p.dist.unpackedSize > limits.maxBytes) return { ok: false, reason: `${e.name}@${e.version} unpacks to ${p.dist.unpackedSize} bytes, above the budget of ${limits.maxBytes}` }; }
     packumentBytes += JSON.stringify(p).length;
     if (packumentBytes > MAX_PACKUMENT_TOTAL_BYTES) return { ok: false, reason: `registry metadata exceeded its budget of ${MAX_PACKUMENT_TOTAL_BYTES} bytes` };
-    const specs = specsOf(p);
+    let specs: Record<string, string>;
+    try { specs = readSpecs(p as unknown as Record<string, unknown>, registryBudget, `registry ${e.name}@${e.version}`); } catch (err) { return { ok: false, reason: `registry-declared ${String((err as Error).message)}` }; }
     trustedEdgeCount += Object.keys(specs).length;
     if (trustedEdgeCount > MAX_EDGES) return { ok: false, reason: `registry-declared dependency edges exceed the limit of ${MAX_EDGES}` };
     for (const d of Object.keys(specs)) { if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` }; reachableNames.add(d); }
@@ -215,11 +246,11 @@ export async function planPrime(candidate: string, base: string | null, approved
   const roots = new Set<string>();
   for (const a of cand.entries) {
     const k = nodeKey(a);
-    const specs = trusted.get(a) ?? {};
-    const prev = nodes.get(k);
-    if (!prev) nodes.set(k, { name: a.name, version: a.version, specs: { ...specs } });
-    else for (const [d, r] of Object.entries(specs)) if (!(d in prev.specs)) prev.specs[d] = r;
     if (approved.includes(a.name) || baseByIdent.has(ident(a))) roots.add(k);
+    if (nodes.has(k)) continue; // trusted specs are per name@version: duplicate placements add nothing
+    const specs = trusted.get(a) ?? {};
+    for (const _ in specs) if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` };
+    nodes.set(k, { name: a.name, version: a.version, specs });
   }
   const byName = new Map<string, string[]>();
   for (const [k, n] of nodes) { const l = byName.get(n.name) ?? []; l.push(k); byName.set(n.name, l); }

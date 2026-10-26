@@ -383,6 +383,52 @@ test('planPrime: a dependency that only becomes reachable through a verified par
   assert.ok(p.ok, JSON.stringify(p)); assert.deepEqual(r.calls, ['pg@1.0.0', 'child@1.0.0']);
 });
 
+test('parseLockfile validates dependency maps before copying them: huge string, array, non-string values, non-object entries', () => {
+  const huge = 'x'.repeat(2_000_000);
+  for (const [label, extra] of Object.entries<object>({
+    'a huge string instead of a map': { dependencies: huge },
+    'an array': { dependencies: ['a', 'b'] },
+    'a non-string value': { optionalDependencies: { a: 1 } },
+    'a nested object value': { peerDependencies: { a: { b: 'c' } } },
+  })) {
+    const t0 = Date.now();
+    const p = parseLockfile(lock({ 'node_modules/y': reg('y', '1.0.0', extra) }));
+    assert.ok(!p.ok, label); assert.match(p.reason, /not a plain object|not a string/, label);
+    assert.ok(Date.now() - t0 < 1_000, `${label}: refused quickly`);
+  }
+  assert.ok(!parseLockfile(JSON.stringify({ lockfileVersion: 3, packages: { '': {}, 'node_modules/y': 'string' } })).ok);
+  assert.ok(!parseLockfile(JSON.stringify({ lockfileVersion: 3, packages: [] })).ok);
+});
+
+test('parseLockfile counts edges and spec bytes while scanning and refuses past either budget', () => {
+  const many = Object.fromEntries([...Array(60_000)].map((_, j) => [`d${j}`, '^1']));
+  const p = parseLockfile(lock({ 'node_modules/y': reg('y', '1.0.0', { dependencies: many }) }));
+  assert.ok(!p.ok); assert.match(p.reason, /edges exceed the limit of 50000/);
+  const fat = { dependencies: { a: '^1 || ' + '1.0.0 || '.repeat(700_000) } };
+  const q = parseLockfile(lock({ 'node_modules/y': reg('y', '1.0.0', fat) }));
+  assert.ok(!q.ok); assert.match(q.reason, /specs exceed the limit of 5000000 bytes/);
+});
+
+test('planPrime: thousands of duplicate placements of an artifact with a large registry dependency map build its node once', async () => {
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg') };
+  for (let i = 0; i < 4_900; i++) pk[`node_modules/d${i}/node_modules/pg`] = reg('pg');
+  const big = Object.fromEntries([...Array(20_000)].map((_, j) => [`dep${j}`, '^1']));
+  const r = registry({ 'pg@1.0.0': { name: 'pg', version: '1.0.0', dist: { tarball: tarballUrl('pg', '1.0.0'), integrity: SRI('pg@1.0.0') }, dependencies: big } });
+  const t0 = Date.now();
+  const p = await planPrime(lock(pk), BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(p.ok, JSON.stringify(p).slice(0, 200)); assert.equal(r.calls.length, 1, 'one lookup for all 4,901 placements');
+  assert.ok(Date.now() - t0 < 3_000, `built in ${Date.now() - t0} ms`);
+  const tight = await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 25_000 }, r.fetchPackument);
+  assert.ok(!tight.ok); assert.match(tight.reason, /work budget/);
+});
+
+test('planPrime: a registry packument with a malformed dependency map is refused', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg') });
+  const r = registry({ 'pg@1.0.0': { name: 'pg', version: '1.0.0', dist: { tarball: tarballUrl('pg', '1.0.0'), integrity: SRI('pg@1.0.0') }, dependencies: 'x'.repeat(100_000) as never } });
+  const p = await planPrime(cand, BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /registry-declared .*not a plain object/);
+});
+
 // ---------------------------------------------------------------- reading the lockfile after untrusted commands ran
 
 test('readLockfileSafely: regular file ok; absent → null; symlink, FIFO and oversized files are refused', () => {
