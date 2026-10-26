@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { REGISTRY, listManifests, looksLikeOfflineMiss, packageName, planPrime, primeNpmCache } from '../src/npm-cache-prime.ts';
+import { dirname, join } from 'node:path';
+import { REGISTRY, MAX_PACKUMENT_BYTES, contentPath, looksLikeOfflineMiss, packageName, packumentUrl, parseLockfile, planPrime, primeNpmCache, sriOf, tarballUrl } from '../src/npm-cache-prime.ts';
+import type { Artifact, Packument } from '../src/npm-cache-prime.ts';
 import { makeEnv, job } from './helpers.ts';
 import { answerBlocked } from '../src/pipeline.ts';
 import { getJob } from '../src/db.ts';
@@ -11,132 +12,202 @@ import type { ExecResult } from '../src/exec.ts';
 
 // 2026-10-26: dependency-adding tickets blocked three times on luckywinclub because the offline npm cache lacked
 // their packages and an operator had to prime it by hand. Priming is now automatic, under the rules tested here.
+// The agent that writes the lockfile is untrusted: identities and edges come from the registry, never from it.
 
-const tgz = (name: string, v = '1.0.0') => `${REGISTRY}${name}/-/${name.split('/').pop()}-${v}.tgz`;
-const SRI = 'sha512-' + 'A'.repeat(86) + '==';
-function lock(packages: Record<string, object>): string {
-  return JSON.stringify({ name: 'demo', lockfileVersion: 3, requires: true, packages: { '': { name: 'demo', dependencies: {} }, ...packages } });
+const SRI = (s: string) => sriOf(Buffer.from(s));
+function lock(packages: Record<string, object>, root: object = { name: 'demo' }): string {
+  return JSON.stringify({ name: 'demo', lockfileVersion: 3, requires: true, packages: { '': root, ...packages } });
 }
-const reg = (name: string, extra: object = {}) => ({ version: '1.0.0', resolved: tgz(name), integrity: SRI, ...extra });
+/** A well-formed registry entry whose integrity is derived from its name@version (so a fake registry can agree). */
+const reg = (name: string, v = '1.0.0', extra: object = {}) => ({ version: v, resolved: tarballUrl(name, v), integrity: SRI(`${name}@${v}`), ...extra });
+/** A fake registry: packuments agree with reg() unless overridden. */
+function registry(overrides: Record<string, Packument | null | Error> = {}, deps: Record<string, Record<string, string>> = {}) {
+  const calls: string[] = [];
+  const fetchPackument = async (name: string, version: string): Promise<Packument | null> => {
+    calls.push(`${name}@${version}`);
+    const key = `${name}@${version}`;
+    if (key in overrides) { const o = overrides[key]; if (o instanceof Error) throw o; return o; }
+    return { name, version, dist: { tarball: tarballUrl(name, version), integrity: SRI(key) }, dependencies: deps[key] ?? {} };
+  };
+  return { fetchPackument, calls };
+}
+const LIMITS = { maxArtifacts: 10, maxBytes: 10_000_000 };
 const BASE = lock({ 'node_modules/existing': reg('existing') });
 
-test('packageName reads the name from any lockfile key', () => {
-  assert.equal(packageName('node_modules/foo'), 'foo');
+test('packageName and tarballUrl', () => {
   assert.equal(packageName('node_modules/@s/foo'), '@s/foo');
   assert.equal(packageName('apps/web/node_modules/foo/node_modules/bar'), 'bar');
   assert.equal(packageName('packages/core'), null);
+  assert.equal(tarballUrl('@s/foo', '1.2.3'), `${REGISTRY}@s/foo/-/foo-1.2.3.tgz`);
+  assert.equal(packumentUrl('@s/foo', '1.2.3'), `${REGISTRY}@s%2Ffoo/1.2.3`);
+  assert.throws(() => packumentUrl('../etc', '1'), /invalid package name/);
+  assert.ok(MAX_PACKUMENT_BYTES > 0);
 });
 
-test('planPrime: nothing new → nothing to prime', () => {
-  const p = planPrime(BASE, BASE, [], 10);
-  assert.deepEqual(p, { ok: true, newPackages: [], totalPackages: 1 });
-});
-
-test('planPrime: an approved new package and its transitive deps are primed', () => {
-  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg', { dependencies: { 'pg-pool': '^3' } }), 'node_modules/pg-pool': reg('pg-pool') });
-  const p = planPrime(cand, BASE, ['pg'], 10);
-  assert.ok(p.ok); assert.deepEqual(p.newPackages.sort(), ['pg', 'pg-pool']);
-});
-
-test('planPrime: a new dependency of an existing package is primed (updates), but an unrelated new package is refused', () => {
-  const cand = lock({ 'node_modules/existing': reg('existing', { dependencies: { helper: '^1' } }), 'node_modules/helper': reg('helper'), 'node_modules/sneaky': reg('sneaky') });
-  const p = planPrime(cand, BASE, [], 10);
-  assert.ok(!p.ok); assert.match(p.reason, /neither approved nor dependencies.*sneaky/);
-  const ok = planPrime(lock({ 'node_modules/existing': reg('existing', { dependencies: { helper: '^1' } }), 'node_modules/helper': reg('helper') }), BASE, [], 10);
-  assert.ok(ok.ok); assert.deepEqual(ok.newPackages, ['helper']);
-});
-
-test('planPrime: no base lockfile means every new package must be approved (or reachable from an approved one)', () => {
-  const cand = lock({ 'node_modules/next': reg('next', { dependencies: { react: '^19' } }), 'node_modules/react': reg('react') });
-  assert.ok(!planPrime(cand, null, [], 10).ok);
-  assert.ok(planPrime(cand, null, ['next'], 10).ok);
-});
+// ---------------------------------------------------------------- shape checks on the candidate lockfile
 
 for (const [label, pkg] of Object.entries({
-  'git dependency': { version: '1.0.0', resolved: 'git+ssh://git@github.com/x/y.git#abc', integrity: SRI },
-  'file dependency': { version: '1.0.0', resolved: 'file:../y', integrity: SRI },
-  'http (not https) registry': { version: '1.0.0', resolved: 'http://registry.npmjs.org/y/-/y-1.0.0.tgz', integrity: SRI },
-  'another registry': { version: '1.0.0', resolved: 'https://npm.pkg.github.com/x/-/y-1.0.0.tgz', integrity: SRI },
-  'registry URL that is not a tarball': { version: '1.0.0', resolved: `${REGISTRY}y/-/y-1.0.0.tgz?token=1`, integrity: SRI },
-  'missing integrity': { version: '1.0.0', resolved: tgz('y') },
-  'malformed integrity': { version: '1.0.0', resolved: tgz('y'), integrity: 'md5-abc' },
+  'git dependency': { version: '1.0.0', resolved: 'git+ssh://git@github.com/x/y.git#abc', integrity: SRI('y') },
+  'file dependency': { version: '1.0.0', resolved: 'file:../y', integrity: SRI('y') },
+  'http (not https) registry': { version: '1.0.0', resolved: 'http://registry.npmjs.org/y/-/y-1.0.0.tgz', integrity: SRI('y') },
+  'another registry': { version: '1.0.0', resolved: 'https://npm.pkg.github.com/y/-/y-1.0.0.tgz', integrity: SRI('y') },
+  'query string on the tarball': { version: '1.0.0', resolved: `${REGISTRY}y/-/y-1.0.0.tgz?token=1`, integrity: SRI('y') },
+  'tarball of a different version': { version: '1.0.0', resolved: tarballUrl('y', '1.0.1'), integrity: SRI('y') },
+  'tarball of a different package (alias substitution by URL)': { version: '1.0.0', resolved: tarballUrl('other', '1.0.0'), integrity: SRI('y') },
+  'npm: alias via the name field': { name: 'other', version: '1.0.0', resolved: tarballUrl('y', '1.0.0'), integrity: SRI('y') },
+  'missing integrity': { version: '1.0.0', resolved: tarballUrl('y', '1.0.0') },
+  'malformed integrity': { version: '1.0.0', resolved: tarballUrl('y', '1.0.0'), integrity: 'md5-abc' },
   'link entry': { version: '1.0.0', link: true, resolved: '../y' },
-  'no resolved URL': { version: '1.0.0', integrity: SRI },
+  'no resolved URL': { version: '1.0.0', integrity: SRI('y') },
+  'no version': { resolved: tarballUrl('y', '1.0.0'), integrity: SRI('y') },
 })) {
-  test(`planPrime refuses: ${label}`, () => {
-    const p = planPrime(lock({ 'node_modules/existing': reg('existing'), 'node_modules/y': pkg }), BASE, ['y'], 10);
-    assert.ok(!p.ok, label); assert.match(p.reason, /"y"/);
+  test(`parseLockfile refuses: ${label}`, () => {
+    const p = parseLockfile(lock({ 'node_modules/existing': reg('existing'), 'node_modules/y': pkg }));
+    assert.ok(!p.ok, label); assert.match(p.reason, /"y/);
   });
 }
 
-test('planPrime refuses a workspace entry outside the repository', () => {
-  const p = planPrime(lock({ '../elsewhere': { name: 'evil', version: '1.0.0' } }), BASE, [], 10);
-  assert.ok(!p.ok); assert.match(p.reason, /outside the repository/);
+test('parseLockfile refuses a workspace entry outside the repository and lockfile v1 / invalid JSON', () => {
+  assert.match((parseLockfile(lock({ '../elsewhere': { name: 'evil', version: '1.0.0' } })) as { reason: string }).reason, /outside the repository/);
+  assert.ok(!parseLockfile('{').ok);
+  assert.ok(!parseLockfile(JSON.stringify({ lockfileVersion: 1, dependencies: {} })).ok);
 });
 
-test('planPrime accepts in-repo workspaces and their node_modules aliases', () => {
-  const cand = JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'demo', workspaces: ['packages/*'] }, 'packages/core': { name: '@lwc/core', version: '0.0.0' }, 'node_modules/@lwc/core': { resolved: 'packages/core', link: true }, 'node_modules/existing': reg('existing') } });
-  // npm writes the alias as a link to the workspace path: accepted only because a matching workspace entry exists
-  const p = planPrime(cand.replace('"resolved":"packages/core","link":true', '"version":"0.0.0"'), BASE, [], 10);
-  assert.ok(p.ok, JSON.stringify(p));
+test('parseLockfile accepts in-repo workspaces and their node_modules links', () => {
+  const p = parseLockfile(JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'demo', workspaces: ['packages/*'] }, 'packages/core': { name: '@lwc/core', version: '0.0.0' }, 'node_modules/@lwc/core': { resolved: 'packages/core', link: true }, 'node_modules/existing': reg('existing') } }));
+  assert.ok(p.ok, JSON.stringify(p)); assert.deepEqual([...p.names], ['existing']);
 });
 
-test('planPrime bounds the number of new packages', () => {
-  const many: Record<string, object> = { 'node_modules/existing': reg('existing', { dependencies: Object.fromEntries([...Array(5)].map((_, i) => [`d${i}`, '^1'])) }) };
-  for (let i = 0; i < 5; i++) many[`node_modules/d${i}`] = reg(`d${i}`);
-  assert.ok(!planPrime(lock(many), BASE, [], 4).ok);
-  assert.ok(planPrime(lock(many), BASE, [], 5).ok);
+// ---------------------------------------------------------------- the plan: registry-verified identity and edges
+
+test('planPrime: nothing new or changed → nothing to fetch, no registry call', async () => {
+  const r = registry();
+  const p = await planPrime(BASE, BASE, [], LIMITS, r.fetchPackument);
+  assert.ok(p.ok); assert.equal(p.artifacts.length, 0); assert.deepEqual(r.calls, []);
 });
 
-test('planPrime refuses lockfile v1 and invalid JSON', () => {
-  assert.ok(!planPrime('{', BASE, [], 10).ok);
-  assert.ok(!planPrime(JSON.stringify({ lockfileVersion: 1, dependencies: {} }), BASE, [], 10).ok);
+test('planPrime: an approved new package and the deps the REGISTRY declares are primed', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg', '1.0.0', { dependencies: { 'pg-pool': '^3' } }), 'node_modules/pg-pool': reg('pg-pool') });
+  const r = registry({}, { 'pg@1.0.0': { 'pg-pool': '^3' } });
+  const p = await planPrime(cand, BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(p.ok, JSON.stringify(p)); assert.deepEqual(p.newNames.sort(), ['pg', 'pg-pool']); assert.equal(p.artifacts.length, 2);
+  assert.deepEqual(r.calls.sort(), ['pg-pool@1.0.0', 'pg@1.0.0']);
+});
+
+test('planPrime: forged edges — the candidate claims an existing package depends on evil; the registry says otherwise → refused', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing', '1.0.0', { dependencies: { evil: '^1' } }), 'node_modules/evil': reg('evil') });
+  const r = registry(); // registry: existing@1.0.0 has no dependencies
+  const p = await planPrime(cand, BASE, [], LIMITS, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /neither approved.*evil/);
+  assert.ok(r.calls.includes('existing@1.0.0'), 'the changed base entry was re-verified against the registry');
+});
+
+test('planPrime: forged edges on an APPROVED package are ignored too; only registry edges count', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg', '1.0.0', { dependencies: { evil: '^1' } }), 'node_modules/evil': reg('evil') });
+  const p = await planPrime(cand, BASE, ['pg'], LIMITS, registry().fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /evil/);
+});
+
+test('planPrime: alias substitution by integrity — pg\'s URL with another tarball\'s hash → registry mismatch → refused', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': { version: '1.0.0', resolved: tarballUrl('pg', '1.0.0'), integrity: SRI('other@1.0.0') } });
+  const p = await planPrime(cand, BASE, ['pg'], LIMITS, registry().fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /integrity differs from the registry/);
+});
+
+test('planPrime: packument identity, tarball host and missing dist.integrity all fail closed', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg') });
+  for (const [label, override] of Object.entries<Packument | null>({
+    'wrong name': { name: 'other', version: '1.0.0', dist: { tarball: tarballUrl('pg', '1.0.0'), integrity: SRI('pg@1.0.0') } },
+    'wrong version': { name: 'pg', version: '1.0.1', dist: { tarball: tarballUrl('pg', '1.0.0'), integrity: SRI('pg@1.0.0') } },
+    'other tarball host': { name: 'pg', version: '1.0.0', dist: { tarball: 'https://evil.example/pg-1.0.0.tgz', integrity: SRI('pg@1.0.0') } },
+    'no dist.integrity': { name: 'pg', version: '1.0.0', dist: { tarball: tarballUrl('pg', '1.0.0') } },
+    'not on the registry': null,
+  })) {
+    const p = await planPrime(cand, BASE, ['pg'], LIMITS, registry({ 'pg@1.0.0': override }).fetchPackument);
+    assert.ok(!p.ok, label);
+  }
+  const err = await planPrime(cand, BASE, ['pg'], LIMITS, registry({ 'pg@1.0.0': new Error('ECONNRESET') }).fetchPackument);
+  assert.ok(!err.ok); assert.match(err.reason, /registry lookup failed/);
+});
+
+test('planPrime: no base lockfile means every new package must be approved or reachable from an approved one', async () => {
+  const cand = lock({ 'node_modules/next': reg('next'), 'node_modules/react': reg('react') });
+  const r = registry({}, { 'next@1.0.0': { react: '^19' } });
+  assert.ok(!(await planPrime(cand, null, [], LIMITS, r.fetchPackument)).ok);
+  assert.ok((await planPrime(cand, null, ['next'], LIMITS, r.fetchPackument)).ok);
+});
+
+test('planPrime bounds artifacts by new/changed name@version placements, not names', async () => {
+  const cand = lock({
+    'node_modules/existing': reg('existing', '1.0.0', { dependencies: { d: '^1' } }), 'node_modules/d': reg('d', '1.0.0'),
+    'node_modules/existing/node_modules/d': reg('d', '1.0.1'), 'apps/web/node_modules/d': reg('d', '1.0.2'),
+  });
+  const r = registry({}, { 'existing@1.0.0': { d: '^1' } });
+  assert.ok(!(await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 3 }, r.fetchPackument)).ok, '4 changed artifacts (existing + 3 versions of d) exceed 3');
+  const ok = await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 4 }, r.fetchPackument);
+  assert.ok(ok.ok, JSON.stringify(ok)); assert.equal(ok.artifacts.length, 4);
 });
 
 test('looksLikeOfflineMiss matches npm offline-miss errors only', () => {
-  assert.ok(looksLikeOfflineMiss("npm ERR! code ENOTCACHED\nnpm ERR! request to https://registry.npmjs.org/tslib failed: cache mode is 'only-if-cached' but no cached response is available."));
-  assert.ok(!looksLikeOfflineMiss('npm ERR! code ERESOLVE\nunable to resolve dependency tree'));
-  assert.ok(!looksLikeOfflineMiss('Error: Cannot find module'));
+  assert.ok(looksLikeOfflineMiss("npm ERR! code ENOTCACHED\nrequest to https://registry.npmjs.org/tslib failed: cache mode is 'only-if-cached' but no cached response is available."));
+  assert.ok(!looksLikeOfflineMiss('npm ERR! code ERESOLVE'));
 });
 
-test('listManifests copies only package.json and package-lock.json, skipping node_modules, .git and symlinks', () => {
-  const root = mkdtempSync(join(tmpdir(), 'prime-wt-'));
-  mkdirSync(join(root, 'apps/web'), { recursive: true }); mkdirSync(join(root, 'node_modules/x'), { recursive: true }); mkdirSync(join(root, '.git'));
-  for (const f of ['package.json', 'package-lock.json', '.npmrc', 'apps/web/package.json', 'node_modules/x/package.json', '.git/package.json']) writeFileSync(join(root, f), '{}');
-  assert.deepEqual(listManifests(root), ['package-lock.json', 'package.json', 'apps/web/package.json']);
-});
+// ---------------------------------------------------------------- fetching: one exact tarball at a time, bounded
 
-test('primeNpmCache runs npm with --ignore-scripts, a clean environment, null configs and the explicit registry', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'prime-wt-'));
-  writeFileSync(join(root, 'package.json'), '{"name":"demo"}'); writeFileSync(join(root, 'package-lock.json'), BASE); writeFileSync(join(root, '.npmrc'), '//registry.npmjs.org/:_authToken=SECRET');
-  const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
-  const calls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
-  const fakeExec = async (cmd: string, args: string[], opts: Record<string, unknown> = {}): Promise<ExecResult> => {
-    calls.push({ cmd, args, opts });
-    const cwd = String(opts.cwd);
-    assert.ok(existsSync(join(cwd, 'package-lock.json')) && !existsSync(join(cwd, '.npmrc')), 'only manifests reach npm');
+function fakeExec(cache: string, opts: { bytesPerAdd?: number; skipContent?: boolean; fail?: boolean } = {}) {
+  const calls: Array<{ args: string[]; opts: Record<string, unknown> }> = [];
+  const exec = async (cmd: string, args: string[], o: Record<string, unknown> = {}): Promise<ExecResult> => {
+    calls.push({ args, opts: o });
+    assert.equal(cmd, 'npm');
+    if (opts.fail) return { code: 1, stdout: '', stderr: 'npm ERR! 503', timedOut: false, truncated: false };
+    const url = args[2]!;
+    const art = (o as { artifacts?: Artifact[] }).artifacts; void art;
+    if (!opts.skipContent) {
+      // simulate npm storing the tarball under the content path of the integrity the test registry agrees on
+      const name = url.slice(REGISTRY.length).split('/-/')[0]!; const version = url.match(/-(\d[^/]*)\.tgz$/)![1]!;
+      const p = contentPath(cache, SRI(`${name}@${version}`)); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, Buffer.alloc(opts.bytesPerAdd ?? 100));
+    }
     return { code: 0, stdout: '', stderr: '', timedOut: false, truncated: false };
   };
-  const out = await primeNpmCache({ worktree: root, cacheDir: cache, timeoutMs: 1000, exec: fakeExec as never });
-  assert.ok(out.ok, JSON.stringify(out));
-  const [c] = calls; assert.ok(c);
-  assert.equal(c.cmd, 'npm'); assert.equal(c.args[0], 'ci');
-  for (const flag of ['--ignore-scripts', '--no-audit', '--no-fund']) assert.ok(c.args.includes(flag), flag);
-  assert.equal(c.args[c.args.indexOf('--userconfig') + 1], '/dev/null');
-  assert.equal(c.args[c.args.indexOf('--globalconfig') + 1], '/dev/null');
-  assert.equal(c.args[c.args.indexOf('--registry') + 1], REGISTRY);
-  assert.equal(c.args[c.args.indexOf('--cache') + 1], cache);
-  const env = c.opts.env as Record<string, string>;
-  assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'TMPDIR', 'npm_config_cache']);
-  assert.ok(!env.HOME.startsWith(process.env.HOME ?? '/nonexistent'), 'HOME is a scratch directory, not the user home');
-  assert.equal(c.opts.timeoutMs, 1000);
-  assert.ok(!existsSync(String(c.opts.cwd)), 'the scratch copy is removed afterwards');
+  return { exec, calls };
+}
+const art = (name: string, v = '1.0.0'): Artifact => ({ key: `node_modules/${name}`, name, version: v, resolved: tarballUrl(name, v), integrity: SRI(`${name}@${v}`), edges: [] });
+
+test('primeNpmCache: one `npm cache add <exact URL>` per artifact with --ignore-scripts, null configs, the registry and a clean environment', async () => {
+  const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
+  const f = fakeExec(cache);
+  const out = await primeNpmCache({ artifacts: [art('pg'), art('pg-pool')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: f.exec as never });
+  assert.ok(out.ok, JSON.stringify(out)); assert.equal(out.artifacts, 2); assert.equal(out.bytesAdded, 200);
+  assert.equal(f.calls.length, 2);
+  for (const [i, c] of f.calls.entries()) {
+    assert.deepEqual(c.args.slice(0, 3), ['cache', 'add', tarballUrl(i === 0 ? 'pg' : 'pg-pool', '1.0.0')]);
+    for (const flag of ['--ignore-scripts', '--no-audit', '--no-fund']) assert.ok(c.args.includes(flag), flag);
+    assert.equal(c.args[c.args.indexOf('--userconfig') + 1], '/dev/null');
+    assert.equal(c.args[c.args.indexOf('--globalconfig') + 1], '/dev/null');
+    assert.equal(c.args[c.args.indexOf('--registry') + 1], REGISTRY);
+    assert.equal(c.args[c.args.indexOf('--cache') + 1], cache);
+    const env = c.opts.env as Record<string, string>;
+    assert.deepEqual(Object.keys(env).sort(), ['HOME', 'PATH', 'TMPDIR', 'npm_config_cache']);
+    assert.ok(!env.HOME.startsWith(process.env.HOME ?? '/nonexistent'), 'HOME is a scratch directory');
+    assert.equal(c.opts.timeoutMs, 1000);
+    assert.ok(!existsSync(String(c.opts.cwd)), 'the scratch directory is removed afterwards');
+  }
 });
 
-test('primeNpmCache reports npm failures without priming', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'prime-wt-')); writeFileSync(join(root, 'package-lock.json'), BASE);
-  const out = await primeNpmCache({ worktree: root, cacheDir: mkdtempSync(join(tmpdir(), 'prime-cache-')), timeoutMs: 1000, exec: (async () => ({ code: 1, stdout: '', stderr: 'npm ERR! 503', timedOut: false, truncated: false })) as never });
-  assert.ok(!out.ok); assert.match(out.reason, /exited 1.*503/s);
+test('primeNpmCache fails closed when the cache holds no content for the lockfile integrity after the add', async () => {
+  const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
+  const out = await primeNpmCache({ artifacts: [art('pg')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { skipContent: true }).exec as never });
+  assert.ok(!out.ok); assert.match(out.reason, /no content for the lockfile's integrity/);
+});
+
+test('primeNpmCache stops at the byte budget and reports npm failures', async () => {
+  const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
+  const f = fakeExec(cache, { bytesPerAdd: 600 });
+  const out = await primeNpmCache({ artifacts: [art('a'), art('b'), art('c')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1000, exec: f.exec as never });
+  assert.ok(!out.ok); assert.match(out.reason, /byte budget/); assert.equal(f.calls.length, 2, 'stopped after the add that crossed the budget');
+  const bad = await primeNpmCache({ artifacts: [art('a')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { fail: true }).exec as never });
+  assert.ok(!bad.ok); assert.match(bad.reason, /exited 1.*503/s);
 });
 
 // ---------------------------------------------------------------- pipeline: an offline miss primes once, then setup is retried
@@ -151,11 +222,11 @@ async function runThroughPolicy(e: ReturnType<typeof makeEnv>, identifier: strin
   }
   return job(e, identifier);
 }
+const ENOTCACHED = { code: 1, stdout: '', stderr: "npm ERR! code ENOTCACHED\nnpm ERR! request to https://registry.npmjs.org/left-pad failed: cache mode is 'only-if-cached' but no cached response is available.", timedOut: false, truncated: false };
 
 test('pipeline: a validation setup failing with ENOTCACHED primes the cache (once per candidate) and retries', async () => {
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
-  mkdirSync(join(cache, '_cacache'));
-  const primes: string[] = [];
+  const primes: Artifact[][] = [];
   const e = makeEnv({
     project: { setup: ['true'], npmCacheDir: cache, npmCachePrime: true, approvedDependencies: ['left-pad'] },
     behaviors: { coding: async (spec) => {
@@ -167,21 +238,21 @@ test('pipeline: a validation setup failing with ENOTCACHED primes the cache (onc
   let setupCalls = 0;
   const real = e.ctx.runCommand;
   e.ctx.runCommand = (async (cmd: string, cwd: string, ...rest: unknown[]) => {
-    // the workspace stage runs setup in the worktree (base lockfile: fine); the validate stage runs it in the candidate snapshot
-    if (cmd === 'true' && cwd.includes('/candidates/') && ++setupCalls === 1) return { code: 1, stdout: '', stderr: "npm ERR! code ENOTCACHED\nnpm ERR! request to https://registry.npmjs.org/left-pad failed: cache mode is 'only-if-cached' but no cached response is available.", timedOut: false, truncated: false };
+    if (cmd === 'true' && cwd.includes('/candidates/') && ++setupCalls === 1) return ENOTCACHED;
     return (real as (...a: unknown[]) => Promise<unknown>)(cmd, cwd, ...rest);
   }) as typeof e.ctx.runCommand;
-  e.ctx.primeNpmCache = async (req) => { primes.push(req.worktree); return { ok: true, bytesAdded: 12_345, durationMs: 10, command: ['npm', 'ci'] }; };
+  e.ctx.fetchPackument = registry().fetchPackument;
+  e.ctx.primeNpmCache = async (req) => { primes.push(req.artifacts); return { ok: true, artifacts: req.artifacts.length, bytesAdded: 12_345, durationMs: 10, command: ['npm', 'cache', 'add'] }; };
   const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Add left-pad', description: '', status: 'ready', priority: 2 });
   const j = await runThroughPolicy(e, t.identifier);
-  assert.equal(primes.length, 1, 'primed exactly once');
+  assert.equal(primes.length, 1, 'primed exactly once'); assert.deepEqual(primes[0]!.map((a) => a.name), ['left-pad']);
   assert.equal(setupCalls, 2, 'setup was retried after priming');
   assert.ok(['awaiting_merge', 'done'].includes(j.status), String(j.blocked_reason ?? j.error ?? j.status));
   const ev = e.ctx.db.prepare("SELECT message FROM events WHERE type = 'cache.primed'").get() as { message: string } | undefined;
-  assert.ok(ev && /1 new package\(s\).*left-pad/.test(String(ev.message)), String(ev?.message));
+  assert.ok(ev && /1 artifact\(s\).*left-pad/.test(String(ev.message)), String(ev?.message));
 });
 
-test('pipeline: an unapproved new package is refused, nothing is primed, and the setup failure reaches the agent', async () => {
+test('pipeline: an unapproved new package is refused, nothing is primed, and the reason reaches the coding agent', async () => {
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
   let primes = 0;
   const prompts: string[] = [];
@@ -195,15 +266,13 @@ test('pipeline: an unapproved new package is refused, nothing is primed, and the
     } },
   });
   const real2 = e.ctx.runCommand;
-  e.ctx.runCommand = (async (cmd: string, cwd: string, ...rest: unknown[]) => (cmd === 'true' && cwd.includes('/candidates/')
-    ? { code: 1, stdout: '', stderr: 'npm ERR! code ENOTCACHED', timedOut: false, truncated: false }
-    : (real2 as (...a: unknown[]) => Promise<unknown>)(cmd, cwd, ...rest))) as typeof e.ctx.runCommand;
-  e.ctx.primeNpmCache = async () => { primes++; return { ok: true, bytesAdded: 0, durationMs: 0, command: [] }; };
+  e.ctx.runCommand = (async (cmd: string, cwd: string, ...rest: unknown[]) => (cmd === 'true' && cwd.includes('/candidates/') ? ENOTCACHED : (real2 as (...a: unknown[]) => Promise<unknown>)(cmd, cwd, ...rest))) as typeof e.ctx.runCommand;
+  e.ctx.fetchPackument = registry().fetchPackument;
+  e.ctx.primeNpmCache = async () => { primes++; return { ok: true, artifacts: 0, bytesAdded: 0, durationMs: 0, command: [] }; };
   const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Add evil', description: '', status: 'ready', priority: 2 });
   await runThroughPolicy(e, t.identifier);
   assert.equal(primes, 0, 'never primed');
   const refused = e.ctx.db.prepare("SELECT message FROM events WHERE type = 'cache.prime.refused'").get() as { message: string } | undefined;
   assert.ok(refused && /neither approved.*evil/.test(String(refused.message)), String(refused?.message));
-  assert.ok(e.ctx.db.prepare("SELECT 1 FROM events WHERE type = 'fix.validation setup'").get(), 'the setup failure went back to the agent as feedback');
   assert.ok(prompts.some((p) => /Automatic npm cache priming did not run: new packages are neither approved.*evil/s.test(p)), 'the refusal reason reached the coding agent in its rework prompt');
 });

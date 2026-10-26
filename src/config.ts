@@ -27,8 +27,11 @@ const ProjectSchema = z.object({
    * script-free. Off by default: the operator primes the cache by hand.
    */
   npmCachePrime: z.boolean().default(false),
-  npmCachePrimeMaxNewPackages: z.number().int().positive().default(400),
-  npmCachePrimeTimeoutMinutes: z.number().positive().default(10),
+  /** New or changed name@version artifacts one priming may fetch (every placement counts), and the bytes it may add. */
+  npmCachePrimeMaxArtifacts: z.number().int().positive().default(400),
+  npmCachePrimeMaxMb: z.number().positive().default(500),
+  /** Per `npm cache add` call. */
+  npmCachePrimeTimeoutMinutes: z.number().positive().default(5),
   /** Extra env for agents and validation. `{{jobId}}` and `{{port}}` are templated. Never put production secrets here. */
   env: z.record(z.string(), z.string()).default({}),
   /** Required GitHub check names; empty = all reported checks must pass. */

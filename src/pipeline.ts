@@ -402,14 +402,15 @@ async function primeCacheForCandidate(ctx: Ctx, job: Job, project: ProjectConfig
   const candidateLock = existsSync(lockPath) ? readFileSync(lockPath, 'utf8') : null;
   if (!candidateLock) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: no package-lock.json in the candidate`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: 'no package-lock.json in the candidate' }; }
   const baseLock = job.base_sha ? await readBaseLockfile(job.worktree!, job.base_sha) : null;
-  const plan = planPrime(candidateLock, baseLock, project.approvedDependencies, project.npmCachePrimeMaxNewPackages);
+  const limits = { maxArtifacts: project.npmCachePrimeMaxArtifacts, maxBytes: Math.round(project.npmCachePrimeMaxMb * 1e6) };
+  const plan = await planPrime(candidateLock, baseLock, project.approvedDependencies, limits, ctx.fetchPackument);
   if (!plan.ok) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: ${plan.reason}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: plan.reason }; }
-  if (!plan.newPackages.length) return { primed: false, note: 'the lockfile adds no packages, so the cache is not the cause' };
+  if (!plan.artifacts.length) return { primed: false, note: 'the lockfile adds or changes no registry packages, so the cache is not the cause' };
   signal.throwIfAborted();
-  const out = await ctx.primeNpmCache({ worktree: snapshot, cacheDir, timeoutMs: project.npmCachePrimeTimeoutMinutes * 60_000 });
-  if (!out.ok) { logEvent(db, 'cache.prime.failed', `${job.ticket_identifier}: ${out.reason.slice(0, 400)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: `npm failed: ${out.reason.slice(0, 300)}` }; }
+  const out = await ctx.primeNpmCache({ artifacts: plan.artifacts, cacheDir, timeoutMs: project.npmCachePrimeTimeoutMinutes * 60_000, maxBytes: limits.maxBytes });
+  if (!out.ok) { logEvent(db, 'cache.prime.failed', `${job.ticket_identifier}: ${out.reason.slice(0, 400)} (${out.artifacts} artifact(s), ${(out.bytesAdded / 1e6).toFixed(1)} MB added before stopping)`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: `npm failed: ${out.reason.slice(0, 300)}` }; }
   kvSet(db, key, 'primed');
-  logEvent(db, 'cache.primed', `${job.ticket_identifier}: ${plan.newPackages.length} new package(s) of ${plan.totalPackages} (${(out.bytesAdded / 1e6).toFixed(1)} MB added, ${Math.round(out.durationMs / 1000)}s): ${plan.newPackages.slice(0, 12).join(', ')}${plan.newPackages.length > 12 ? ', …' : ''}`, { jobId: job.id, ticketId: job.ticket_id });
+  logEvent(db, 'cache.primed', `${job.ticket_identifier}: ${out.artifacts} artifact(s) fetched for ${plan.newNames.length} new package(s) of ${plan.totalEntries} entries (${(out.bytesAdded / 1e6).toFixed(1)} MB added, ${Math.round(out.durationMs / 1000)}s): ${plan.newNames.slice(0, 12).join(', ')}${plan.newNames.length > 12 ? ', …' : ''}`, { jobId: job.id, ticketId: job.ticket_id });
   return { primed: true };
 }
 
