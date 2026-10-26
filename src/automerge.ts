@@ -250,9 +250,9 @@ export function codingModelOverrideKey(jobId: string): string {
 export function escalationFeedback(model: string, verdict: SecondReviewVerdict, findings: string, noProgress: boolean): string {
   return `ESCALATED REWORK. The independent merge reviewer (${model}) still requests changes before this can be merged`
     + (noProgress ? ', and the previous rework attempt changed nothing: the candidate is identical to the one it rejected.' : ', after the maximum number of rework cycles.')
-    + `\n\nFix every finding below. Each one is required: do not argue it away, do not explain why it is already handled, and do not leave it for later. `
+    + `\n\nFix every blocking finding below. Each one is required: do not argue it away, do not explain why it is already handled, and do not leave it for later. `
     + 'Make the code change the finding asks for (or an equivalent one that removes the problem), add or update tests that prove it, and re-run the checks. '
-    + `This is the last automatic attempt before a human is asked.\n\nReviewer summary: ${verdict.summary}\n\nFindings (severity/category, file:line, issue, suggested fix):\n${findings}\n\nSpec conformance notes: ${verdict.specConformance}`;
+    + `This is the last automatic attempt before a human is asked.\n\nReviewer summary: ${verdict.summary}\n\nBlocking findings (severity/category, file:line, issue, suggested fix):\n${findings}\n\nSpec conformance notes: ${verdict.specConformance}`;
 }
 
 export function conflictFeedback(base: string, files: string[]): string {

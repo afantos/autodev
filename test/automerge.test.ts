@@ -204,6 +204,24 @@ test('escalation: if the escalated candidate is rejected again, the PR is held a
   assert.match(await comments(e, t.id), /Auto-merge is on hold[\s\S]*still requests changes after 1 rework cycles and an escalated rework \(opus\)/);
 });
 
+test('escalation: a clarified ticket (new requirements hash) may escalate once more', async () => {
+  const reviewer = new FakeReviewer([CHANGES]);
+  const e = env(reviewer, { behaviors: { coding: neverFixes } });
+  const t = await ready(e);
+  await cycles(e, 8);
+  assert.equal(eventCount(e, 'automerge.escalate'), 1);
+  assert.equal(eventCount(e, 'automerge.hold'), 1, 'held after the first escalation');
+  e.ctx.db.prepare('UPDATE local_tickets SET description = ? WHERE id = ?').run('Do the thing.\n\n## Owner clarification\nInfinity must be rejected.', t.id);
+  await cycles(e, 8);
+  assert.equal(eventCount(e, 'automerge.escalate'), 2, 'one more escalation for the new requirements');
+  // Held again: the same candidate and reason, so hold() doesn't repeat its comment; check that nothing more runs.
+  const runs = codingCalls(e).length;
+  await cycles(e, 3);
+  assert.equal(codingCalls(e).length, runs, 'no further coding while held');
+  assert.equal(job(e, t.identifier).status, 'awaiting_merge');
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'open');
+});
+
 test('escalation: the escalated rework runs with models.codingComplex regardless of the estimate; the others do not', async () => {
   const reviewer = new FakeReviewer([CHANGES, APPROVE]);
   const e = env(reviewer, { behaviors: { coding: fixesOnlyWhenEscalated }, config: { models: { coding: 'sonnet', codingComplex: 'opus-max' } } });
