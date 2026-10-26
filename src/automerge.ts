@@ -105,9 +105,12 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   const policy = await inspectChanges(ws, job.worktree, job.base_branch, project, cfg);
   let policyNote = 'clean';
   if (policy.reasons.length) {
-    const humanApproved = !!kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
+    const approval = kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
+    const humanApproved = !!approval;
+    // Only `/answer approve` of this exact hash; an approval carried over by fingerprint after a base refresh is not one.
+    const ownerApprovedExact = approval === 'human';
     const flagged = `The diff policy flags changes that need a human:\n${policy.reasons.map((r) => `- ${r}`).join('\n')}`;
-    if (humanApproved && cfg.secondReview.mergeOwnerApprovedDiffs) {
+    if (ownerApprovedExact && cfg.secondReview.mergeOwnerApprovedDiffs) {
       // The owner approved this exact diff (by hash); the second review and the CI/head gates still apply.
       policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
     } else if (!humanApproved && onlyNarrowTestUpdates(policy)) {
@@ -125,9 +128,9 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       if (policyNote === 'clean') {
         // flaggedDiffApprover 'second-review': the owner delegated approval of flagged diffs (outside alwaysHumanPaths).
         if (!aiApprovalEligible(ctx, project, policy)) return hold(`${flagged}${triageNote}`);
-        if (humanApproved) policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
+        if (ownerApprovedExact) policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
         else {
-          const a = await approveFlaggedDiff(ctx, job, project, policy, humanDecisions(ctx, ticket));
+          const a = await approveFlaggedDiff(ctx, job, project, policy, humanDecisions(ctx, ticket), requirementsHash(ctx, ticket));
           if (a.kind === 'waiting') return 'waiting';
           if (a.kind !== 'approved') return hold(`${flagged}${triageNote}\n\nSecond-review approval: ${a.note}`);
           policyNote = `flagged changes approved by the second reviewer for this exact diff (${policy.hash.slice(0, 12)}), delegated by the owner`;

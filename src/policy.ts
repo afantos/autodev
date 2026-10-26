@@ -294,6 +294,8 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
     }
     if (removed.includes(file) && !/\.(md|txt|snap)$/.test(file)) reasons.push(`${file}: source or configuration file removed`);
     for (const pattern of project.humanReviewPaths) if (new RegExp(pattern).test(file)) reasons.push(`${file}: protected path (/${pattern}/) changed`);
+    // An independent finding, so an otherwise clean diff, or one eligible for an automatic exception, still reaches the owner.
+    for (const pattern of project.alwaysHumanPaths) if (new RegExp(pattern).test(file)) reasons.push(`${file}: owner-only path (/${pattern}/) changed`);
   }
   // Exclude documentation from semantic keyword rules, but inspect every code file's added lines.
   const added: string[] = [];

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeEnv, job } from './helpers.ts';
+import { getJob, kvSet } from '../src/db.ts';
+import { answerBlocked } from '../src/pipeline.ts';
 import { flaggedReviewAccepted } from '../src/triage.ts';
 import type { FlaggedReview, StructuredTask } from '../src/agents/triage.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict, TestIntegrityVerdict, TestUpdateReviewInput } from '../src/agents/second-review.ts';
@@ -120,4 +122,51 @@ test('flaggedReviewAccepted requires approve and every finding accepted exactly 
   assert.equal(flaggedReviewAccepted({ ...ok, findings: [ok.findings[0]!, ok.findings[0]!] }, ['f1', 'f2']), false, 'duplicate id');
   assert.equal(flaggedReviewAccepted({ ...ok, findings: [ok.findings[0]!, { id: 'f9', acceptable: true, explanation: '' }] }, ['f1', 'f2']), false, 'unknown id');
   assert.equal(flaggedReviewAccepted({ ...ok, findings: [ok.findings[0]!, { id: 'f2', acceptable: false, explanation: '' }] }, ['f1', 'f2']), false);
+});
+
+// ---------------------------------------------------------------- review fixes (GPT code review of 6c7a5a1)
+
+test('an otherwise clean diff touching alwaysHumanPaths still goes to the owner', async () => {
+  const reviewer = new Reviewer(accept);
+  const e = env(reviewer, { humanReviewPaths: [], alwaysHumanPaths: ['^CHANGES\\.md$'] });
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  assert.equal(j.status, 'blocked');
+  assert.match(String(j.blocked_reason), /CHANGES\.md: owner-only path/);
+  assert.equal(reviewer.asked.length, 0);
+});
+
+test('mergeOwnerApprovedDiffs merges only an exact owner approval, not one carried over by fingerprint', async () => {
+  const reviewer = new Reviewer(accept);
+  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true, humanReviewPaths: ['^CHANGES\\.md$'] }, config: { secondReview: { enabled: true, mergeOwnerApprovedDiffs: true } } });
+  const t = await ready(e);
+  await e.cycle();
+  const j = job(e, t.identifier);
+  assert.equal(j.status, 'blocked');
+  const hash = JSON.parse(j.blocked_reason!).policyHash as string;
+  await answerBlocked(e.ctx, getJob(e.ctx.db, j.id)!, 'approve');
+  // Downgrade the exact approval to what requireChangeApproval stores after a base refresh: same change, not this hash.
+  kvSet(e.ctx.db, `policy-approved:${j.id}:${hash}`, 'human (carried over: same change, moved base)');
+  await cycles(e, 4);
+  const after = job(e, t.identifier);
+  assert.ok(after.pr_number, `${after.status}/${after.stage}: ${after.blocked_reason ?? after.error}`);
+  assert.equal((await e.scm.getPr(e.repo, after.pr_number)).state, 'open', 'a carried approval must not merge on its own');
+  assert.match(await comments(e, t.id), /diff policy flags changes that need a human/);
+});
+
+test('a flagged-diff verdict is not reused once the ticket requirements change', async () => {
+  let n = 0;
+  const reviewer = new Reviewer((ids) => (++n === 1
+    ? { verdict: 'escalate', summary: 'Out of scope for this ticket.', findings: ids.map((id) => ({ id, acceptable: false, explanation: 'scope' })) }
+    : accept(ids)));
+  const e = env(reviewer);
+  const t = await ready(e);
+  await cycles(e, 4);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'open');
+  assert.equal(reviewer.asked.length, 1);
+  e.ctx.db.prepare('UPDATE local_tickets SET description = ? WHERE id = ?').run('Do the thing. Updating CHANGES.md is in scope.', t.id);
+  await cycles(e, 3);
+  assert.equal(reviewer.asked.length, 2, 'the clarified ticket gets a fresh flagged-diff judgment');
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'merged');
 });

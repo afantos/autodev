@@ -118,8 +118,14 @@ export function aiApprovalEligible(ctx: Ctx, project: ProjectConfig | undefined,
   return !policy.files.some((f) => project.alwaysHumanPaths.some((p) => new RegExp(p).test(f)));
 }
 
-const aiApprovedKey = (job: Job, hash: string) => `policy-ai-approved:${job.id}:${hash}`;
-export const isAiApproved = (ctx: Ctx, job: Job, policy: PolicyInspection) => !!kvGet(ctx.db, aiApprovedKey(job, policy.hash));
+/**
+ * What an approval covers: the exact diff hash AND the findings judged AND the ticket requirements (description and
+ * recorded decisions). A new finding (e.g. a config change adds a protected path) or a clarified ticket asks again.
+ */
+const approvalScope = (policy: PolicyInspection, requirements: string) =>
+  createHash('sha256').update(policy.hash).update('\0').update(JSON.stringify([...policy.reasons].sort())).update('\0').update(requirements).digest('hex');
+const aiApprovedKey = (job: Job, scope: string) => `policy-ai-approved:${job.id}:${scope}`;
+export const isAiApproved = (ctx: Ctx, job: Job, policy: PolicyInspection, requirements: string) => !!kvGet(ctx.db, aiApprovedKey(job, approvalScope(policy, requirements)));
 
 /** Enforced in code: approve only if the model accepted every finding, each exactly once. */
 export function flaggedReviewAccepted(v: FlaggedReview, ids: string[]): boolean {
@@ -135,14 +141,15 @@ export function flaggedReviewAccepted(v: FlaggedReview, ids: string[]): boolean 
 
 export type FlaggedApprovalOutcome = { kind: 'approved'; note: string } | { kind: 'human'; note: string } | { kind: 'waiting' };
 
-export async function approveFlaggedDiff(ctx: Ctx, job: Job, project: ProjectConfig, policy: PolicyInspection, decisions: { question: string; decision: string }[]): Promise<FlaggedApprovalOutcome> {
+export async function approveFlaggedDiff(ctx: Ctx, job: Job, project: ProjectConfig, policy: PolicyInspection, decisions: { question: string; decision: string }[], requirements: string): Promise<FlaggedApprovalOutcome> {
   if (!aiApprovalEligible(ctx, project, policy)) return { kind: 'human', note: 'not eligible for second-review approval' };
-  if (isAiApproved(ctx, job, policy)) return { kind: 'approved', note: 'approved earlier for this exact diff' };
+  const scope = approvalScope(policy, requirements);
+  if (isAiApproved(ctx, job, policy, requirements)) return { kind: 'approved', note: 'approved earlier for this exact diff, findings and requirements' };
   const findings = policy.reasons.map((reason, i) => ({ id: `f${i + 1}`, reason }));
   const ticket = (await ctx.tracker.getTicket(job.ticket_id))!;
   const diff = await ctx.ws.diff(job.worktree!, job.base_branch!);
   const task = flaggedReviewTask({ repo: job.repo, ticket, candidateSha: job.candidate_sha!, findings, decisions, diff });
-  const r = await ask(ctx, job, `flagged-review:${job.id}:${policy.hash}`, 'policy.ai_review', task, (v) => ({ outcome: v.verdict, summary: v.summary }));
+  const r = await ask(ctx, job, `flagged-review:${job.id}:${scope}`, 'policy.ai_review', task, (v) => ({ outcome: v.verdict, summary: v.summary }));
   if (r.kind === 'waiting') return { kind: 'waiting' };
   if (r.kind === 'failed') return { kind: 'human', note: `second-review approval unavailable: ${r.message.slice(0, 300)}` };
   const v = r.value;
@@ -151,7 +158,7 @@ export async function approveFlaggedDiff(ctx: Ctx, job: Job, project: ProjectCon
     logEvent(ctx.db, 'policy.ai_escalated', `${job.ticket_identifier}: ${r.model} did not approve flagged diff ${policy.hash.slice(0, 12)}: ${v.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
     return { kind: 'human', note: `${r.model} did not approve the flagged change(s): ${v.summary}\n${detail}` };
   }
-  kvSet(ctx.db, aiApprovedKey(job, policy.hash), JSON.stringify({ model: r.model, summary: v.summary }));
+  kvSet(ctx.db, aiApprovedKey(job, scope), JSON.stringify({ model: r.model, summary: v.summary, hash: policy.hash, reasons: policy.reasons }));
   logEvent(ctx.db, 'policy.ai_approved', `${job.ticket_identifier}: flagged diff ${policy.hash.slice(0, 12)} approved by ${r.model} (owner-delegated): ${policy.reasons.length} finding(s)`, { jobId: job.id, ticketId: job.ticket_id });
   await ctx.tracker.comment(job.ticket_id, `🛡️ **Flagged-diff approval (${r.model}, delegated by the owner)** for diff ${policy.hash.slice(0, 12)}. CI, the Claude review and the second review still apply.\n\n${v.summary}\n${findings.map((f) => `- ${f.reason}`).join('\n')}`).catch(() => {});
   return { kind: 'approved', note: v.summary };
