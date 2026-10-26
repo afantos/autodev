@@ -122,6 +122,7 @@ export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { o
   if (placements > maxPlacements + 1) return { ok: false, reason: `${placements - 1} lockfile placements exceed the limit of ${maxPlacements}` };
   for (const [key, pkg] of Object.entries(lock.packages)) if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return { ok: false, reason: `lockfile entry "${key.slice(0, 80)}" is not an object` };
   const budget = newSpecBudget();
+  const bundled: Array<{ key: string; name: string; pkg: LockfilePackage }> = [];
   const entries: Artifact[] = [];
   const workspaceNames = new Set<string>();
   for (const [key, pkg] of Object.entries(lock.packages)) {
@@ -133,12 +134,8 @@ export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { o
   for (const [key, pkg] of Object.entries(lock.packages)) {
     const name = packageName(key);
     if (!name) continue;
-    // A bundled dependency ships inside its parent's tarball (whose integrity is verified); it has no URL or hash of its
-    // own and is never fetched, so it neither needs nor gets priming. It must still live under a parent's node_modules.
-    if (pkg.inBundle === true) {
-      if (!pkg.resolved && !pkg.integrity && key.split('node_modules/').length > 2) continue;
-      return { ok: false, reason: `"${name}" is marked inBundle but is not nested in a parent package or carries its own URL` };
-    }
+    // Bundled dependencies are decided after this loop, once every registry parent is known.
+    if (pkg.inBundle === true) { bundled.push({ key, name, pkg }); continue; }
     if (pkg.link || (!pkg.resolved && !pkg.integrity)) {
       // npm records a workspace package under node_modules/<name> as a link to its in-repo path; accept only those.
       if (workspaceNames.has(name) && (!pkg.resolved || !/^(https?:|git|file:)/i.test(pkg.resolved))) continue;
@@ -153,6 +150,18 @@ export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { o
     let specs: Record<string, string>;
     try { specs = readSpecs(pkg as unknown as Record<string, unknown>, budget, `"${name}"`); } catch (e) { return { ok: false, reason: String((e as Error).message) }; }
     entries.push({ key, name, version: pkg.version, resolved, integrity: pkg.integrity, specs });
+  }
+  // A bundled dependency ships inside its parent's tarball and is never fetched separately, so it is skipped, but only
+  // when its direct parent (the key up to the last "/node_modules/") is an accepted registry artifact (whose tarball,
+  // integrity and, when new or changed, registry identity are verified) or itself an accepted bundled entry of one.
+  // Orphans, parents that are workspaces or links, and bundled entries with their own URL or hash are refused.
+  const accepted = new Set(entries.map((e) => e.key));
+  for (const b of bundled.sort((x, y) => x.key.length - y.key.length)) {
+    if (b.pkg.resolved || b.pkg.integrity || b.pkg.link) return { ok: false, reason: `"${b.name}" is marked inBundle but carries its own URL, hash or link` };
+    const cut = b.key.lastIndexOf('/node_modules/');
+    const parent = cut < 0 ? '' : b.key.slice(0, cut);
+    if (!parent || !accepted.has(parent)) return { ok: false, reason: `"${b.name}" is marked inBundle but its parent "${parent || '(none)'}" is not a verified registry package` };
+    accepted.add(b.key);
   }
   return { ok: true, entries, names: new Set(entries.map((e) => e.name)) };
 }
