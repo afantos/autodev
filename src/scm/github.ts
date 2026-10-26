@@ -11,7 +11,7 @@ function split(repo: string) {
 
 /**
  * GitHub via a least-privilege bot token (fine-grained PAT of a machine user, or an App installation token):
- * contents rw, pull requests rw, checks/actions/statuses/deployments read. No admin, no bypass.
+ * contents rw, pull requests rw, actions rw (to re-run failed jobs), checks/statuses/deployments read. No admin, no bypass.
  */
 export class GitHubScm implements Scm {
   private gh: Octokit;
@@ -118,6 +118,23 @@ export class GitHubScm implements Scm {
     }
     if (relevant.some((c) => c.state === 'pending')) return { state: 'pending', failures: [], logExcerpt: '' };
     return { state: 'success', failures: [], logExcerpt: '' };
+  }
+
+  async rerunFailedJobs(repo: string, pr: PullRequest) {
+    const r = split(repo);
+    const { data } = await this.gh.actions.listWorkflowRunsForRepo({ ...r, head_sha: pr.headSha, per_page: 50 });
+    const failed = data.workflow_runs.filter((w) => w.status === 'completed' && ['failure', 'timed_out'].includes(w.conclusion ?? ''));
+    if (!failed.length) throw new Error(`no failed workflow run for ${pr.headSha.slice(0, 8)}`);
+    for (const w of failed) await this.gh.actions.reRunWorkflowFailedJobs({ ...r, run_id: w.id });
+    // Until GitHub registers the new attempt, the check runs still read as failed and the next poll would see the old
+    // failure as the retry's result: wait (bounded) for each run to leave "completed".
+    for (const w of failed) {
+      for (let i = 0; i < 10; i++) {
+        const run = (await this.gh.actions.getWorkflowRun({ ...r, run_id: w.id })).data;
+        if (run.status !== 'completed' || (run.run_attempt ?? 0) > (w.run_attempt ?? 0)) break;
+        await new Promise((res) => setTimeout(res, 3000));
+      }
+    }
   }
 
   async previewUrl(repo: string, pr: PullRequest): Promise<string | null> {

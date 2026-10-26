@@ -12,6 +12,8 @@ export interface Scm {
   updatePr(repo: string, number: number, patch: { title?: string; body?: string; base?: string }): Promise<void>;
   /** Aggregate CI state for the PR head commit. */
   checks(repo: string, pr: PullRequest, required: string[]): Promise<CheckResult>;
+  /** Re-run the failed GitHub Actions jobs of the PR head commit (flaky-CI retry). Resolves once the re-run is registered. */
+  rerunFailedJobs(repo: string, pr: PullRequest): Promise<void>;
   /** Preview deployment URL for the PR head, if a preview platform reported one. */
   previewUrl(repo: string, pr: PullRequest): Promise<string | null>;
   /** True if `branch`'s tip is contained in `base` (i.e. merged). */

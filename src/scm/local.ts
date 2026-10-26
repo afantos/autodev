@@ -77,6 +77,8 @@ export class LocalScm implements Scm {
     kvSet(this.db, key, JSON.stringify(res));
     return res;
   }
+  /** Local CI has no jobs to re-run: a no-op, so the cached result for this head stands. */
+  async rerunFailedJobs() {}
   async previewUrl() { return null; }
   async branchMerged(repo: string, branch: string, base: string) {
     const r = await run('git', ['merge-base', '--is-ancestor', `refs/heads/${branch}`, `refs/heads/${base}`], { cwd: resolve(repo) });

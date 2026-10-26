@@ -13,13 +13,14 @@ import { decisionsForTicket, recordHumanDecision, resolveQuestion } from './deci
 import { shellQuote, slugify, tail } from './exec.ts';
 import { similarity } from './planning.ts';
 import { LABEL_SUGGESTED } from './tracker/types.ts';
-import type { Job, PullRequest, Stage, Ticket } from './types.ts';
+import type { CheckResult, Job, PullRequest, Stage, Ticket } from './types.ts';
 import { STAGES } from './types.ts';
 import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
 import { conflictFeedback } from './automerge.ts';
+import { baseFailsNote, failingTestFilesOfChecks, inDiff, outsideDiffNote } from './ci-flake.ts';
 import { looksLikeOfflineMiss, planPrime, readBaseLockfile, readLockfileSafely } from './npm-cache-prime.ts';
 export { scanSecrets } from './secrets.ts';
 
@@ -236,7 +237,8 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       const checks = await scm.checks(job.repo, pr, project.requiredChecks);
       if (checks.state === 'pending') throw new Divert('wait_ci', 'waiting for CI');
       if (checks.state === 'failure') {
-        return feedbackLoop(ctx, job, 'ci', `GitHub CI failed on ${pr.headSha.slice(0, 8)}:\n${checks.failures.map((f) => `- ${f.name}: ${f.summary}`).join('\n')}\n\nLogs:\n${checks.logExcerpt || '(no logs available)'}`);
+        const note = await flakyCi(ctx, job, project, pr, checks);
+        return feedbackLoop(ctx, job, 'ci', `GitHub CI failed on ${pr.headSha.slice(0, 8)}:\n${checks.failures.map((f) => `- ${f.name}: ${f.summary}`).join('\n')}\n\nLogs:\n${checks.logExcerpt || '(no logs available)'}${note ? `\n\n${note}` : ''}`);
       }
       updateJob(db, job.id, { summary_json: mergeSummary(job, { ci: checks.state === 'none' ? 'no CI checks reported' : 'all checks passed' }) }, owner);
       return;
@@ -373,6 +375,50 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
     options: ['Remove or revise flagged changes', 'Approve this exact diff with /answer approve'],
     recommendation: 'Remove or revise flagged changes', decisionId: null,
   });
+}
+
+/**
+ * A CI failure confined to test files outside the candidate's diff may be a flaky test the agent cannot fix. The first
+ * time for a candidate, re-run the failed jobs and wait for CI again (diverts to waiting_ci). A second such failure is
+ * evidence of a deterministic one, so it goes to the agent with a neutral note (the tests may cover code it changed);
+ * only when the same tests also fail on the base branch's latest CI is it called likely pre-existing, and logged as
+ * `ci.flake_suspected` so an operator can file a ticket. Returns null when the failure is not of that kind.
+ */
+async function flakyCi(ctx: Ctx, job: Job, project: ProjectConfig, pr: PullRequest, checks: CheckResult): Promise<string | null> {
+  const { db, scm, ws } = ctx;
+  const files = failingTestFilesOfChecks(checks);
+  if (!files) return null;
+  const changed = await ws.changedFiles(job.worktree!, job.base_branch!);
+  if (files.some((f) => inDiff(f, changed))) return null;
+  const at = { jobId: job.id, ticketId: job.ticket_id };
+  const sha = pr.headSha.slice(0, 8);
+  const key = `ci-retry:${job.id}:${pr.headSha}`;
+  const earlier = kvGet(db, key);
+  if (!earlier) {
+    kvSet(db, key, JSON.stringify({ files, at: now(), rerun: true }));
+    try {
+      await scm.rerunFailedJobs(job.repo, pr);
+      logEvent(db, 'ci.flake_retry', `${job.ticket_identifier}: CI failed only in tests outside the diff (${files.join(', ')}); re-running the failed jobs once on ${sha}`, { ...at, level: 'warn', data: { sha: pr.headSha, files } });
+      throw new Divert('wait_ci', 're-running CI jobs that failed outside the diff');
+    } catch (e) {
+      if (e instanceof Divert) throw e;
+      kvSet(db, key, JSON.stringify({ files, at: now(), rerun: false }));
+      logEvent(db, 'ci.flake_retry_error', `${job.ticket_identifier}: could not re-run the failed jobs: ${String((e as Error)?.message ?? e).slice(0, 300)}`, { ...at, level: 'warn' });
+      return outsideDiffNote(files, false);
+    }
+  }
+  if ((JSON.parse(earlier) as { rerun?: boolean }).rerun === false) return outsideDiffNote(files, false);
+  const base = job.base_branch!;
+  const baseFiles = await scm.branchSha(job.repo, base)
+    .then((baseSha) => scm.checks(job.repo, { ...pr, headSha: baseSha, headBranch: base }, project.requiredChecks))
+    .then((c) => failingTestFilesOfChecks(c) ?? [])
+    .catch(() => [] as string[]);
+  if (files.every((f) => baseFiles.includes(f))) {
+    logEvent(db, 'ci.flake_suspected', `${job.ticket_identifier}: CI failed again after a re-run on ${sha}, only in tests outside the diff that also fail on ${base}: ${files.join(', ')}; consider a ticket`, { ...at, level: 'warn', data: { sha: pr.headSha, base, files } });
+    return baseFailsNote(files, base);
+  }
+  logEvent(db, 'ci.retry_failed', `${job.ticket_identifier}: CI failed again after a re-run on ${sha} in tests outside the diff (${files.join(', ')}); ${base} does not fail them, so the change is handed back to the agent`, { ...at, level: 'warn', data: { sha: pr.headSha, files } });
+  return outsideDiffNote(files, true);
 }
 
 /** Queue feedback for another implement pass, bounded by maxFixAttempts. */
