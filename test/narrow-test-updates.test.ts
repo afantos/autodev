@@ -651,3 +651,40 @@ test('regression (review of ee02fc1): ${…} code and quotes inside regexes cann
   // Proven string data stays exempt.
   for (const line of ["for (const raw of ['A\\tB', 'Ann\\u0000', 'A\\u007fB']) {", 'const t = `n ${x} \\u0000`;']) assert.equal(flagged(line), false, line);
 });
+
+test('regression: closing a multiline literal cannot hide executable escapes from the weakening check', async () => {
+  const { testWeakening } = await import('../src/policy.ts');
+  for (const source of [
+    'const first = `hello\n`; \\u0070rocess.exit(0); const second = `\nworld`;\n',
+    "const first = 'hello\\\n'; \\u0070rocess.exit(0); const second = '\\\nworld';\n",
+  ]) {
+    const lines = source.trimEnd().split('\n');
+    assert.ok(testWeakening('test/new.test.js', lines, false).some(r => /reaches the process/.test(r)));
+    assert.ok(testWeakening('test/new.test.js', lines, false, source).some(r => /reaches the process/.test(r)));
+    // An existing diff can contain just the closing line; its surrounding source must still be inspected.
+    assert.ok(testWeakening('test/existing.test.js', [lines[1]], true, source).some(r => /reaches the process/.test(r)));
+  }
+});
+
+test('full-source string exemptions preserve ordinary Unicode test data and fail closed on ambiguous source', async () => {
+  const { testWeakening } = await import('../src/policy.ts');
+  const line = "const input = 'Ann\\u0000';";
+  const source = `// A control-character fixture\n${line}\n`;
+  assert.deepEqual(testWeakening('test/new.test.js', source.trimEnd().split('\n'), false, source), []);
+  const invalid = `${source}const broken = ;\n`;
+  assert.ok(testWeakening('test/new.test.js', [line], false, invalid).some(r => /reaches the process/.test(r)));
+});
+
+test('e2e: a new test cannot hide an escaped early exit between multiline templates', async () => {
+  const e = makeEnv({ project: { protectTests: true }, behaviors: { coding: async s => {
+    writeFileSync(join(s.cwd, 'CHANGES.md'), 'implementation\n');
+    mkdirSync(join(s.cwd, 'test'), { recursive: true });
+    writeFileSync(join(s.cwd, 'test/hidden.test.js'), 'const first = `hello\n`; \\u0070rocess.exit(0); const second = `\nworld`;\n');
+    return {};
+  } } });
+  const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Feature', description: 'Do it.', status: 'ready', priority: 2 });
+  await cycles(e, 2);
+  assert.equal(job(e, t.identifier).status, 'blocked');
+  assert.match(job(e, t.identifier).blocked_reason, /reaches the process/);
+  assert.equal(job(e, t.identifier).pr_number, null);
+});

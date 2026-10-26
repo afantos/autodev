@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { analyzeTestUpdate } from './test-updates.ts';
+import { analyzeTestUpdate, lexLines, v8CodeAtBoundaries } from './test-updates.ts';
 import type { TestUpdateAnalysis } from './test-updates.ts';
 import { join } from 'node:path';
 import type { Config, ProjectConfig } from './config.ts';
@@ -151,12 +151,32 @@ export function withoutStringContents(line: string): string | null {
  * bypassable, e.g. a block comment opened before an existing test and closed after it. New test files are allowed,
  * but every added line is scanned for code that disables tests or replaces assertions.
  */
-export function testWeakening(file: string, addedLines: string[], existedOnBase: boolean): string[] {
+export function testWeakening(file: string, addedLines: string[], existedOnBase: boolean, fullSource?: string): string[] {
   const out = new Set<string>();
   if (existedOnBase) out.add(existingTestReason(file));
+  // A closing quote/backtick can look like an opening literal in a one-line scan. Only exempt literal data when
+  // the complete new file proves that line begins in code. Existing diffs may omit the opening literal, so they
+  // require the full candidate source. Repeated identical lines must ALL have a safe context.
+  const candidates = new Set(addedLines.filter(l => ESCAPED_IDENTIFIER.test(l) && !ESCAPED_IDENTIFIER.test(withoutStringContents(l) ?? l)));
+  const exempt = new Set<string>();
+  const source = fullSource ?? (existedOnBase ? undefined : addedLines.join('\n'));
+  if (source !== undefined && candidates.size) {
+    const lexical = lexLines(source);
+    if (lexical.ok) {
+      const lines = source.split('\n');
+      const positions = lines.flatMap((line, i) => candidates.has(line) ? [i] : []);
+      // At the production inspection boundary, cross-check the lexical context with V8, compiling but NEVER
+      // evaluating the candidate. Unit callers can still supply standalone line fragments without fullSource.
+      const proof = fullSource === undefined ? null : v8CodeAtBoundaries(source, /\.[cm]?ts$/.test(file), positions);
+      for (const line of candidates) {
+        const occurrences = positions.flatMap((position, i) => lines[position] === line ? [i] : []);
+        if (occurrences.length && occurrences.every(i => lexical.codeAtStart[positions[i]] && (proof === null || (proof.ok && proof.code[i])))) exempt.add(line);
+      }
+    }
+  }
   for (const l of addedLines) {
     for (const [re, why] of WEAKENING_ADDED) if (re.test(l)) out.add(`${file}: added test code ${why}`);
-    if (ESCAPED_IDENTIFIER.test(withoutStringContents(l) ?? l)) out.add(`${file}: added test code reaches the process object or runs dynamic code`);
+    if (ESCAPED_IDENTIFIER.test(exempt.has(l) ? withoutStringContents(l)! : l)) out.add(`${file}: added test code reaches the process object or runs dynamic code`);
   }
   return [...out];
 }
@@ -285,10 +305,10 @@ export async function inspectChanges(ws: Workspaces, worktree: string, base: str
     }
     if (project.protectTests && TEST_FILE.test(f)) {
       const existed = await exists(ref, f);
-      reasons.push(...testWeakening(f, lines, existed));
+      const after = await content(head, f);
+      reasons.push(...testWeakening(f, lines, existed, after ?? undefined));
       if (existed) {
         const before = await content(ref, f);
-        const after = await content(head, f);
         testUpdates.push({ file: f, ...(before === null || after === null ? { eligible: false, why: 'existing test file removed', changes: [] } : analyzeTestUpdate(before, after, f)) });
       }
     }
