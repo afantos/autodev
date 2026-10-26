@@ -349,10 +349,38 @@ test('planPrime: duplicate placements below the limit traverse a deduplicated gr
   const t0 = Date.now();
   const p = await planPrime(lock(pk), BASE, ['pg'], LIMITS, r.fetchPackument);
   assert.ok(p.ok, JSON.stringify(p).slice(0, 200)); assert.equal(p.artifacts.length, 2); assert.ok(Date.now() - t0 < 2_000);
-  // 4,000 placements of child@1.0.0 collapse to one node: a single traversal step, so a budget of 1 suffices
-  assert.ok((await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 1 }, r.fetchPackument)).ok, 'one step for 4,000 placements');
+  // 4,000 placements of child@1.0.0 collapse to one node: a handful of steps, independent of the placement count
+  assert.ok((await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 5 }, r.fetchPackument)).ok, 'a few steps for 4,000 placements');
   const tight = await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 0 }, r.fetchPackument);
   assert.ok(!tight.ok); assert.match(tight.reason, /work budget of 0 steps/);
+});
+
+test('planPrime: 400 versions of an unapproved package nobody depends on are refused without a single registry lookup', async () => {
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing') };
+  for (let i = 0; i < 400; i++) pk[`node_modules/x${i}/node_modules/evil`] = reg('evil', `1.0.${i}`);
+  const r = registry();
+  const p = await planPrime(lock(pk), BASE, [], { ...LIMITS, maxArtifacts: 1000 }, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /neither approved.*evil@1\.0\./);
+  assert.equal(r.calls.length, 0);
+});
+
+test('planPrime: huge registry dependency maps behind small declared edges are refused early, before all lookups', async () => {
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing') };
+  for (let i = 0; i < 20; i++) pk[`node_modules/p${i}`] = reg(`p${i}`);
+  const huge = Object.fromEntries([...Array(30_000)].map((_, j) => [`dep${j}`, '^1']));
+  const over: Record<string, Packument> = {};
+  for (let i = 0; i < 20; i++) over[`p${i}@1.0.0`] = { name: `p${i}`, version: '1.0.0', dist: { tarball: tarballUrl(`p${i}`, '1.0.0'), integrity: SRI(`p${i}@1.0.0`) }, dependencies: huge };
+  const r = registry(over);
+  const p = await planPrime(lock(pk), BASE, [...Array(20)].map((_, i) => `p${i}`), { ...LIMITS, maxArtifacts: 100 }, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /registry-declared dependency edges exceed|registry metadata exceeded|work budget/);
+  assert.ok(r.calls.length < 20, `stopped after ${r.calls.length} of 20 lookups`);
+});
+
+test('planPrime: a dependency that only becomes reachable through a verified parent is verified after it', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/child': reg('child'), 'node_modules/pg': reg('pg') });
+  const r = registry({}, { 'pg@1.0.0': { child: '^1' } });
+  const p = await planPrime(cand, BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(p.ok, JSON.stringify(p)); assert.deepEqual(r.calls, ['pg@1.0.0', 'child@1.0.0']);
 });
 
 // ---------------------------------------------------------------- reading the lockfile after untrusted commands ran

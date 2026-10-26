@@ -49,6 +49,7 @@ export interface PrimeLimits { maxArtifacts: number; maxBytes: number; deadlineM
 export const MAX_PLACEMENTS = 5_000;
 export const MAX_EDGES = 50_000;
 export const MAX_WORK = 1_000_000;
+export const MAX_PACKUMENT_TOTAL_BYTES = 20_000_000;
 export type PrimePlan =
   | { ok: true; artifacts: Artifact[]; newNames: string[]; totalEntries: number }
   | { ok: false; reason: string };
@@ -161,7 +162,32 @@ export async function planPrime(candidate: string, base: string | null, approved
   // under one overall deadline and the caller's abort signal.
   const deadline = AbortSignal.timeout(limits.deadlineMs ?? 5 * 60_000);
   const planSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  for (const e of changed) {
+  // Lazy, breadth-first verification: a changed entry is looked up only once its NAME is reachable, i.e. approved,
+  // already in the base lockfile, or a dependency name of an entry verified so far (or of an unchanged base entry).
+  // An unapproved package nothing depends on is refused without any registry request. Registry-derived edges and
+  // packument bytes are budgeted cumulatively, and every inspected spec counts against the work budget.
+  const candEntries = cand.entries;
+  const maxWork = limits.maxWork ?? MAX_WORK;
+  let work = 0;
+  let trustedEdgeCount = 0;
+  let packumentBytes = 0;
+  const reachableNames = new Set<string>([...approved, ...baseNames]);
+  for (const a of unchanged) for (const d of Object.keys(trusted.get(a) ?? {})) { if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` }; reachableNames.add(d); }
+  const pending = [...changed];
+  const order: Artifact[] = [];
+  for (let progressed = true; progressed;) {
+    progressed = false;
+    for (let i = 0; i < pending.length; i++) {
+      if (!reachableNames.has(pending[i]!.name)) continue;
+      const [e] = pending.splice(i--, 1) as [Artifact];
+      order.push(e); progressed = true;
+      // verify now so its dependency names can unlock further entries
+      const verdict = await verifyOne(e);
+      if (verdict) return verdict;
+    }
+  }
+  if (pending.length) return { ok: false, reason: `new packages are neither approved nor dependencies of approved/existing ones: ${pending.slice(0, 10).map((a) => `${a.name}@${a.version}`).join(', ')}${pending.length > 10 ? ', …' : ''}` };
+  async function verifyOne(e: Artifact): Promise<PrimePlan | null> {
     if (planSignal.aborted) return { ok: false, reason: signal?.aborted ? 'priming was cancelled' : `registry verification exceeded its deadline of ${Math.round((limits.deadlineMs ?? 300_000) / 1000)}s` };
     let p: Packument | null;
     try { p = await fetchPackument(e.name, e.version, planSignal); } catch (err) { return { ok: false, reason: planSignal.aborted && !signal?.aborted ? `registry verification exceeded its deadline` : `registry lookup failed for ${e.name}@${e.version}: ${String((err as Error)?.message ?? err).slice(0, 200)}` }; }
@@ -170,9 +196,15 @@ export async function planPrime(candidate: string, base: string | null, approved
     if (!p.dist?.tarball || !p.dist.tarball.startsWith(REGISTRY) || p.dist.tarball !== e.resolved) return { ok: false, reason: `${e.name}@${e.version}: lockfile tarball ${e.resolved} differs from the registry's ${p.dist?.tarball ?? '(none)'}` };
     if (!p.dist?.integrity || p.dist.integrity !== e.integrity) return { ok: false, reason: `${e.name}@${e.version}: lockfile integrity differs from the registry's` };
     if (typeof p.dist.unpackedSize === 'number') { e.unpackedSize = p.dist.unpackedSize; if (p.dist.unpackedSize > limits.maxBytes) return { ok: false, reason: `${e.name}@${e.version} unpacks to ${p.dist.unpackedSize} bytes, above the budget of ${limits.maxBytes}` }; }
+    packumentBytes += JSON.stringify(p).length;
+    if (packumentBytes > MAX_PACKUMENT_TOTAL_BYTES) return { ok: false, reason: `registry metadata exceeded its budget of ${MAX_PACKUMENT_TOTAL_BYTES} bytes` };
     const specs = specsOf(p);
+    trustedEdgeCount += Object.keys(specs).length;
+    if (trustedEdgeCount > MAX_EDGES) return { ok: false, reason: `registry-declared dependency edges exceed the limit of ${MAX_EDGES}` };
+    for (const d of Object.keys(specs)) { if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` }; reachableNames.add(d); }
     trusted.set(e, specs);
-    for (const dup of cand.entries) if (dup !== e && dup.name === e.name && dup.version === e.version) trusted.set(dup, specs);
+    for (const dup of candEntries) if (dup !== e && dup.name === e.name && dup.version === e.version) trusted.set(dup, specs);
+    return null;
   }
   // Artifact-level reachability over trusted specs: roots are approved names and artifacts the base already had
   // (same name, version, URL and integrity; their specs are now registry-verified when they differed).
@@ -191,13 +223,12 @@ export async function planPrime(candidate: string, base: string | null, approved
   }
   const byName = new Map<string, string[]>();
   for (const [k, n] of nodes) { const l = byName.get(n.name) ?? []; l.push(k); byName.set(n.name, l); }
-  const maxWork = limits.maxWork ?? MAX_WORK;
-  let work = 0;
   const reachable = new Set<string>(roots);
   const queue = [...roots];
   while (queue.length) {
     const parent = nodes.get(queue.pop()!)!;
     for (const [depName, spec] of Object.entries(parent.specs)) {
+      if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` };
       for (const k of byName.get(depName) ?? []) {
         if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` };
         if (!reachable.has(k) && specAuthorizes(depName, spec, nodes.get(k)!)) { reachable.add(k); queue.push(k); }
