@@ -385,16 +385,26 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
  * `ci.flake_suspected` so an operator can file a ticket. Returns null when the failure is not of that kind.
  */
 async function flakyCi(ctx: Ctx, job: Job, project: ProjectConfig, pr: PullRequest, checks: CheckResult): Promise<string | null> {
-  const { db, scm, ws } = ctx;
+  const { db, scm, ws, cfg } = ctx;
+  const key = `ci-retry:${job.id}:${pr.headSha}`;
+  const earlier = kvGet(db, key);
+  const retry = earlier ? JSON.parse(earlier) as { at: number; rerun?: boolean } : null;
+  // GitHub can register a re-run before its new check runs exist; until then the head still reports the failures the
+  // re-run was requested for. Those finished before the request: keep waiting (bounded by ciTimeoutMinutes) rather than
+  // read them as the re-run's result.
+  if (retry && retry.rerun !== false && checks.failures.some((f) => f.completedAt !== undefined && f.completedAt < retry.at)) {
+    if (now() - retry.at < cfg.limits.ciTimeoutMinutes * 60_000) throw new Divert('wait_ci', 'waiting for the re-run CI jobs to report');
+    kvSet(db, key, JSON.stringify({ ...retry, rerun: false }));
+    logEvent(db, 'ci.flake_retry_error', `${job.ticket_identifier}: the re-run CI jobs did not report within ${cfg.limits.ciTimeoutMinutes} minutes`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    retry.rerun = false;
+  }
   const files = failingTestFilesOfChecks(checks);
   if (!files) return null;
   const changed = await ws.changedFiles(job.worktree!, job.base_branch!);
   if (files.some((f) => inDiff(f, changed))) return null;
   const at = { jobId: job.id, ticketId: job.ticket_id };
   const sha = pr.headSha.slice(0, 8);
-  const key = `ci-retry:${job.id}:${pr.headSha}`;
-  const earlier = kvGet(db, key);
-  if (!earlier) {
+  if (!retry) {
     kvSet(db, key, JSON.stringify({ files, at: now(), rerun: true }));
     try {
       await scm.rerunFailedJobs(job.repo, pr);
@@ -407,7 +417,7 @@ async function flakyCi(ctx: Ctx, job: Job, project: ProjectConfig, pr: PullReque
       return outsideDiffNote(files, false);
     }
   }
-  if ((JSON.parse(earlier) as { rerun?: boolean }).rerun === false) return outsideDiffNote(files, false);
+  if (retry.rerun === false) return outsideDiffNote(files, false);
   const base = job.base_branch!;
   const baseFiles = await scm.branchSha(job.repo, base)
     .then((baseSha) => scm.checks(job.repo, { ...pr, headSha: baseSha, headBranch: base }, project.requiredChecks))

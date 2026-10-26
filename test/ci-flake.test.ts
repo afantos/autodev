@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { excerptCiLog } from '../src/ci-log.ts';
 import { failingTestFiles, failingTestFilesOfChecks, inDiff } from '../src/ci-flake.ts';
 import { GitHubScm } from '../src/scm/github.ts';
+import { updateJob } from '../src/db.ts';
 import { makeEnv, job } from './helpers.ts';
 import type { Env } from './helpers.ts';
 import type { CheckResult, PullRequest } from '../src/types.ts';
@@ -203,4 +204,63 @@ test('GitHub re-run that never registers throws, so the old failed attempt is no
   const { scm, calls, pr } = githubWithRun(Infinity);
   await assert.rejects(scm.rerunFailedJobs('o/r', pr), /did not register the re-run of workflow run 7/);
   assert.equal(calls.polls, 10);
+});
+
+/** A failure GitHub reports as finished at `completedAt` (here: long before any re-run request). */
+const failedAt = (logExcerpt: string, completedAt: number): CheckResult => ({ state: 'failure', failures: [{ name: 'test', summary: 'failure', completedAt }], logExcerpt });
+
+test('after a re-run, failures that finished before the request are the old attempt: keep waiting for the new one', async () => {
+  const e = makeEnv({ config: { loop: { ciPollSeconds: 0 } } });
+  const stale = failedAt(FLAKY, 1);
+  // checks() is called by the CI stage and by pollCi in turn: stage (fail → re-run), poll, stage, poll, stage.
+  const ci = scriptedCi(e, [stale, stale, stale, passed]);
+  const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Slow re-run', description: '', status: 'ready', priority: 2 });
+  await e.cycle();
+  assert.equal(job(e, t.identifier).status, 'waiting_ci');
+  assert.equal(ci.reruns.length, 1);
+
+  // The first report after the re-run still shows the old attempt's failure: not the re-run's result.
+  await e.orch.pollCi();
+  await e.orch.tick();
+  await e.orch.drain(Infinity);
+  let j = job(e, t.identifier);
+  assert.equal(j.status, 'waiting_ci', String(j.blocked_reason ?? j.error));
+  assert.equal(j.fix_attempts, 0);
+  assert.equal(events(e, 'ci.retry_failed').length + events(e, 'ci.flake_suspected').length + events(e, 'fix.ci').length, 0);
+
+  await e.cycle();
+  j = job(e, t.identifier);
+  assert.equal(j.status, 'awaiting_merge', String(j.blocked_reason ?? j.error));
+  assert.equal(ci.reruns.length, 1);
+});
+
+test('a re-run whose jobs never report within ciTimeoutMinutes counts as no re-run (neutral note)', async () => {
+  const e = makeEnv({ config: { loop: { ciPollSeconds: 0 }, limits: { ciTimeoutMinutes: 0 } } });
+  const ci = scriptedCi(e, [failedAt(FLAKY, 1)]);
+  const { j } = await failTwice(e);
+  assert.equal(ci.reruns.length, 1);
+  assert.match(events(e, 'ci.flake_retry_error')[0]?.message ?? '', /did not report within 0 minutes/);
+  assert.equal(events(e, 'ci.retry_failed').length, 0);
+  assert.equal(j.fix_attempts, 1);
+  assert.doesNotMatch(String(j.pending_feedback), /re-run on this commit|flaky|predates/);
+});
+
+test('a re-run request that fails after submitting is never repeated for the same head', async () => {
+  const e = makeEnv({ config: { loop: { ciPollSeconds: 0 } } });
+  scriptedCi(e, [failed(FLAKY)]);
+  let requests = 0;
+  e.ctx.scm.rerunFailedJobs = async () => { requests++; throw new Error('GitHub did not register the re-run of workflow run 7'); };
+  const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Timeout', description: '', status: 'ready', priority: 2 });
+  await e.cycle();
+  let j = job(e, t.identifier);
+  assert.equal(requests, 1);
+  assert.equal(j.fix_attempts, 1);
+  // The same head reaches the CI stage again (e.g. after a restart; a job resumes after its recorded stage): no second request.
+  updateJob(e.ctx.db, j.id, { status: 'queued', stage: 'pr' });
+  await e.orch.tick();
+  await e.orch.drain(Infinity);
+  j = job(e, t.identifier);
+  assert.equal(requests, 1);
+  assert.equal(j.fix_attempts, 2, String(j.blocked_reason ?? j.error));
+  assert.equal(events(e, 'ci.flake_retry_error').length, 1);
 });
