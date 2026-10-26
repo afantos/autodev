@@ -324,6 +324,37 @@ test('primeNpmCache: a tarball larger than the remaining budget is never written
   assert.equal(cacheBytes(cache), 0);
 });
 
+test('planPrime: optionalDependencies override dependencies for the same name, as in npm', async () => {
+  const cand = (v: string) => lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg'), 'node_modules/child': reg('child', v) });
+  const r = registry({ 'pg@1.0.0': { name: 'pg', version: '1.0.0', dist: { tarball: tarballUrl('pg', '1.0.0'), integrity: SRI('pg@1.0.0') }, dependencies: { child: '^1' }, optionalDependencies: { child: '^2' } } });
+  const one = await planPrime(cand('1.0.0'), BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(!one.ok, 'child@1 is not authorized: the optional ^2 spec wins'); assert.match(one.reason, /child@1\.0\.0/);
+  assert.ok((await planPrime(cand('2.0.0'), BASE, ['pg'], LIMITS, r.fetchPackument)).ok);
+});
+
+test('planPrime fails fast on tens of thousands of duplicate placements of one approved package', async () => {
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg', '1.0.0', { dependencies: { child: '^1' } }) };
+  for (let i = 0; i < 20_000; i++) pk[`node_modules/d${i}/node_modules/child`] = reg('child', '1.0.0', { dependencies: { child: '^1' } });
+  const r = registry({}, { 'pg@1.0.0': { child: '^1' }, 'child@1.0.0': { child: '^1' } });
+  const t0 = Date.now();
+  const p = await planPrime(lock(pk), BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /placements exceed the limit of 5000/);
+  assert.ok(Date.now() - t0 < 2_000, 'refused quickly'); assert.equal(r.calls.length, 0, 'before any registry request');
+});
+
+test('planPrime: duplicate placements below the limit traverse a deduplicated graph within the work budget', async () => {
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg', '1.0.0', { dependencies: { child: '^1' } }) };
+  for (let i = 0; i < 4_000; i++) pk[`node_modules/d${i}/node_modules/child`] = reg('child', '1.0.0');
+  const r = registry({}, { 'pg@1.0.0': { child: '^1' } });
+  const t0 = Date.now();
+  const p = await planPrime(lock(pk), BASE, ['pg'], LIMITS, r.fetchPackument);
+  assert.ok(p.ok, JSON.stringify(p).slice(0, 200)); assert.equal(p.artifacts.length, 2); assert.ok(Date.now() - t0 < 2_000);
+  // 4,000 placements of child@1.0.0 collapse to one node: a single traversal step, so a budget of 1 suffices
+  assert.ok((await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 1 }, r.fetchPackument)).ok, 'one step for 4,000 placements');
+  const tight = await planPrime(lock(pk), BASE, ['pg'], { ...LIMITS, maxWork: 0 }, r.fetchPackument);
+  assert.ok(!tight.ok); assert.match(tight.reason, /work budget of 0 steps/);
+});
+
 // ---------------------------------------------------------------- reading the lockfile after untrusted commands ran
 
 test('readLockfileSafely: regular file ok; absent → null; symlink, FIFO and oversized files are refused', () => {

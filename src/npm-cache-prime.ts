@@ -45,7 +45,10 @@ export interface Packument { name?: string; version?: string; dist?: { tarball?:
 export type FetchPackument = (name: string, version: string, signal?: AbortSignal) => Promise<Packument | null>;
 
 /** maxArtifacts bounds both registry verifications (every new or changed entry) and fetched tarballs; deadlineMs bounds planning. */
-export interface PrimeLimits { maxArtifacts: number; maxBytes: number; deadlineMs?: number }
+export interface PrimeLimits { maxArtifacts: number; maxBytes: number; deadlineMs?: number; maxPlacements?: number; maxWork?: number }
+export const MAX_PLACEMENTS = 5_000;
+export const MAX_EDGES = 50_000;
+export const MAX_WORK = 1_000_000;
 export type PrimePlan =
   | { ok: true; artifacts: Artifact[]; newNames: string[]; totalEntries: number }
   | { ok: false; reason: string };
@@ -66,7 +69,8 @@ export function tarballUrl(name: string, version: string): string {
 }
 
 function specsOf(p: { dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }): Record<string, string> {
-  return { ...(p.peerDependencies ?? {}), ...(p.optionalDependencies ?? {}), ...(p.dependencies ?? {}) };
+  // npm's precedence: an optionalDependencies entry overrides the same name in dependencies, so it is merged last.
+  return { ...(p.peerDependencies ?? {}), ...(p.dependencies ?? {}), ...(p.optionalDependencies ?? {}) };
 }
 
 /**
@@ -124,6 +128,11 @@ const sameSpecs = (a: Record<string, string>, b: Record<string, string>) => JSON
 export async function planPrime(candidate: string, base: string | null, approved: readonly string[], limits: PrimeLimits, fetchPackument: FetchPackument, signal?: AbortSignal): Promise<PrimePlan> {
   const cand = parseLockfile(candidate);
   if (!cand.ok) return cand;
+  // Bound the graph before any work: placements and declared edges, both untrusted input.
+  const maxPlacements = limits.maxPlacements ?? MAX_PLACEMENTS;
+  if (cand.entries.length > maxPlacements) return { ok: false, reason: `${cand.entries.length} lockfile placements exceed the limit of ${maxPlacements}` };
+  const declaredEdges = cand.entries.reduce((n, e) => n + Object.keys(e.specs).length, 0);
+  if (declaredEdges > MAX_EDGES) return { ok: false, reason: `${declaredEdges} declared dependency edges exceed the limit of ${MAX_EDGES}` };
   const baseParsed = base ? parseLockfile(base) : null;
   const baseByIdent = new Map<string, Artifact>();
   const baseNames = new Set<string>();
@@ -167,16 +176,35 @@ export async function planPrime(candidate: string, base: string | null, approved
   }
   // Artifact-level reachability over trusted specs: roots are approved names and artifacts the base already had
   // (same name, version, URL and integrity; their specs are now registry-verified when they differed).
-  const all = cand.entries;
-  const reachable = new Set<Artifact>([...unchanged, ...all.filter((a) => approved.includes(a.name) || baseByIdent.has(ident(a)))]);
-  const queue = [...reachable];
+  // The graph is deduplicated to name@version nodes (placements of one version share their trusted specs) and indexed
+  // by name, and every step counts against a work budget, so duplicated placements cannot blow up the traversal.
+  const nodeKey = (a: Artifact) => `${a.name}@${a.version}`;
+  const nodes = new Map<string, { name: string; version: string; specs: Record<string, string> }>();
+  const roots = new Set<string>();
+  for (const a of cand.entries) {
+    const k = nodeKey(a);
+    const specs = trusted.get(a) ?? {};
+    const prev = nodes.get(k);
+    if (!prev) nodes.set(k, { name: a.name, version: a.version, specs: { ...specs } });
+    else for (const [d, r] of Object.entries(specs)) if (!(d in prev.specs)) prev.specs[d] = r;
+    if (approved.includes(a.name) || baseByIdent.has(ident(a))) roots.add(k);
+  }
+  const byName = new Map<string, string[]>();
+  for (const [k, n] of nodes) { const l = byName.get(n.name) ?? []; l.push(k); byName.set(n.name, l); }
+  const maxWork = limits.maxWork ?? MAX_WORK;
+  let work = 0;
+  const reachable = new Set<string>(roots);
+  const queue = [...roots];
   while (queue.length) {
-    const parent = queue.shift()!;
-    for (const [depName, spec] of Object.entries(trusted.get(parent) ?? {})) {
-      for (const child of all) if (!reachable.has(child) && specAuthorizes(depName, spec, child)) { reachable.add(child); queue.push(child); }
+    const parent = nodes.get(queue.pop()!)!;
+    for (const [depName, spec] of Object.entries(parent.specs)) {
+      for (const k of byName.get(depName) ?? []) {
+        if (++work > maxWork) return { ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` };
+        if (!reachable.has(k) && specAuthorizes(depName, spec, nodes.get(k)!)) { reachable.add(k); queue.push(k); }
+      }
     }
   }
-  const unreachable = toFetch.filter((a) => !reachable.has(a));
+  const unreachable = toFetch.filter((a) => !reachable.has(nodeKey(a)));
   if (unreachable.length) return { ok: false, reason: `new packages are neither approved nor dependencies of approved/existing ones: ${unreachable.slice(0, 10).map((a) => `${a.name}@${a.version}`).join(', ')}${unreachable.length > 10 ? ', …' : ''}` };
   return { ok: true, artifacts: toFetch, newNames, totalEntries: cand.entries.length };
 }
