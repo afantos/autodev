@@ -35,22 +35,22 @@ projects:
 
   # luckywinclub (Linear team LWC, repo afantos/luckywinclub), onboarded 2026-10-25. The repository starts
   # with documents only; the scaffold (package.json, tsconfig, ESLint, node:test) is the first ticket.
-  # setup/validate stay empty and autoMerge off until that ticket merges and the offline npm cache is seeded;
-  # then set setup/validate/npmCacheDir like poker's and review autoMerge.
+  # Scaffold merged 2026-10-26 (LWC-9, main 312d81a): setup/validate are live; the npm cache is operator-seeded from the lockfile.
+  # autoMerge stays off until the owner has seen a few supervised tickets through.
   - key: luckywinclub
     repo: afantos/luckywinclub
     linear:
       teamKey: LWC
-    setup: []                                        # after the scaffold: ["npm ci --offline --no-audit"]
-    # npmCacheDir: /opt/autodev/instance/cache/luckywinclub/npm   # seed from the scaffold's package-lock.json first
-    validate: []                                     # after the scaffold: typecheck, lint, test, build
+    setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
+    npmCacheDir: /opt/autodev/instance/cache/luckywinclub/npm   # operator-seeded from luckywinclub's package-lock.json (2026-10-26, main 312d81a)
+    validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # offline, unit-level only (ADR 0001); Compose/Playwright run in GitHub CI
     requiredChecks: ["checks"]                       # .github/workflows/ci.yml, required by branch protection
     env:
       NODE_ENV: test
     maxConcurrent: 1
     stackedBranches: false
     approvedDependencies: []                         # the scaffold's dev dependencies go through human review (package.json is protected)
-    humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/']
+    humanReviewPaths: ['(^|/)package\.json$', '(^|/)package-lock\.json$', '(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/']
     protectTests: true
     autoMerge: false                                 # supervised until the scaffold merges and validation runs in the sandbox
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr]
