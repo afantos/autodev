@@ -30,7 +30,8 @@ projects:
     # Clean PRs merge without a human: CI, Claude review, second review (secondReview below), policy clean, up to date.
     # Anything the policy flags still waits for a human. Needs GITHUB_REVIEWER_TOKEN and OPENAI_API_KEY in .env.
     autoMerge: true
-    docs: [CLAUDE.md, README.md, GLOSSARY.md, docs/mvp-spec.md, docs/adr]
+    # docs/online-play-tickets.md gives reviewers each ticket's scope (e.g. MP-16 owns real-clock timers, not MP-10).
+    docs: [CLAUDE.md, README.md, GLOSSARY.md, docs/mvp-spec.md, docs/adr, docs/online-play-tickets.md]
 
 linear:
   states:                                # must match your Linear workflow state names
