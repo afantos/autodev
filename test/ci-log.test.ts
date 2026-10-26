@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { cleanCiLog, excerptCiLog } from '../src/ci-log.ts';
+import { cleanCiLog, collapseRepeats, excerptCiLog } from '../src/ci-log.ts';
 
 // 2026-10-26 (luckywinclub LWC-29): the agent received the last 5,000 characters of the integration job log, which were
 // all Postgres container output from `docker compose logs`; the node:test failure report sat just above. It blocked
@@ -69,4 +69,32 @@ test('real log with an assertion failure: the excerpt is the summary through ##[
   assert.match(ex, /expected: 'America\/New_York'/);
   assert.match(ex, /##\[error\]Process completed with exit code 1\.$/);
   assert.doesNotMatch(ex, /Post job cleanup|safe\.directory|Cleaning up orphan processes/);
+});
+
+test('real log with 11 repeated hook errors above the summary (LWC-27): the cause survives the budget', () => {
+  const raw = readFileSync(new URL('./fixtures/ci-hook-error-repeated.log', import.meta.url), 'utf8');
+  const ex = excerptCiLog(raw, 5000);
+  assert.ok(ex.length <= 5000);
+  assert.match(ex, /Test hook "before" at test-integration\/entry-concurrency\.test\.ts:11:3/);
+  assert.match(ex, /terminating connection due to administrator command/);
+  assert.match(ex, /repeated \d+×/);
+  assert.match(ex, /✖ failing tests:/);
+  assert.ok(ex.length > 600, `a useful excerpt, not just the summary (${ex.length} chars)`);
+});
+
+test('collapseRepeats folds repeated lines and repeated blocks, ignoring durations', () => {
+  assert.deepEqual(collapseRepeats(['a', 'b', 'b', 'b', 'c']), ['a', 'b', '… (the line above repeated 3×)', 'c']);
+  assert.deepEqual(collapseRepeats(['x (1ms)', 'y', 'x (2ms)', 'y', 'z']), ['x (1ms)', 'y', '… (the 2 lines above repeated 2×)', 'z']);
+  assert.deepEqual(collapseRepeats(['a', 'b', 'c']), ['a', 'b', 'c']);
+});
+
+test('over budget, the windows nearest the summary are kept and earlier ones dropped', () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 30; i++) lines.push(`not ok ${i} - early failure ${i}`, ...[...Array(5)].map((_, j) => `detail ${i}.${j} ${'x'.repeat(40)}`), ...[...Array(30)].map((_, j) => `filler ${i}.${j}`));
+  lines.push('AssertionError: the real cause', '✖ failing tests:', 'test at a.test.ts:1:1');
+  const ex = excerptCiLog(lines.join('\n'), 2000, 3);
+  assert.ok(ex.length <= 2000);
+  assert.match(ex, /AssertionError: the real cause/);
+  assert.match(ex, /✖ failing tests:/);
+  assert.doesNotMatch(ex, /early failure 0\b/, 'the oldest windows are the ones dropped');
 });

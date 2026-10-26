@@ -27,8 +27,36 @@ export function cleanCiLog(raw: string): string[] {
     if (!line || COMPOSE.test(line) || NOISE.test(line)) continue;
     out.push(line);
   }
+  return collapseRepeats(out);
+}
+
+/**
+ * Collapse runs of repeated lines and repeated multi-line blocks (node:test prints the same hook error once per test
+ * in the file) into one copy plus a "(repeated N×)" note, so one cause cannot crowd every other line out of the budget.
+ */
+export function collapseRepeats(lines: string[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    let best = 1; let bestCount = 1;
+    for (let size = 1; size <= 12 && i + size * 2 <= lines.length; size++) {
+      let count = 1;
+      while (i + size * (count + 1) <= lines.length && sameBlock(lines, i, i + size * count, size)) count++;
+      if (count > 1 && count * size > bestCount * best) { best = size; bestCount = count; }
+    }
+    for (let k = 0; k < best; k++) out.push(lines[i + k]!);
+    if (bestCount > 1) out.push(`… (the ${best === 1 ? 'line' : `${best} lines`} above repeated ${bestCount}×)`);
+    i += best * bestCount;
+  }
   return out;
 }
+
+function sameBlock(lines: string[], a: number, b: number, size: number): boolean {
+  for (let k = 0; k < size; k++) if (normalize(lines[a + k]!) !== normalize(lines[b + k]!)) return false;
+  return true;
+}
+/** Near-identical: ignore durations and pids that differ between repeats. */
+const normalize = (l: string) => l.replace(/\(\d+(?:\.\d+)?ms\)/g, '(…ms)').replace(/\[\d+\]/g, '[…]');
 
 export function excerptCiLog(raw: string, max = 5000, window = 25): string {
   const lines = cleanCiLog(raw);
@@ -40,9 +68,22 @@ export function excerptCiLog(raw: string, max = 5000, window = 25): string {
     // The summary ends where the step fails (##[error]) or GitHub's post-job steps begin; what follows is runner noise.
     const stop = lines.findIndex((l, i) => i > summary && (/^##\[error\]/.test(l) || /^Post job cleanup\./.test(l)));
     const tailPart = lines.slice(summary, stop < 0 ? undefined : stop + (/^##\[error\]/.test(lines[stop] ?? '') ? 1 : 0)).join('\n');
-    const before = markedWindows(lines.slice(0, summary), window).join('\n');
-    const combined = before ? `${before}\n…\n${tailPart}` : tailPart;
-    return clip(combined.length <= max ? combined : tailPart);
+    // Fill the remaining budget with the marker windows nearest the summary (walking backwards), so the cause that
+    // node:test printed just above it survives even when everything earlier does not fit.
+    const windows = markedWindows(lines.slice(0, summary), window);
+    const kept: string[] = [];
+    let used = tailPart.length;
+    for (let k = windows.length - 1; k >= 0; k--) {
+      const w = windows[k]!;
+      const cost = w.length + 3;
+      if (used + cost > max) {
+        const room = max - used - 30;
+        if (room > 200 && !kept.length) kept.unshift('… ' + w.slice(w.length - room)); // at least the nearest window, trimmed from its start
+        break;
+      }
+      kept.unshift(w); used += cost;
+    }
+    return clip(kept.length ? `${kept.join('\n…\n')}\n…\n${tailPart}` : tailPart);
   }
   const windows = markedWindows(lines, window);
   if (windows.length) return clip(windows.join('\n…\n'));
