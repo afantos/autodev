@@ -52,7 +52,7 @@ projects:
     setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
     npmCacheDir: /opt/autodev/instance/cache/luckywinclub/npm   # operator-seeded from luckywinclub's package-lock.json (2026-10-26, main 312d81a)
     validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # offline, unit-level only (ADR 0001); Compose/Playwright run in GitHub CI
-    requiredChecks: ["checks"]                       # .github/workflows/ci.yml, required by branch protection
+    requiredChecks: ["checks", "integration"]        # both required by branch protection (integration = Postgres via Compose, since PR #12)
     env:
       NODE_ENV: test
     maxConcurrent: 1
