@@ -152,7 +152,8 @@ export function parseLockfile(text: string, maxPlacements = MAX_PLACEMENTS): { o
 }
 
 const ident = (a: Artifact) => `${a.name}@${a.version}|${a.resolved}|${a.integrity}`;
-const sameSpecs = (a: Record<string, string>, b: Record<string, string>) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+/** Canonical string of a spec map (sorted entries). Each call is O(map size); callers memoize and charge work. */
+const canon = (m: Record<string, string>) => JSON.stringify(Object.entries(m).sort());
 
 /**
  * Decide what may be primed. Pure apart from the registry lookups, which go through `fetchPackument` (seam for tests).
@@ -167,19 +168,44 @@ export async function planPrime(candidate: string, base: string | null, approved
   const baseByIdent = new Map<string, Artifact>();
   const baseNames = new Set<string>();
   if (baseParsed?.ok) for (const e of baseParsed.entries) { baseByIdent.set(ident(e), e); baseNames.add(e.name); }
+  // The deadline and the work counter exist from here on: classification below is charged too.
+  const deadline = AbortSignal.timeout(limits.deadlineMs ?? 5 * 60_000);
+  const planSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const maxWork = limits.maxWork ?? MAX_WORK;
+  let work = 0;
+  const overWork = (): PrimePlan => ({ ok: false, reason: `dependency graph traversal exceeded its work budget of ${maxWork} steps` });
   // Trusted specs per artifact: from the base lockfile for unchanged entries, from the registry for new/changed ones.
+  // Each base artifact's canonical specs are computed once; each candidate placement is canonicalized once (the total
+  // is bounded by parseLockfile's edge/byte budget) and every spec examined is charged to the work budget.
   const trusted = new Map<Artifact, Record<string, string>>();
   const unchanged: Artifact[] = [];
   const changed: Artifact[] = [];
-  const seen = new Set<string>();
+  const firstChanged = new Map<string, Artifact>();
+  const baseCanon = new Map<string, string>();
+  const verdicts = new Map<string, boolean>();
   for (const e of cand.entries) {
-    const b = baseByIdent.get(ident(e));
-    if (b && sameSpecs(b.specs, e.specs)) { trusted.set(e, b.specs); unchanged.push(e); continue; }
+    const id0 = ident(e);
+    const b = baseByIdent.get(id0);
+    if (b) {
+      work += 1 + Object.keys(e.specs).length;
+      if (work > maxWork) return overWork();
+      const candCanon = canon(e.specs);
+      const memoKey = `${id0}\u0000${candCanon}`;
+      let same = verdicts.get(memoKey);
+      if (same === undefined) {
+        let bc = baseCanon.get(id0);
+        if (bc === undefined) { work += Object.keys(b.specs).length; if (work > maxWork) return overWork(); bc = canon(b.specs); baseCanon.set(id0, bc); }
+        same = bc === candCanon; verdicts.set(memoKey, same);
+      }
+      if (same) { trusted.set(e, b.specs); unchanged.push(e); continue; }
+    }
     const id = `${e.name}@${e.version}`;
-    if (seen.has(id)) { const first = changed.find((c) => `${c.name}@${c.version}` === id)!; trusted.set(e, trusted.get(first) ?? {}); continue; }
-    seen.add(id);
+    const first = firstChanged.get(id);
+    if (first) { trusted.set(e, trusted.get(first) ?? {}); continue; }
+    firstChanged.set(id, e);
     changed.push(e);
   }
+  if (planSignal.aborted) return { ok: false, reason: signal?.aborted ? 'priming was cancelled' : 'registry verification exceeded its deadline' };
   const newNames = [...cand.names].filter((n) => !baseNames.has(n));
   // Artifacts to fetch: new name@version tarballs. A base artifact whose only change is its declared specs is
   // re-verified against the registry (below) but its tarball is already in the cache.
@@ -189,15 +215,11 @@ export async function planPrime(candidate: string, base: string | null, approved
   if (changed.length > limits.maxArtifacts) return { ok: false, reason: `${changed.length} new or changed lockfile entries exceed the limit of ${limits.maxArtifacts} registry verifications` };
   // Registry verification of every new/changed entry: identity, tarball, integrity, size hint and trusted specs,
   // under one overall deadline and the caller's abort signal.
-  const deadline = AbortSignal.timeout(limits.deadlineMs ?? 5 * 60_000);
-  const planSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
   // Lazy, breadth-first verification: a changed entry is looked up only once its NAME is reachable, i.e. approved,
   // already in the base lockfile, or a dependency name of an entry verified so far (or of an unchanged base entry).
   // An unapproved package nothing depends on is refused without any registry request. Registry-derived edges and
   // packument bytes are budgeted cumulatively, and every inspected spec counts against the work budget.
   const candEntries = cand.entries;
-  const maxWork = limits.maxWork ?? MAX_WORK;
-  let work = 0;
   let trustedEdgeCount = 0;
   const registryBudget = newSpecBudget();
   let packumentBytes = 0;

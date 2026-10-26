@@ -429,6 +429,20 @@ test('planPrime: a registry packument with a malformed dependency map is refused
   assert.ok(!p.ok); assert.match(p.reason, /registry-declared .*not a plain object/);
 });
 
+test('planPrime: a large base spec map with thousands of altered duplicate placements is canonicalized once, within the work budget', async () => {
+  const bigSpecs = Object.fromEntries([...Array(8_000)].map((_, j) => [`dep${j}`, '^1']));
+  const base = lock({ 'node_modules/existing': reg('existing', '1.0.0', { dependencies: bigSpecs }) });
+  const pk: Record<string, object> = { 'node_modules/existing': reg('existing', '1.0.0', { dependencies: { altered: '^1' } }) };
+  for (let i = 0; i < 4_900; i++) pk[`node_modules/d${i}/node_modules/existing`] = reg('existing', '1.0.0', { dependencies: { altered: '^1' } });
+  const r = registry({}, { 'existing@1.0.0': { altered: '^1' } });
+  const t0 = Date.now();
+  const p = await planPrime(lock(pk), base, [], LIMITS, r.fetchPackument);
+  assert.ok(p.ok, JSON.stringify(p).slice(0, 200)); assert.ok(Date.now() - t0 < 2_000, `classified in ${Date.now() - t0} ms`);
+  assert.equal(r.calls.length, 1, 'the altered base artifact is re-verified once');
+  const tight = await planPrime(lock(pk), base, [], { ...LIMITS, maxWork: 5_000 }, r.fetchPackument);
+  assert.ok(!tight.ok); assert.match(tight.reason, /work budget/);
+});
+
 // ---------------------------------------------------------------- reading the lockfile after untrusted commands ran
 
 test('readLockfileSafely: regular file ok; absent → null; symlink, FIFO and oversized files are refused', () => {
