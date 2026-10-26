@@ -1,7 +1,7 @@
+import { excerptCiLog } from '../ci-log.ts';
 import { Octokit } from '@octokit/rest';
 import type { CheckFailure, CheckResult, PullRequest } from '../types.ts';
 import type { Scm } from './types.ts';
-import { tail } from '../exec.ts';
 
 function split(repo: string) {
   const [owner, name] = repo.split('/');
@@ -111,7 +111,7 @@ export class GitHubScm implements Scm {
         if (!c.jobId) continue;
         try {
           const res = await this.gh.request('GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs', { ...r, job_id: c.jobId });
-          logs += `\n===== ${c.name} =====\n${tail(String(res.data), 5000)}`;
+          logs += `\n===== ${c.name} =====\n${excerptCiLog(String(res.data), 5000)}`;
         } catch { /* logs may be unavailable; summary still helps */ }
       }
       return { state: 'failure', failures, logExcerpt: logs };
