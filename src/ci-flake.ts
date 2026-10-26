@@ -28,6 +28,9 @@ export function failingTestFiles(excerpt: string): string[] {
  */
 export function failingTestFilesOfChecks(checks: CheckResult): string[] | null {
   if (checks.state !== 'failure' || !checks.failures.length) return null;
+  // Logs are matched to checks by name: two failing checks with one name (different workflows) cannot be told apart.
+  const names = checks.failures.map((f) => f.name);
+  if (new Set(names).size !== names.length) return null;
   // GitHubScm prefixes each failing job's excerpt with "===== <check name> ====="; LocalScm reports one unlabelled check.
   const sections = new Map<string, string[]>();
   let current: string | null = checks.failures.length === 1 ? checks.failures[0]!.name : null;
