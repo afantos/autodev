@@ -67,6 +67,8 @@ export interface CheckFailure {
   name: string;
   summary: string;
   detailsUrl?: string;
+  /** When the failing check finished (ms since epoch), if the SCM reports it. */
+  completedAt?: number;
 }
 
 export interface CheckResult {

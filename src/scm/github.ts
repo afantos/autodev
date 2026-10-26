@@ -86,7 +86,7 @@ export class GitHubScm implements Scm {
     const r = split(repo);
     const runs = await this.gh.paginate(this.gh.checks.listForRef, { ...r, ref: pr.headSha, per_page: 100 });
     const statuses = (await this.gh.repos.getCombinedStatusForRef({ ...r, ref: pr.headSha })).data.statuses;
-    type C = { name: string; state: 'pending' | 'success' | 'failure'; summary: string; url?: string; jobId?: number };
+    type C = { name: string; state: 'pending' | 'success' | 'failure'; summary: string; url?: string; jobId?: number; completedAt?: number };
     const all: C[] = [
       ...runs.map((c) => ({
         name: c.name,
@@ -94,8 +94,9 @@ export class GitHubScm implements Scm {
         summary: `${c.conclusion ?? c.status}${c.output?.title ? `: ${c.output.title}` : ''}${c.output?.summary ? `\n${c.output.summary.slice(0, 800)}` : ''}`,
         url: c.details_url ?? undefined,
         jobId: c.app?.slug === 'github-actions' ? c.id : undefined,
+        completedAt: c.completed_at ? Date.parse(c.completed_at) : undefined,
       })),
-      ...statuses.map((s) => ({ name: s.context, state: (s.state === 'success' ? 'success' : s.state === 'pending' ? 'pending' : 'failure') as C['state'], summary: s.description ?? s.state, url: s.target_url ?? undefined })),
+      ...statuses.map((s) => ({ name: s.context, state: (s.state === 'success' ? 'success' : s.state === 'pending' ? 'pending' : 'failure') as C['state'], summary: s.description ?? s.state, url: s.target_url ?? undefined, completedAt: s.updated_at ? Date.parse(s.updated_at) : undefined })),
     ];
     const relevant = required.length ? all.filter((c) => required.includes(c.name)) : all;
     if (required.length && required.some((n) => !all.some((c) => c.name === n))) {
@@ -105,7 +106,7 @@ export class GitHubScm implements Scm {
     if (!relevant.length) return { state: 'none', failures: [], logExcerpt: '' };
     const failing = relevant.filter((c) => c.state === 'failure');
     if (failing.length) {
-      const failures: CheckFailure[] = failing.map((c) => ({ name: c.name, summary: c.summary, detailsUrl: c.url }));
+      const failures: CheckFailure[] = failing.map((c) => ({ name: c.name, summary: c.summary, detailsUrl: c.url, ...(c.completedAt ? { completedAt: c.completedAt } : {}) }));
       let logs = '';
       for (const c of failing.slice(0, 3)) {
         if (!c.jobId) continue;
