@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, cpSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, cpSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import semver from 'semver';
@@ -23,7 +23,9 @@ import type { ExecResult } from './exec.ts';
  *  3. reachability is artifact-level: a parent authorizes a child only when the child's name is the spec's target
  *     (npm: aliases and non-registry specs authorize nothing) and the child's version satisfies the spec's range.
  *     Roots are approved names and artifacts unchanged from the base lockfile. Anything unreachable → refused;
- *  4. only the verified tarballs are fetched, one `npm cache add <exact URL>` each into a scratch cache, with
+ *  4. only the verified tarballs are fetched: streamed by the orchestrator itself (registry host, no redirects,
+ *     aborted past the remaining byte budget), checked against the lockfile integrity, then ingested offline with
+ *     `npm cache add <local file>` into a scratch cache, with
  *     --ignore-scripts, two distinct empty config files, an explicit registry, a scratch HOME and an environment of
  *     PATH/HOME/TMPDIR only, under a per-call timeout. The scratch cache must then hold content for the lockfile's
  *     sha512 and stay within the byte budget; only then is it promoted into the shared cache. No manifest ever
@@ -40,9 +42,10 @@ export interface Lockfile { lockfileVersion?: number; packages?: Record<string, 
 /** A registry entry of the candidate lockfile that passed the shape checks; `specs` are its declared dependency specs. */
 export interface Artifact { key: string; name: string; version: string; resolved: string; integrity: string; specs: Record<string, string>; unpackedSize?: number }
 export interface Packument { name?: string; version?: string; dist?: { tarball?: string; integrity?: string; unpackedSize?: number }; dependencies?: Record<string, string>; optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
-export type FetchPackument = (name: string, version: string) => Promise<Packument | null>;
+export type FetchPackument = (name: string, version: string, signal?: AbortSignal) => Promise<Packument | null>;
 
-export interface PrimeLimits { maxArtifacts: number; maxBytes: number }
+/** maxArtifacts bounds both registry verifications (every new or changed entry) and fetched tarballs; deadlineMs bounds planning. */
+export interface PrimeLimits { maxArtifacts: number; maxBytes: number; deadlineMs?: number }
 export type PrimePlan =
   | { ok: true; artifacts: Artifact[]; newNames: string[]; totalEntries: number }
   | { ok: false; reason: string };
@@ -74,8 +77,9 @@ export function specAuthorizes(depName: string, spec: string, child: { name: str
   if (child.name !== depName) return false;
   const s = spec.trim();
   if (!s || /^(npm:|git|github:|gitlab:|bitbucket:|gist:|https?:|file:|link:|workspace:|\.|\/)/i.test(s)) return false;
-  if (!semver.validRange(s, { includePrerelease: true })) return false;
-  return semver.satisfies(child.version, s, { includePrerelease: true });
+  // npm's own semantics: a prerelease satisfies a range only when the range names a prerelease of that tuple.
+  if (!semver.validRange(s)) return false;
+  return semver.satisfies(child.version, s);
 }
 
 /** Parse and shape-check a lockfile. Returns the registry entries or the first refusal. */
@@ -117,7 +121,7 @@ const sameSpecs = (a: Record<string, string>, b: Record<string, string>) => JSON
  * Decide what may be primed. Pure apart from the registry lookups, which go through `fetchPackument` (seam for tests).
  * `base` is the base branch's lockfile text (null when the base has none).
  */
-export async function planPrime(candidate: string, base: string | null, approved: readonly string[], limits: PrimeLimits, fetchPackument: FetchPackument): Promise<PrimePlan> {
+export async function planPrime(candidate: string, base: string | null, approved: readonly string[], limits: PrimeLimits, fetchPackument: FetchPackument, signal?: AbortSignal): Promise<PrimePlan> {
   const cand = parseLockfile(candidate);
   if (!cand.ok) return cand;
   const baseParsed = base ? parseLockfile(base) : null;
@@ -142,11 +146,16 @@ export async function planPrime(candidate: string, base: string | null, approved
   // re-verified against the registry (below) but its tarball is already in the cache.
   const toFetch = changed.filter((e) => !baseByIdent.has(ident(e)));
   if (!changed.length) return { ok: true, artifacts: [], newNames: [], totalEntries: cand.entries.length };
-  if (toFetch.length > limits.maxArtifacts) return { ok: false, reason: `${toFetch.length} new or changed artifacts exceed the limit of ${limits.maxArtifacts}` };
-  // Registry verification of every new/changed entry: identity, tarball, integrity, size hint and trusted specs.
+  // Every changed entry costs one registry request, so bound them all (spec-only edits included) before any request.
+  if (changed.length > limits.maxArtifacts) return { ok: false, reason: `${changed.length} new or changed lockfile entries exceed the limit of ${limits.maxArtifacts} registry verifications` };
+  // Registry verification of every new/changed entry: identity, tarball, integrity, size hint and trusted specs,
+  // under one overall deadline and the caller's abort signal.
+  const deadline = AbortSignal.timeout(limits.deadlineMs ?? 5 * 60_000);
+  const planSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
   for (const e of changed) {
+    if (planSignal.aborted) return { ok: false, reason: signal?.aborted ? 'priming was cancelled' : `registry verification exceeded its deadline of ${Math.round((limits.deadlineMs ?? 300_000) / 1000)}s` };
     let p: Packument | null;
-    try { p = await fetchPackument(e.name, e.version); } catch (err) { return { ok: false, reason: `registry lookup failed for ${e.name}@${e.version}: ${String((err as Error)?.message ?? err).slice(0, 200)}` }; }
+    try { p = await fetchPackument(e.name, e.version, planSignal); } catch (err) { return { ok: false, reason: planSignal.aborted && !signal?.aborted ? `registry verification exceeded its deadline` : `registry lookup failed for ${e.name}@${e.version}: ${String((err as Error)?.message ?? err).slice(0, 200)}` }; }
     if (!p) return { ok: false, reason: `${e.name}@${e.version} is not on the registry` };
     if (p.name !== e.name || p.version !== e.version) return { ok: false, reason: `registry packument for ${e.name}@${e.version} describes ${p.name}@${p.version}` };
     if (!p.dist?.tarball || !p.dist.tarball.startsWith(REGISTRY) || p.dist.tarball !== e.resolved) return { ok: false, reason: `${e.name}@${e.version}: lockfile tarball ${e.resolved} differs from the registry's ${p.dist?.tarball ?? '(none)'}` };
@@ -182,10 +191,11 @@ export function packumentUrl(name: string, version: string): string {
  * The registry packument for one exact version via global fetch: registry.npmjs.org only, no redirects followed,
  * a timeout and a streamed response size cap. Anything else throws, which the planner reports as a refusal.
  */
-export async function fetchRegistryPackument(name: string, version: string, timeoutMs = 20_000): Promise<Packument | null> {
+export async function fetchRegistryPackument(name: string, version: string, signal?: AbortSignal, timeoutMs = 20_000): Promise<Packument | null> {
   const url = packumentUrl(name, version);
   if (!url.startsWith(REGISTRY)) throw new Error(`refusing non-registry URL ${url}`);
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'application/json' }, redirect: 'error' });
+  const per = AbortSignal.timeout(timeoutMs);
+  const res = await fetch(url, { signal: signal ? AbortSignal.any([signal, per]) : per, headers: { accept: 'application/json' }, redirect: 'error' });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   const length = Number(res.headers.get('content-length') ?? 0);
@@ -241,8 +251,11 @@ export interface PrimeRequest {
   cacheDir: string;
   timeoutMs: number;
   maxBytes: number;
+  signal?: AbortSignal;
   /** Test seam: the command runner (defaults to exec.run). */
   exec?: typeof run;
+  /** Test seam: HTTP fetch (defaults to global fetch). */
+  fetchImpl?: typeof fetch;
 }
 export type PrimeOutcome =
   | { ok: true; artifacts: number; bytesAdded: number; durationMs: number; command: string[] }
@@ -269,12 +282,20 @@ export async function primeNpmCache(req: PrimeRequest): Promise<PrimeOutcome> {
   let command: string[] = [];
   try {
     for (const a of req.artifacts) {
+      // 1. Download the exact verified URL ourselves: registry host only, no redirects, aborted past the remaining
+      //    budget, then check the bytes against the lockfile integrity. npm never touches the network.
+      const tgz = join(scratch, `artifact-${done}.tgz`);
+      const dl = await downloadCapped(a.resolved, tgz, req.maxBytes - bytes, req.timeoutMs, req.signal, req.fetchImpl ?? fetch);
+      if (!dl.ok) return { ok: false, reason: `${a.name}@${a.version}: ${dl.reason}`, artifacts: done, bytesAdded: bytes };
+      if (!integrityMatches(readFileSync(tgz), a.integrity)) return { ok: false, reason: `${a.name}@${a.version}: the downloaded bytes do not match the lockfile's integrity (registry served different bytes?)`, artifacts: done, bytesAdded: bytes };
+      // 2. Ingest the verified local file into a scratch cache, offline.
       const stage = join(scratch, `stage-${done}`); mkdirSync(stage);
-      const args = ['cache', 'add', a.resolved, ...npmIsolationArgs(scratch, stage)];
+      const args = ['cache', 'add', tgz, '--offline', ...npmIsolationArgs(scratch, stage)];
       command = ['npm', ...args];
       const r: ExecResult = await exec('npm', args, { cwd: scratch, timeoutMs: req.timeoutMs, env: { PATH: process.env.PATH ?? '', HOME: home, TMPDIR: scratch, npm_config_cache: stage } });
       if (r.code !== 0) return { ok: false, reason: `npm cache add ${a.name}@${a.version} exited ${r.code}${r.timedOut ? ' (timed out)' : ''}: ${(r.stderr || r.stdout).slice(-800)}`, artifacts: done, bytesAdded: bytes };
-      if (!existsSync(contentPath(stage, a.integrity))) return { ok: false, reason: `${a.name}@${a.version}: the fetched content does not match the lockfile's integrity (registry served different bytes?)`, artifacts: done, bytesAdded: bytes };
+      if (!existsSync(contentPath(stage, a.integrity))) return { ok: false, reason: `${a.name}@${a.version}: the cache holds no content for the lockfile's integrity after ingesting the verified file`, artifacts: done, bytesAdded: bytes };
+      rmSync(tgz, { force: true });
       const size = cacheBytes(stage);
       if (bytes + size > req.maxBytes) return { ok: false, reason: `priming would exceed the byte budget (${bytes + size} > ${req.maxBytes}) at ${a.name}@${a.version}; nothing from it was promoted`, artifacts: done, bytesAdded: bytes };
       // Promote: cacache paths are content/key hashed, so merging the staged tree into the shared cache is safe.
@@ -287,6 +308,44 @@ export async function primeNpmCache(req: PrimeRequest): Promise<PrimeOutcome> {
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/** Stream `url` (registry tarballs only) into `dest`, aborting past `cap` bytes, the timeout or the caller's signal. */
+export async function downloadCapped(url: string, dest: string, cap: number, timeoutMs: number, signal: AbortSignal | undefined, fetchImpl: typeof fetch): Promise<{ ok: true; bytes: number } | { ok: false; reason: string }> {
+  if (!url.startsWith(REGISTRY) || !/\.tgz$/.test(url)) return { ok: false, reason: `refusing to download ${url}` };
+  if (cap <= 0) return { ok: false, reason: 'the byte budget is used up' };
+  const ctrl = new AbortController();
+  const per = AbortSignal.timeout(timeoutMs);
+  const combined = AbortSignal.any([ctrl.signal, per, ...(signal ? [signal] : [])]);
+  let fd: number | null = null;
+  try {
+    const res = await fetchImpl(url, { signal: combined, redirect: 'error' });
+    if (!res.ok || !res.body) return { ok: false, reason: `HTTP ${res.status} for ${url}` };
+    const declared = Number(res.headers.get('content-length') ?? 0);
+    if (declared > cap) { ctrl.abort(); return { ok: false, reason: `tarball is ${declared} bytes, over the remaining budget of ${cap}` }; }
+    fd = openSync(dest, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    const reader = res.body.getReader();
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > cap) { await reader.cancel().catch(() => {}); ctrl.abort(); return { ok: false, reason: `download cut off past the remaining budget of ${cap} bytes` }; }
+      writeSync(fd, value);
+    }
+    return { ok: true, bytes: total };
+  } catch (e) {
+    return { ok: false, reason: combined.aborted && per.aborted ? `download timed out after ${timeoutMs} ms` : `download failed: ${String((e as Error)?.message ?? e).slice(0, 200)}` };
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/** Does `bytes` match the SRI string (sha256/384/512)? */
+export function integrityMatches(bytes: Buffer, integrity: string): boolean {
+  const [algo, b64] = integrity.split('-', 2) as [string, string];
+  if (!['sha256', 'sha384', 'sha512'].includes(algo)) return false;
+  return createHash(algo).update(bytes).digest('base64') === b64;
 }
 
 /** cacache content path for an SRI string: content-v2/<algo>/<hex 0-2>/<hex 2-4>/<hex 4->. */

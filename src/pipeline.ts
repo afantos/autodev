@@ -408,11 +408,11 @@ async function primeCacheForCandidate(ctx: Ctx, job: Job, project: ProjectConfig
   if (!candidateLock) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: no package-lock.json in the candidate`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: 'no package-lock.json in the candidate' }; }
   const baseLock = job.base_sha ? await readBaseLockfile(job.worktree!, job.base_sha) : null;
   const limits = { maxArtifacts: project.npmCachePrimeMaxArtifacts, maxBytes: Math.round(project.npmCachePrimeMaxMb * 1e6) };
-  const plan = await planPrime(candidateLock, baseLock, project.approvedDependencies, limits, ctx.fetchPackument);
+  const plan = await planPrime(candidateLock, baseLock, project.approvedDependencies, { ...limits, deadlineMs: project.npmCachePrimeTimeoutMinutes * 60_000 }, ctx.fetchPackument, signal);
   if (!plan.ok) { logEvent(db, 'cache.prime.refused', `${job.ticket_identifier}: ${plan.reason}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: plan.reason }; }
   if (!plan.artifacts.length) return { primed: false, note: 'the lockfile adds or changes no registry packages, so the cache is not the cause' };
   signal.throwIfAborted();
-  const out = await ctx.primeNpmCache({ artifacts: plan.artifacts, cacheDir, timeoutMs: project.npmCachePrimeTimeoutMinutes * 60_000, maxBytes: limits.maxBytes });
+  const out = await ctx.primeNpmCache({ artifacts: plan.artifacts, cacheDir, timeoutMs: project.npmCachePrimeTimeoutMinutes * 60_000, maxBytes: limits.maxBytes, signal });
   if (!out.ok) { logEvent(db, 'cache.prime.failed', `${job.ticket_identifier}: ${out.reason.slice(0, 400)} (${out.artifacts} artifact(s), ${(out.bytesAdded / 1e6).toFixed(1)} MB added before stopping)`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' }); return { primed: false, note: `npm failed: ${out.reason.slice(0, 300)}` }; }
   kvSet(db, key, 'primed');
   logEvent(db, 'cache.primed', `${job.ticket_identifier}: ${out.artifacts} artifact(s) fetched for ${plan.newNames.length} new package(s) of ${plan.totalEntries} entries (${(out.bytesAdded / 1e6).toFixed(1)} MB added, ${Math.round(out.durationMs / 1000)}s): ${plan.newNames.slice(0, 12).join(', ')}${plan.newNames.length > 12 ? ', …' : ''}`, { jobId: job.id, ticketId: job.ticket_id });

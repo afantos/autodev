@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, symlinkSync, readFil
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { REGISTRY, MAX_PACKUMENT_BYTES, cacheBytes, contentPath, looksLikeOfflineMiss, npmIsolationArgs, packageName, packumentUrl, parseLockfile, planPrime, primeNpmCache, readCapped, readLockfileSafely, specAuthorizes, sriOf, tarballUrl } from '../src/npm-cache-prime.ts';
+import { REGISTRY, MAX_PACKUMENT_BYTES, cacheBytes, contentPath, downloadCapped, integrityMatches, looksLikeOfflineMiss, npmIsolationArgs, packageName, packumentUrl, parseLockfile, planPrime, primeNpmCache, readCapped, readLockfileSafely, specAuthorizes, sriOf, tarballUrl } from '../src/npm-cache-prime.ts';
 import type { Artifact, Packument } from '../src/npm-cache-prime.ts';
 import { makeEnv, job } from './helpers.ts';
 import { answerBlocked } from '../src/pipeline.ts';
@@ -144,8 +144,8 @@ test('planPrime bounds artifacts by new/changed name@version placements, not nam
     'node_modules/existing/node_modules/d': reg('d', '1.0.1'), 'apps/web/node_modules/d': reg('d', '1.0.2'),
   });
   const r = registry({}, { 'existing@1.0.0': { d: '^1' } });
-  assert.ok(!(await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 2 }, r.fetchPackument)).ok, '3 new artifacts (3 versions of d) exceed 2');
-  const ok = await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 3 }, r.fetchPackument);
+  assert.ok(!(await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 3 }, r.fetchPackument)).ok, '4 registry verifications (existing with new specs + 3 versions of d) exceed 3');
+  const ok = await planPrime(cand, BASE, [], { ...LIMITS, maxArtifacts: 4 }, r.fetchPackument);
   assert.ok(ok.ok, JSON.stringify(ok)); assert.equal(ok.artifacts.length, 3, 'existing@1.0.0 is re-verified but not fetched again');
   assert.ok(r.calls.includes('existing@1.0.0'), 'the base entry with new specs was re-verified against the registry');
 });
@@ -163,28 +163,44 @@ function fakeExec(cache: string, opts: { bytesPerAdd?: number; skipContent?: boo
     calls.push({ args, opts: o });
     assert.equal(cmd, 'npm');
     if (opts.fail) return { code: 1, stdout: '', stderr: 'npm ERR! 503', timedOut: false, truncated: false };
-    const url = args[2]!;
+    const local = args[2]!;
+    assert.ok(!local.startsWith('http'), 'npm only ever ingests a local, already verified file');
+    assert.ok(args.includes('--offline'), 'npm runs offline');
     const stage = args[args.indexOf('--cache') + 1]!;
     assert.notEqual(stage, cache, 'npm writes into a staged cache, never straight into the shared one');
     if (!opts.skipContent) {
-      // simulate npm storing the tarball under the content path of the integrity the test registry agrees on
-      const name = url.slice(REGISTRY.length).split('/-/')[0]!; const version = url.match(/-(\d[^/]*)\.tgz$/)![1]!;
-      const p = contentPath(stage, SRI(`${name}@${version}`)); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, Buffer.alloc(opts.bytesPerAdd ?? 100));
+      // simulate npm storing the file under the content path of its own sha512
+      const p = contentPath(stage, sriOf(readFileSync(local))); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, Buffer.alloc(opts.bytesPerAdd ?? 100));
     }
     return { code: 0, stdout: '', stderr: '', timedOut: false, truncated: false };
   };
   return { exec, calls };
+}
+/** A fake tarball server: the body is the bytes art() hashes into its integrity, unless overridden. */
+function tarballs(over: Record<string, Buffer | { status: number }> = {}) {
+  const urls: string[] = [];
+  const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
+    const url = String(input); urls.push(url);
+    assert.equal(init?.redirect, 'error', 'redirects are never followed');
+    const name = url.slice(REGISTRY.length).split('/-/')[0]!; const version = url.match(/-(\d[^/]*)\.tgz$/)![1]!;
+    const o = over[`${name}@${version}`];
+    if (o && !Buffer.isBuffer(o)) return new Response(null, { status: o.status });
+    return new Response(new Uint8Array(o ?? Buffer.from(`${name}@${version}`)), { status: 200 });
+  }) as typeof fetch;
+  return { fetchImpl, urls };
 }
 const art = (name: string, v = '1.0.0'): Artifact => ({ key: `node_modules/${name}`, name, version: v, resolved: tarballUrl(name, v), integrity: SRI(`${name}@${v}`), specs: {} });
 
 test('primeNpmCache: one `npm cache add <exact URL>` per artifact with --ignore-scripts, null configs, the registry and a clean environment', async () => {
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
   const f = fakeExec(cache);
-  const out = await primeNpmCache({ artifacts: [art('pg'), art('pg-pool')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: f.exec as never });
+  const t = tarballs();
+  const out = await primeNpmCache({ artifacts: [art('pg'), art('pg-pool')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: f.exec as never, fetchImpl: t.fetchImpl });
+  assert.deepEqual(t.urls, [tarballUrl('pg', '1.0.0'), tarballUrl('pg-pool', '1.0.0')], 'only the exact verified URLs are requested');
   assert.ok(out.ok, JSON.stringify(out)); assert.equal(out.artifacts, 2); assert.equal(out.bytesAdded, 200);
   assert.equal(f.calls.length, 2);
   for (const [i, c] of f.calls.entries()) {
-    assert.deepEqual(c.args.slice(0, 3), ['cache', 'add', tarballUrl(i === 0 ? 'pg' : 'pg-pool', '1.0.0')]);
+    assert.deepEqual(c.args.slice(0, 2), ['cache', 'add']); assert.ok(c.args[2]!.endsWith('.tgz') && !c.args[2]!.startsWith('http'));
     for (const flag of ['--ignore-scripts', '--no-audit', '--no-fund']) assert.ok(c.args.includes(flag), flag);
     const user = c.args[c.args.indexOf('--userconfig') + 1]!; const global = c.args[c.args.indexOf('--globalconfig') + 1]!;
     assert.notEqual(user, global, 'distinct config files (npm refuses to double-load one path)');
@@ -201,17 +217,17 @@ test('primeNpmCache: one `npm cache add <exact URL>` per artifact with --ignore-
 
 test('primeNpmCache fails closed when the cache holds no content for the lockfile integrity after the add', async () => {
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
-  const out = await primeNpmCache({ artifacts: [art('pg')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { skipContent: true }).exec as never });
-  assert.ok(!out.ok); assert.match(out.reason, /does not match the lockfile's integrity/);
+  const out = await primeNpmCache({ artifacts: [art('pg')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { skipContent: true }).exec as never, fetchImpl: tarballs().fetchImpl });
+  assert.ok(!out.ok); assert.match(out.reason, /no content for the lockfile's integrity/);
 });
 
 test('primeNpmCache stops at the byte budget and reports npm failures', async () => {
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
   const f = fakeExec(cache, { bytesPerAdd: 600 });
-  const out = await primeNpmCache({ artifacts: [art('a'), art('b'), art('c')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1000, exec: f.exec as never });
+  const out = await primeNpmCache({ artifacts: [art('a'), art('b'), art('c')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1000, exec: f.exec as never, fetchImpl: tarballs().fetchImpl });
   assert.ok(!out.ok); assert.match(out.reason, /byte budget/); assert.equal(f.calls.length, 2, 'stopped at the add that would cross the budget');
   assert.equal(cacheBytes(cache), 600, 'only the first artifact was promoted; the over-budget one never reached the shared cache');
-  const bad = await primeNpmCache({ artifacts: [art('a')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { fail: true }).exec as never });
+  const bad = await primeNpmCache({ artifacts: [art('a')], cacheDir: cache, timeoutMs: 1000, maxBytes: 1e6, exec: fakeExec(cache, { fail: true }).exec as never, fetchImpl: tarballs().fetchImpl });
   assert.ok(!bad.ok); assert.match(bad.reason, /exited 1.*503/s);
 });
 
@@ -258,6 +274,56 @@ test('planPrime refuses an artifact whose registry unpackedSize exceeds the byte
   assert.ok(!p.ok); assert.match(p.reason, /unpacks to 5000000 bytes/);
 });
 
+test('specAuthorizes uses npm semver semantics: an ordinary range never admits a prerelease, an explicit one does', () => {
+  assert.ok(!specAuthorizes('dep', '^1.2.0', { name: 'dep', version: '1.9.0-attacker.0' }));
+  assert.ok(!specAuthorizes('dep', '>=1.0.0', { name: 'dep', version: '2.0.0-rc.1' }));
+  assert.ok(specAuthorizes('dep', '^1.2.0-beta.1', { name: 'dep', version: '1.2.0-beta.3' }), 'same-tuple prerelease named by the range');
+  assert.ok(!specAuthorizes('dep', '^1.2.0-beta.1', { name: 'dep', version: '1.3.0-beta.1' }), 'other-tuple prerelease');
+});
+
+test('planPrime refuses many spec-only changes before any registry access', async () => {
+  const basePk: Record<string, object> = {}; const candPk: Record<string, object> = {};
+  for (let i = 0; i < 50; i++) { basePk[`node_modules/b${i}`] = reg(`b${i}`); candPk[`node_modules/b${i}`] = reg(`b${i}`, '1.0.0', { dependencies: { x: '^1' } }); }
+  const r = registry();
+  const p = await planPrime(lock(candPk), lock(basePk), [], { maxArtifacts: 1, maxBytes: 1e6 }, r.fetchPackument);
+  assert.ok(!p.ok); assert.match(p.reason, /50 new or changed lockfile entries exceed the limit of 1/);
+  assert.equal(r.calls.length, 0, 'no registry request was made');
+});
+
+test('planPrime stops at its deadline and on the caller\'s abort signal, passing the signal to each lookup', async () => {
+  const cand = lock({ 'node_modules/existing': reg('existing'), 'node_modules/pg': reg('pg'), 'node_modules/pg-pool': reg('pg-pool') });
+  const seen: Array<AbortSignal | undefined> = [];
+  const slow = async (_n: string, _v: string, signal?: AbortSignal) => { seen.push(signal); await new Promise((res, rej) => { const t = setTimeout(res, 5_000); signal?.addEventListener('abort', () => { clearTimeout(t); rej(new Error('aborted')); }); }); return null; };
+  const t0 = Date.now();
+  const p = await planPrime(cand, BASE, ['pg'], { maxArtifacts: 10, maxBytes: 1e6, deadlineMs: 100 }, slow);
+  assert.ok(!p.ok); assert.match(p.reason, /deadline/); assert.ok(Date.now() - t0 < 2_000); assert.ok(seen[0] instanceof AbortSignal);
+  const ctrl = new AbortController(); ctrl.abort();
+  const q = await planPrime(cand, BASE, ['pg'], LIMITS, registry().fetchPackument, ctrl.signal);
+  assert.ok(!q.ok); assert.match(q.reason, /cancelled/);
+});
+
+test('downloadCapped cuts an oversized response off at the cap and refuses non-registry URLs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dl-'));
+  let pulled = 0;
+  const endless = (async () => new Response(new ReadableStream<Uint8Array>({ pull(c) { pulled += 1024; c.enqueue(new Uint8Array(1024)); } }), { status: 200 })) as unknown as typeof fetch;
+  const r = await downloadCapped(tarballUrl('big', '1.0.0'), join(dir, 'a.tgz'), 4096, 5_000, undefined, endless);
+  assert.ok(!r.ok); assert.match(r.reason, /cut off past the remaining budget of 4096/); assert.ok(pulled <= 4096 + 2048, 'stopped reading right after the cap');
+  const declared = (async () => new Response('x', { status: 200, headers: { 'content-length': '999999' } })) as unknown as typeof fetch;
+  const d = await downloadCapped(tarballUrl('big', '1.0.0'), join(dir, 'b.tgz'), 4096, 5_000, undefined, declared);
+  assert.ok(!d.ok); assert.match(d.reason, /over the remaining budget/);
+  const other = await downloadCapped('https://evil.example/x.tgz', join(dir, 'c.tgz'), 4096, 5_000, undefined, declared);
+  assert.ok(!other.ok); assert.match(other.reason, /refusing to download/);
+  assert.ok(integrityMatches(Buffer.from('abc'), sriOf(Buffer.from('abc'))) && !integrityMatches(Buffer.from('abd'), sriOf(Buffer.from('abc'))));
+});
+
+test('primeNpmCache: a tarball larger than the remaining budget is never written past the cap nor promoted', async () => {
+  const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
+  const huge = tarballs({ 'pg@1.0.0': Buffer.alloc(50_000) });
+  const out = await primeNpmCache({ artifacts: [art('pg')], cacheDir: cache, timeoutMs: 1000, maxBytes: 10_000, exec: fakeExec(cache).exec as never, fetchImpl: huge.fetchImpl });
+  assert.ok(!out.ok); assert.match(out.reason, /cut off past the remaining budget/);
+  assert.equal(cacheBytes(cache), 0);
+});
+
 // ---------------------------------------------------------------- reading the lockfile after untrusted commands ran
 
 test('readLockfileSafely: regular file ok; absent → null; symlink, FIFO and oversized files are refused', () => {
@@ -297,20 +363,20 @@ test('real npm: a local tarball staged through primeNpmCache lands in the shared
   execFileSync('tar', ['-czf', join(scratch, 'fixture.tgz'), '-C', scratch, 'pkg']);
   const bytes = readFileSync(join(scratch, 'fixture.tgz'));
   const cache = mkdtempSync(join(tmpdir(), 'prime-cache-'));
-  // exec seam: the same real npm, but with the exact URL swapped for the local tarball so no network is used
+  // fetch seam serves the fixture bytes; npm itself runs for real (offline) on the verified local file
+  const fetchImpl = (async () => new Response(bytes, { status: 200 })) as unknown as typeof fetch;
   const exec = async (cmd: string, args: string[], o: Record<string, unknown> = {}): Promise<ExecResult> => {
-    const swapped = args.map((a) => (a === tarballUrl('lwc-fixture', '1.0.0') ? join(scratch, 'fixture.tgz') : a));
-    try { const stdout = execFileSync(cmd, [...swapped, '--offline'], { encoding: 'utf8', cwd: String(o.cwd), env: o.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] }); return { code: 0, stdout, stderr: '', timedOut: false, truncated: false }; }
+    try { const stdout = execFileSync(cmd, args, { encoding: 'utf8', cwd: String(o.cwd), env: o.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'] }); return { code: 0, stdout, stderr: '', timedOut: false, truncated: false }; }
     catch (e) { const err = e as { status?: number; stdout?: string; stderr?: string }; return { code: err.status ?? 1, stdout: String(err.stdout ?? ''), stderr: String(err.stderr ?? ''), timedOut: false, truncated: false }; }
   };
   const artifact: Artifact = { key: 'node_modules/lwc-fixture', name: 'lwc-fixture', version: '1.0.0', resolved: tarballUrl('lwc-fixture', '1.0.0'), integrity: sriOf(bytes), specs: {} };
-  const out = await primeNpmCache({ artifacts: [artifact], cacheDir: cache, timeoutMs: 60_000, maxBytes: 10_000_000, exec: exec as never });
+  const out = await primeNpmCache({ artifacts: [artifact], cacheDir: cache, timeoutMs: 60_000, maxBytes: 10_000_000, exec: exec as never, fetchImpl });
   assert.ok(out.ok, JSON.stringify(out));
   assert.ok(existsSync(contentPath(cache, sriOf(bytes))), 'content stored under the tarball sha512 in the shared cache');
   assert.ok(out.bytesAdded > 0);
   const wrong: Artifact = { ...artifact, integrity: sriOf(Buffer.from('not the tarball')) };
-  const bad = await primeNpmCache({ artifacts: [wrong], cacheDir: mkdtempSync(join(tmpdir(), 'prime-cache-')), timeoutMs: 60_000, maxBytes: 10_000_000, exec: exec as never });
-  assert.ok(!bad.ok); assert.match(bad.reason, /does not match the lockfile's integrity/);
+  const bad = await primeNpmCache({ artifacts: [wrong], cacheDir: mkdtempSync(join(tmpdir(), 'prime-cache-')), timeoutMs: 60_000, maxBytes: 10_000_000, exec: exec as never, fetchImpl });
+  assert.ok(!bad.ok); assert.match(bad.reason, /downloaded bytes do not match the lockfile's integrity/);
 });
 
 // ---------------------------------------------------------------- pipeline: an offline miss primes once, then setup is retried
