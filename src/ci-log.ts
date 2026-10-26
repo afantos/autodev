@@ -37,7 +37,9 @@ export function excerptCiLog(raw: string, max = 5000, window = 25): string {
   if (summary >= 0) {
     // The summary lists every failure with its location and error; keep the earlier per-test diagnostics too when
     // they fit, since hook errors ("generated asynchronous activity after the test ended") are reported above it.
-    const tailPart = lines.slice(summary).join('\n');
+    // The summary ends where the step fails (##[error]) or GitHub's post-job steps begin; what follows is runner noise.
+    const stop = lines.findIndex((l, i) => i > summary && (/^##\[error\]/.test(l) || /^Post job cleanup\./.test(l)));
+    const tailPart = lines.slice(summary, stop < 0 ? undefined : stop + (/^##\[error\]/.test(lines[stop] ?? '') ? 1 : 0)).join('\n');
     const before = markedWindows(lines.slice(0, summary), window).join('\n');
     const combined = before ? `${before}\n…\n${tailPart}` : tailPart;
     return clip(combined.length <= max ? combined : tailPart);

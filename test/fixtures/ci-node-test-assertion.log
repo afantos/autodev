@@ -1,0 +1,640 @@
+﻿2026-10-26T16:52:22.9575750Z Current runner version: '2.338.0'
+2026-10-26T16:52:22.9607726Z ##[group]Runner Image Provisioner
+2026-10-26T16:52:22.9608744Z Hosted Compute Agent
+2026-10-26T16:52:22.9609529Z Version: 20261021.618
+2026-10-26T16:52:22.9610358Z Commit: 21505ad2541d5be6135ed84fc33697146cf75b8e
+2026-10-26T16:52:22.9611260Z Build Date: 2026-10-21T00:45:21Z
+2026-10-26T16:52:22.9612233Z Worker ID: {a104ae2d-926a-46c5-af47-263db1aa62a5}
+2026-10-26T16:52:22.9613128Z Region: eastus
+2026-10-26T16:52:22.9613905Z Cloud: Azure
+2026-10-26T16:52:22.9614804Z ##[endgroup]
+2026-10-26T16:52:22.9616562Z ##[group]Operating System
+2026-10-26T16:52:22.9617364Z Ubuntu
+2026-10-26T16:52:22.9618002Z 24.04.5
+2026-10-26T16:52:22.9618694Z LTS
+2026-10-26T16:52:22.9619360Z ##[endgroup]
+2026-10-26T16:52:22.9620118Z ##[group]Runner Image
+2026-10-26T16:52:22.9620883Z Image: ubuntu-24.04
+2026-10-26T16:52:22.9621616Z Version: 20261012.334.1
+2026-10-26T16:52:22.9623269Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md
+2026-10-26T16:52:22.9625620Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261012.334
+2026-10-26T16:52:22.9626946Z ##[endgroup]
+2026-10-26T16:52:22.9628446Z ##[group]GITHUB_TOKEN Permissions
+2026-10-26T16:52:22.9630732Z Contents: read
+2026-10-26T16:52:22.9631505Z Metadata: read
+2026-10-26T16:52:22.9632190Z ##[endgroup]
+2026-10-26T16:52:22.9634807Z Secret source: Actions
+2026-10-26T16:52:22.9636025Z Cache mode: write
+2026-10-26T16:52:22.9636963Z Prepare workflow directory
+2026-10-26T16:52:23.0012247Z Prepare all required actions
+2026-10-26T16:52:23.0068669Z Getting action download info
+2026-10-26T16:52:23.1855304Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-10-26T16:52:23.3396673Z Download action repository 'actions/setup-node@v4' (SHA:49933ea5288caeca8642d1e84afbd3f7d6820020)
+2026-10-26T16:52:24.0954985Z Complete job name: integration
+2026-10-26T16:52:24.1735257Z ##[group]Run actions/checkout@v4
+2026-10-26T16:52:24.1736341Z with:
+2026-10-26T16:52:24.1736968Z   repository: afantos/luckywinclub
+2026-10-26T16:52:24.1740751Z   token: ***
+2026-10-26T16:52:24.1741339Z   ssh-strict: true
+2026-10-26T16:52:24.1741933Z   ssh-user: git
+2026-10-26T16:52:24.1742535Z   persist-credentials: true
+2026-10-26T16:52:24.1743170Z   clean: true
+2026-10-26T16:52:24.1743761Z   sparse-checkout-cone-mode: true
+2026-10-26T16:52:24.1744567Z   fetch-depth: 1
+2026-10-26T16:52:24.1745222Z   fetch-tags: false
+2026-10-26T16:52:24.1746059Z   show-progress: true
+2026-10-26T16:52:24.1746886Z   lfs: false
+2026-10-26T16:52:24.1747651Z   submodules: false
+2026-10-26T16:52:24.1748418Z   set-safe-directory: true
+2026-10-26T16:52:24.1749326Z   allow-unsafe-pr-checkout: false
+2026-10-26T16:52:24.1750784Z ##[endgroup]
+2026-10-26T16:52:24.2782903Z Syncing repository: afantos/luckywinclub
+2026-10-26T16:52:24.2785715Z ##[group]Getting Git version info
+2026-10-26T16:52:24.2787331Z Working directory is '/home/runner/work/luckywinclub/luckywinclub'
+2026-10-26T16:52:24.2803110Z [command]/usr/bin/git version
+2026-10-26T16:52:24.2946858Z git version 2.55.0
+2026-10-26T16:52:24.2974445Z ##[endgroup]
+2026-10-26T16:52:24.2983834Z Temporarily overriding HOME='/home/runner/work/_temp/40c3422d-1cb9-4dc8-8188-9660c29042c6' before making global git config changes
+2026-10-26T16:52:24.2986691Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-26T16:52:24.2989044Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/luckywinclub/luckywinclub
+2026-10-26T16:52:24.3039177Z Deleting the contents of '/home/runner/work/luckywinclub/luckywinclub'
+2026-10-26T16:52:24.3042247Z ##[group]Initializing the repository
+2026-10-26T16:52:24.3044396Z [command]/usr/bin/git init /home/runner/work/luckywinclub/luckywinclub
+2026-10-26T16:52:24.3168063Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-26T16:52:24.3170433Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-26T16:52:24.3172987Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-26T16:52:24.3174941Z hint: call:
+2026-10-26T16:52:24.3176313Z hint:
+2026-10-26T16:52:24.3177653Z hint: 	git config --global init.defaultBranch <name>
+2026-10-26T16:52:24.3179346Z hint:
+2026-10-26T16:52:24.3180621Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-26T16:52:24.3182693Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-26T16:52:24.3184377Z hint:
+2026-10-26T16:52:24.3185879Z hint: 	git branch -m <name>
+2026-10-26T16:52:24.3187095Z hint:
+2026-10-26T16:52:24.3188673Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-26T16:52:24.3190799Z Initialized empty Git repository in /home/runner/work/luckywinclub/luckywinclub/.git/
+2026-10-26T16:52:24.3198465Z [command]/usr/bin/git remote add origin https://github.com/afantos/luckywinclub
+2026-10-26T16:52:24.3345126Z ##[endgroup]
+2026-10-26T16:52:24.3347817Z ##[group]Disabling automatic garbage collection
+2026-10-26T16:52:24.3350470Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-26T16:52:24.3403957Z ##[endgroup]
+2026-10-26T16:52:24.3446717Z ##[group]Setting up auth
+2026-10-26T16:52:24.3486720Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-26T16:52:24.3491913Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-26T16:52:24.5212134Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-26T16:52:24.5218310Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-26T16:52:24.5430288Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-26T16:52:24.5473855Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-26T16:52:24.5707757Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-26T16:52:24.6409789Z ##[endgroup]
+2026-10-26T16:52:24.6411190Z ##[group]Fetching the repository
+2026-10-26T16:52:24.6422958Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +777cc3cb24d2314f6fa5cabfb03ecfd7f81517be:refs/remotes/pull/22/merge
+2026-10-26T16:52:25.9964987Z From https://github.com/afantos/luckywinclub
+2026-10-26T16:52:25.9966474Z  * [new ref]         777cc3cb24d2314f6fa5cabfb03ecfd7f81517be -> pull/22/merge
+2026-10-26T16:52:25.9969687Z ##[endgroup]
+2026-10-26T16:52:25.9970257Z ##[group]Determining the checkout info
+2026-10-26T16:52:25.9970907Z ##[endgroup]
+2026-10-26T16:52:25.9971270Z [command]/usr/bin/git sparse-checkout disable
+2026-10-26T16:52:26.0087102Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-26T16:52:26.0175617Z ##[group]Checking out the ref
+2026-10-26T16:52:26.0178570Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/22/merge
+2026-10-26T16:52:26.0378656Z Note: switching to 'refs/remotes/pull/22/merge'.
+2026-10-26T16:52:26.0379407Z 
+2026-10-26T16:52:26.0386048Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-10-26T16:52:26.0399996Z changes and commit them, and you can discard any commits you make in this
+2026-10-26T16:52:26.0405472Z state without impacting any branches by switching back to a branch.
+2026-10-26T16:52:26.0406304Z 
+2026-10-26T16:52:26.0407278Z If you want to create a new branch to retain commits you create, you may
+2026-10-26T16:52:26.0408318Z do so (now or later) by using -c with the switch command. Example:
+2026-10-26T16:52:26.0409231Z 
+2026-10-26T16:52:26.0409670Z   git switch -c <new-branch-name>
+2026-10-26T16:52:26.0410764Z 
+2026-10-26T16:52:26.0411237Z Or undo this operation with:
+2026-10-26T16:52:26.0411962Z 
+2026-10-26T16:52:26.0412397Z   git switch -
+2026-10-26T16:52:26.0413112Z 
+2026-10-26T16:52:26.0413696Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-10-26T16:52:26.0414817Z 
+2026-10-26T16:52:26.0417158Z HEAD is now at 777cc3c Merge 471aa62d85c85a73c8411f00bd38a3a9b9f4239b into 674e43bea46bbdefc88c14a7ac2cb46951dfe550
+2026-10-26T16:52:26.0418778Z ##[endgroup]
+2026-10-26T16:52:26.0439528Z [command]/usr/bin/git log -1 --format=%H
+2026-10-26T16:52:26.0464088Z 777cc3cb24d2314f6fa5cabfb03ecfd7f81517be
+2026-10-26T16:52:26.0808453Z ##[group]Run actions/setup-node@v4
+2026-10-26T16:52:26.0808736Z with:
+2026-10-26T16:52:26.0808953Z   node-version: 24
+2026-10-26T16:52:26.0809170Z   cache: npm
+2026-10-26T16:52:26.0870049Z   always-auth: false
+2026-10-26T16:52:26.0870421Z   check-latest: false
+2026-10-26T16:52:26.0874557Z   token: ***
+2026-10-26T16:52:26.0874929Z ##[endgroup]
+2026-10-26T16:52:26.2448828Z (node:1943) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-10-26T16:52:26.2450309Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-10-26T16:52:26.2455467Z Found in cache @ /opt/hostedtoolcache/node/24.21.0/x64
+2026-10-26T16:52:26.2457830Z ##[group]Environment details
+2026-10-26T16:52:26.8142600Z node: v24.21.0
+2026-10-26T16:52:26.8147955Z npm: 11.19.0
+2026-10-26T16:52:26.8150086Z yarn: 1.22.22
+2026-10-26T16:52:26.8151164Z ##[endgroup]
+2026-10-26T16:52:26.8151821Z [command]/opt/hostedtoolcache/node/24.21.0/x64/bin/npm config get cache
+2026-10-26T16:52:26.9565887Z /home/runner/.npm
+2026-10-26T16:52:27.0416674Z Cache hit for: node-cache-Linux-x64-npm-6aac7589f188f94641fe539afcd54aec3415c6a9367503f2a676d372ab2393d2
+2026-10-26T16:52:27.0515954Z (node:1943) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-10-26T16:52:27.7506610Z Received 124252236 of 124252236 (100.0%), 182.9 MBs/sec
+2026-10-26T16:52:27.7507542Z Cache Size: ~118 MB (124252236 B)
+2026-10-26T16:52:27.7577232Z [command]/usr/bin/tar -xf /home/runner/work/_temp/8ee17b8a-7678-4e2b-8e99-49c95a850adc/cache.tzst -P -C /home/runner/work/luckywinclub/luckywinclub --use-compress-program unzstd
+2026-10-26T16:52:27.9638107Z Cache restored successfully
+2026-10-26T16:52:27.9705463Z Cache restored from key: node-cache-Linux-x64-npm-6aac7589f188f94641fe539afcd54aec3415c6a9367503f2a676d372ab2393d2
+2026-10-26T16:52:28.1395152Z ##[group]Run npm ci --no-audit --no-fund
+2026-10-26T16:52:28.1395517Z [36;1mnpm ci --no-audit --no-fund[0m
+2026-10-26T16:52:28.3197839Z shell: /usr/bin/bash -e {0}
+2026-10-26T16:52:28.3198240Z ##[endgroup]
+2026-10-26T16:52:30.8521794Z npm warn deprecated @esbuild-kit/esm-loader@2.6.5: Merged into tsx: https://tsx.hirok.io
+2026-10-26T16:52:30.8962298Z npm warn deprecated @esbuild-kit/core-utils@3.3.2: Merged into tsx: https://tsx.hirok.io
+2026-10-26T16:52:37.1985494Z 
+2026-10-26T16:52:37.1986523Z added 199 packages in 9s
+2026-10-26T16:52:37.1992277Z npm warn install-scripts 3 packages have install scripts not yet covered by allowScripts:
+2026-10-26T16:52:37.1995912Z npm warn install-scripts   esbuild@0.18.20 (postinstall: node install.js)
+2026-10-26T16:52:37.1998639Z npm warn install-scripts   esbuild@0.25.12 (postinstall: node install.js)
+2026-10-26T16:52:37.2002569Z npm warn install-scripts   esbuild@0.28.2 (postinstall: node install.js)
+2026-10-26T16:52:37.2004977Z npm warn install-scripts
+2026-10-26T16:52:37.2006084Z npm warn install-scripts Run `npm install-scripts ls` to review, or `npm install-scripts approve <pkg>` to allow.
+2026-10-26T16:52:37.2754686Z ##[group]Run docker compose up -d --wait postgres mailpit
+2026-10-26T16:52:37.2755134Z [36;1mdocker compose up -d --wait postgres mailpit[0m
+2026-10-26T16:52:37.2812028Z shell: /usr/bin/bash -e {0}
+2026-10-26T16:52:37.2812414Z ##[endgroup]
+2026-10-26T16:52:37.8648144Z  postgres Pulling 
+2026-10-26T16:52:37.8649469Z  mailpit Pulling 
+2026-10-26T16:52:38.4812483Z  7b229517ed22 Pulling fs layer 
+2026-10-26T16:52:38.4813107Z  6d36f2406fac Pulling fs layer 
+2026-10-26T16:52:38.4813491Z  bb74c0cfe3af Pulling fs layer 
+2026-10-26T16:52:38.4813852Z  f2be67225471 Pulling fs layer 
+2026-10-26T16:52:38.4814672Z  e0428ef87eb8 Pulling fs layer 
+2026-10-26T16:52:38.4822896Z  c9b382b1f732 Pulling fs layer 
+2026-10-26T16:52:38.4823734Z  0f6d195ee345 Pulling fs layer 
+2026-10-26T16:52:38.4824529Z  d1b142a2d3ac Pulling fs layer 
+2026-10-26T16:52:38.4825123Z  2ab475e318db Pulling fs layer 
+2026-10-26T16:52:38.4825717Z  bee16f784947 Pulling fs layer 
+2026-10-26T16:52:38.4826333Z  633cb7982454 Pulling fs layer 
+2026-10-26T16:52:38.4826811Z  0ec7842b4287 Pulling fs layer 
+2026-10-26T16:52:38.4827162Z  515b4b00cc07 Pulling fs layer 
+2026-10-26T16:52:38.4827615Z  90d33c82e6b4 Pulling fs layer 
+2026-10-26T16:52:38.4827991Z  a5bccd2244f9 Pulling fs layer 
+2026-10-26T16:52:38.4828592Z  d38aaa71d21a Pulling fs layer 
+2026-10-26T16:52:38.4829095Z  99b43abe6052 Pulling fs layer 
+2026-10-26T16:52:38.4829420Z  f2be67225471 Waiting 
+2026-10-26T16:52:38.4829864Z  e0428ef87eb8 Waiting 
+2026-10-26T16:52:38.4830160Z  c9b382b1f732 Waiting 
+2026-10-26T16:52:38.4830636Z  0f6d195ee345 Waiting 
+2026-10-26T16:52:38.4830911Z  d1b142a2d3ac Waiting 
+2026-10-26T16:52:38.4831204Z  2ab475e318db Waiting 
+2026-10-26T16:52:38.4831675Z  bee16f784947 Waiting 
+2026-10-26T16:52:38.4831965Z  633cb7982454 Waiting 
+2026-10-26T16:52:38.4832424Z  0ec7842b4287 Waiting 
+2026-10-26T16:52:38.4832719Z  515b4b00cc07 Waiting 
+2026-10-26T16:52:38.4833171Z  90d33c82e6b4 Waiting 
+2026-10-26T16:52:38.4833470Z  a5bccd2244f9 Waiting 
+2026-10-26T16:52:38.4833938Z  d38aaa71d21a Waiting 
+2026-10-26T16:52:38.4834493Z  99b43abe6052 Waiting 
+2026-10-26T16:52:38.5105652Z  bb74c0cfe3af Downloading [>                                                  ]  3.458kB/177.3kB
+2026-10-26T16:52:38.5136921Z  7b229517ed22 Downloading [>                                                  ]  48.51kB/3.853MB
+2026-10-26T16:52:38.5159211Z  bb74c0cfe3af Downloading [==================================================>]  177.3kB/177.3kB
+2026-10-26T16:52:38.5160437Z  bb74c0cfe3af Verifying Checksum 
+2026-10-26T16:52:38.5161078Z  bb74c0cfe3af Download complete 
+2026-10-26T16:52:38.5161839Z  6d36f2406fac Downloading [>                                                  ]    114kB/10.38MB
+2026-10-26T16:52:38.5375510Z  7b229517ed22 Verifying Checksum 
+2026-10-26T16:52:38.5377138Z  7b229517ed22 Download complete 
+2026-10-26T16:52:38.5535988Z  6d36f2406fac Verifying Checksum 
+2026-10-26T16:52:38.5537449Z  6d36f2406fac Download complete 
+2026-10-26T16:52:38.5575190Z  f2be67225471 Downloading [>                                                  ]  310.7kB/29.84MB
+2026-10-26T16:52:38.6054142Z  e0428ef87eb8 Downloading [==================================================>]  1.165kB/1.165kB
+2026-10-26T16:52:38.6061519Z  e0428ef87eb8 Verifying Checksum 
+2026-10-26T16:52:38.6063001Z  e0428ef87eb8 Download complete 
+2026-10-26T16:52:38.6066487Z  c9b382b1f732 Downloading [>                                                  ]   64.9kB/6.443MB
+2026-10-26T16:52:38.6342565Z  0f6d195ee345 Downloading [>                                                  ]  15.74kB/1.257MB
+2026-10-26T16:52:38.6508898Z  c9b382b1f732 Verifying Checksum 
+2026-10-26T16:52:38.6510409Z  c9b382b1f732 Download complete 
+2026-10-26T16:52:38.6576124Z  f2be67225471 Downloading [===============================================>   ]  28.33MB/29.84MB
+2026-10-26T16:52:38.6618840Z  f2be67225471 Verifying Checksum 
+2026-10-26T16:52:38.6619601Z  f2be67225471 Download complete 
+2026-10-26T16:52:38.7462673Z  0f6d195ee345 Downloading [=========================>                         ]  638.3kB/1.257MB
+2026-10-26T16:52:38.7754021Z  0f6d195ee345 Verifying Checksum 
+2026-10-26T16:52:38.7763214Z  0f6d195ee345 Download complete 
+2026-10-26T16:52:38.7850878Z  7b229517ed22 Extracting [>                                                  ]  65.54kB/3.853MB
+2026-10-26T16:52:38.7860321Z  2ab475e318db Downloading [>                                                  ]  15.74kB/1.312MB
+2026-10-26T16:52:38.7877667Z  d1b142a2d3ac Downloading [>                                                  ]  97.66kB/8.204MB
+2026-10-26T16:52:38.7986196Z  2ab475e318db Verifying Checksum 
+2026-10-26T16:52:38.7986805Z  2ab475e318db Download complete 
+2026-10-26T16:52:38.8034695Z  bee16f784947 Downloading [==================================================>]     116B/116B
+2026-10-26T16:52:38.8048540Z  bee16f784947 Verifying Checksum 
+2026-10-26T16:52:38.8049466Z  bee16f784947 Download complete 
+2026-10-26T16:52:38.8232370Z  d1b142a2d3ac Verifying Checksum 
+2026-10-26T16:52:38.8233802Z  d1b142a2d3ac Download complete 
+2026-10-26T16:52:38.8322267Z  633cb7982454 Downloading [==================================================>]  3.146kB/3.146kB
+2026-10-26T16:52:38.8330441Z  633cb7982454 Verifying Checksum 
+2026-10-26T16:52:38.8331428Z  633cb7982454 Download complete 
+2026-10-26T16:52:38.8655338Z  0ec7842b4287 Downloading [>                                                  ]  540.7kB/114.3MB
+2026-10-26T16:52:38.8673244Z  515b4b00cc07 Downloading [================>                                  ]    3.5kB/10.46kB
+2026-10-26T16:52:38.8678679Z  515b4b00cc07 Downloading [==================================================>]  10.46kB/10.46kB
+2026-10-26T16:52:38.8679342Z  515b4b00cc07 Verifying Checksum 
+2026-10-26T16:52:38.8680020Z  515b4b00cc07 Download complete 
+2026-10-26T16:52:38.8804394Z  90d33c82e6b4 Downloading [==================================================>]     128B/128B
+2026-10-26T16:52:38.8811298Z  90d33c82e6b4 Verifying Checksum 
+2026-10-26T16:52:38.8814067Z  90d33c82e6b4 Download complete 
+2026-10-26T16:52:38.8970089Z  7b229517ed22 Extracting [==========>                                        ]  786.4kB/3.853MB
+2026-10-26T16:52:38.8983561Z  f2be67225471 Extracting [>                                                  ]  327.7kB/29.84MB
+2026-10-26T16:52:38.9404874Z  a5bccd2244f9 Downloading [==================================================>]     167B/167B
+2026-10-26T16:52:38.9408772Z  a5bccd2244f9 Verifying Checksum 
+2026-10-26T16:52:38.9409859Z  a5bccd2244f9 Download complete 
+2026-10-26T16:52:38.9493293Z  d38aaa71d21a Downloading [============================>                      ]  3.501kB/6.111kB
+2026-10-26T16:52:38.9494484Z  d38aaa71d21a Downloading [==================================================>]  6.111kB/6.111kB
+2026-10-26T16:52:38.9495386Z  d38aaa71d21a Verifying Checksum 
+2026-10-26T16:52:38.9496121Z  d38aaa71d21a Download complete 
+2026-10-26T16:52:38.9755369Z  0ec7842b4287 Downloading [========>                                          ]  19.18MB/114.3MB
+2026-10-26T16:52:38.9834972Z  99b43abe6052 Downloading [==================================================>]     185B/185B
+2026-10-26T16:52:38.9838714Z  99b43abe6052 Verifying Checksum 
+2026-10-26T16:52:38.9839338Z  99b43abe6052 Download complete 
+2026-10-26T16:52:38.9989216Z  7b229517ed22 Extracting [======================================>            ]  2.949MB/3.853MB
+2026-10-26T16:52:39.0106555Z  f2be67225471 Extracting [===>                                               ]  2.294MB/29.84MB
+2026-10-26T16:52:39.0387269Z  7b229517ed22 Extracting [==================================================>]  3.853MB/3.853MB
+2026-10-26T16:52:39.0401317Z  7b229517ed22 Extracting [==================================================>]  3.853MB/3.853MB
+2026-10-26T16:52:39.0717385Z  0ec7842b4287 Downloading [===================>                               ]  45.29MB/114.3MB
+2026-10-26T16:52:39.1129683Z  f2be67225471 Extracting [=======>                                           ]  4.588MB/29.84MB
+2026-10-26T16:52:39.1707877Z  0ec7842b4287 Downloading [=================================>                 ]  76.76MB/114.3MB
+2026-10-26T16:52:39.2206254Z  f2be67225471 Extracting [============>                                      ]  7.209MB/29.84MB
+2026-10-26T16:52:39.3042590Z  0ec7842b4287 Downloading [=======================================>           ]  90.11MB/114.3MB
+2026-10-26T16:52:39.3704822Z  0ec7842b4287 Verifying Checksum 
+2026-10-26T16:52:39.3705472Z  0ec7842b4287 Download complete 
+2026-10-26T16:52:39.3789332Z  f2be67225471 Extracting [============>                                      ]  7.537MB/29.84MB
+2026-10-26T16:52:39.4806506Z  f2be67225471 Extracting [===================>                               ]  11.47MB/29.84MB
+2026-10-26T16:52:39.5833198Z  f2be67225471 Extracting [==============================>                    ]  18.35MB/29.84MB
+2026-10-26T16:52:39.6938281Z  f2be67225471 Extracting [==========================================>        ]  25.56MB/29.84MB
+2026-10-26T16:52:39.8842680Z  f2be67225471 Extracting [===========================================>       ]  25.89MB/29.84MB
+2026-10-26T16:52:39.9860041Z  f2be67225471 Extracting [===========================================>       ]  26.21MB/29.84MB
+2026-10-26T16:52:40.0952681Z  f2be67225471 Extracting [================================================>  ]  28.84MB/29.84MB
+2026-10-26T16:52:40.1324437Z  7b229517ed22 Pull complete 
+2026-10-26T16:52:40.2412465Z  f2be67225471 Extracting [================================================>  ]  29.16MB/29.84MB
+2026-10-26T16:52:40.3219804Z  f2be67225471 Extracting [==================================================>]  29.84MB/29.84MB
+2026-10-26T16:52:40.8564669Z  6d36f2406fac Extracting [>                                                  ]  131.1kB/10.38MB
+2026-10-26T16:52:41.3752860Z  6d36f2406fac Extracting [=>                                                 ]  262.1kB/10.38MB
+2026-10-26T16:52:41.4701793Z  f2be67225471 Pull complete 
+2026-10-26T16:52:41.4738580Z  6d36f2406fac Extracting [========================================>          ]  8.389MB/10.38MB
+2026-10-26T16:52:41.5015241Z  6d36f2406fac Extracting [==================================================>]  10.38MB/10.38MB
+2026-10-26T16:52:41.9109825Z  e0428ef87eb8 Extracting [==================================================>]  1.165kB/1.165kB
+2026-10-26T16:52:41.9114048Z  e0428ef87eb8 Extracting [==================================================>]  1.165kB/1.165kB
+2026-10-26T16:52:48.4582346Z  e0428ef87eb8 Pull complete 
+2026-10-26T16:52:48.4582872Z  6d36f2406fac Pull complete 
+2026-10-26T16:52:48.4623002Z  c9b382b1f732 Extracting [>                                                  ]  65.54kB/6.443MB
+2026-10-26T16:52:48.4633855Z  bb74c0cfe3af Extracting [=========>                                         ]  32.77kB/177.3kB
+2026-10-26T16:52:48.4687704Z  bb74c0cfe3af Extracting [==================================================>]  177.3kB/177.3kB
+2026-10-26T16:52:48.5146426Z  bb74c0cfe3af Extracting [==================================================>]  177.3kB/177.3kB
+2026-10-26T16:52:48.5636492Z  c9b382b1f732 Extracting [====================================>              ]  4.719MB/6.443MB
+2026-10-26T16:52:48.6381917Z  c9b382b1f732 Extracting [==================================================>]  6.443MB/6.443MB
+2026-10-26T16:52:49.0339918Z  c9b382b1f732 Pull complete 
+2026-10-26T16:52:49.0342348Z  bb74c0cfe3af Pull complete 
+2026-10-26T16:52:49.0361328Z  0f6d195ee345 Extracting [=>                                                 ]  32.77kB/1.257MB
+2026-10-26T16:52:49.0437624Z  mailpit Pulled 
+2026-10-26T16:52:49.0641342Z  0f6d195ee345 Extracting [==================================================>]  1.257MB/1.257MB
+2026-10-26T16:52:49.1322904Z  0f6d195ee345 Pull complete 
+2026-10-26T16:52:49.1340829Z  d1b142a2d3ac Extracting [>                                                  ]   98.3kB/8.204MB
+2026-10-26T16:52:49.2357189Z  d1b142a2d3ac Extracting [=========================>                         ]  4.227MB/8.204MB
+2026-10-26T16:52:49.3423631Z  d1b142a2d3ac Extracting [======================================>            ]  6.291MB/8.204MB
+2026-10-26T16:52:49.3866399Z  d1b142a2d3ac Extracting [==================================================>]  8.204MB/8.204MB
+2026-10-26T16:52:49.9656680Z  d1b142a2d3ac Pull complete 
+2026-10-26T16:52:49.9663117Z  2ab475e318db Extracting [=>                                                 ]  32.77kB/1.312MB
+2026-10-26T16:52:50.0469262Z  2ab475e318db Extracting [==================================================>]  1.312MB/1.312MB
+2026-10-26T16:52:50.2306457Z  2ab475e318db Pull complete 
+2026-10-26T16:52:50.2318389Z  bee16f784947 Extracting [==================================================>]     116B/116B
+2026-10-26T16:52:50.2322330Z  bee16f784947 Extracting [==================================================>]     116B/116B
+2026-10-26T16:52:50.2738792Z  bee16f784947 Pull complete 
+2026-10-26T16:52:50.2755148Z  633cb7982454 Extracting [==================================================>]  3.146kB/3.146kB
+2026-10-26T16:52:50.2782193Z  633cb7982454 Extracting [==================================================>]  3.146kB/3.146kB
+2026-10-26T16:52:50.3359173Z  633cb7982454 Pull complete 
+2026-10-26T16:52:50.3868798Z  0ec7842b4287 Extracting [>                                                  ]  557.1kB/114.3MB
+2026-10-26T16:52:50.4939383Z  0ec7842b4287 Extracting [===>                                               ]  7.799MB/114.3MB
+2026-10-26T16:52:50.6024429Z  0ec7842b4287 Extracting [====>                                              ]  11.14MB/114.3MB
+2026-10-26T16:52:50.7152275Z  0ec7842b4287 Extracting [=======>                                           ]  16.15MB/114.3MB
+2026-10-26T16:52:50.8294632Z  0ec7842b4287 Extracting [=========>                                         ]  21.73MB/114.3MB
+2026-10-26T16:52:50.9435845Z  0ec7842b4287 Extracting [============>                                      ]  28.41MB/114.3MB
+2026-10-26T16:52:51.0336268Z  0ec7842b4287 Extracting [================>                                  ]  37.88MB/114.3MB
+2026-10-26T16:52:51.1394896Z  0ec7842b4287 Extracting [====================>                              ]  46.79MB/114.3MB
+2026-10-26T16:52:51.2601117Z  0ec7842b4287 Extracting [========================>                          ]  55.15MB/114.3MB
+2026-10-26T16:52:51.3607502Z  0ec7842b4287 Extracting [==========================>                        ]  60.16MB/114.3MB
+2026-10-26T16:52:51.4667726Z  0ec7842b4287 Extracting [=============================>                     ]  68.52MB/114.3MB
+2026-10-26T16:52:51.5741113Z  0ec7842b4287 Extracting [=================================>                 ]  77.43MB/114.3MB
+2026-10-26T16:52:51.6805544Z  0ec7842b4287 Extracting [=====================================>             ]  85.79MB/114.3MB
+2026-10-26T16:52:51.7837170Z  0ec7842b4287 Extracting [=========================================>         ]   94.7MB/114.3MB
+2026-10-26T16:52:51.8902362Z  0ec7842b4287 Extracting [==========================================>        ]  98.04MB/114.3MB
+2026-10-26T16:52:52.0458307Z  0ec7842b4287 Extracting [============================================>      ]  101.4MB/114.3MB
+2026-10-26T16:52:52.1488115Z  0ec7842b4287 Extracting [=============================================>     ]  104.7MB/114.3MB
+2026-10-26T16:52:52.2878761Z  0ec7842b4287 Extracting [===============================================>   ]  108.1MB/114.3MB
+2026-10-26T16:52:52.4217941Z  0ec7842b4287 Extracting [================================================>  ]  110.3MB/114.3MB
+2026-10-26T16:52:52.6127453Z  0ec7842b4287 Extracting [=================================================> ]  112.5MB/114.3MB
+2026-10-26T16:52:52.7568432Z  0ec7842b4287 Extracting [=================================================> ]  113.6MB/114.3MB
+2026-10-26T16:52:52.8075236Z  0ec7842b4287 Extracting [==================================================>]  114.3MB/114.3MB
+2026-10-26T16:52:56.5523921Z  0ec7842b4287 Pull complete 
+2026-10-26T16:52:56.5537745Z  515b4b00cc07 Extracting [==================================================>]  10.46kB/10.46kB
+2026-10-26T16:52:56.5540406Z  515b4b00cc07 Extracting [==================================================>]  10.46kB/10.46kB
+2026-10-26T16:52:56.5713246Z  515b4b00cc07 Pull complete 
+2026-10-26T16:52:56.5726614Z  90d33c82e6b4 Extracting [==================================================>]     128B/128B
+2026-10-26T16:52:56.5732186Z  90d33c82e6b4 Extracting [==================================================>]     128B/128B
+2026-10-26T16:52:56.6316612Z  90d33c82e6b4 Pull complete 
+2026-10-26T16:52:56.6332921Z  a5bccd2244f9 Extracting [==================================================>]     167B/167B
+2026-10-26T16:52:56.6333946Z  a5bccd2244f9 Extracting [==================================================>]     167B/167B
+2026-10-26T16:52:56.6427859Z  a5bccd2244f9 Pull complete 
+2026-10-26T16:52:56.6445904Z  d38aaa71d21a Extracting [==================================================>]  6.111kB/6.111kB
+2026-10-26T16:52:56.6448685Z  d38aaa71d21a Extracting [==================================================>]  6.111kB/6.111kB
+2026-10-26T16:52:56.6637600Z  d38aaa71d21a Pull complete 
+2026-10-26T16:52:56.6651995Z  99b43abe6052 Extracting [==================================================>]     185B/185B
+2026-10-26T16:52:56.6653516Z  99b43abe6052 Extracting [==================================================>]     185B/185B
+2026-10-26T16:52:56.6709640Z  99b43abe6052 Pull complete 
+2026-10-26T16:52:56.6772415Z  postgres Pulled 
+2026-10-26T16:52:56.6795046Z  Network luckywinclub_default  Creating
+2026-10-26T16:52:56.7228455Z  Network luckywinclub_default  Created
+2026-10-26T16:52:56.7237510Z  Container luckywinclub-postgres-1  Creating
+2026-10-26T16:52:56.7237900Z  Container luckywinclub-mailpit-1  Creating
+2026-10-26T16:52:56.7530126Z  Container luckywinclub-mailpit-1  Created
+2026-10-26T16:52:56.7535436Z  Container luckywinclub-postgres-1  Created
+2026-10-26T16:52:56.7550323Z  Container luckywinclub-mailpit-1  Starting
+2026-10-26T16:52:56.7550946Z  Container luckywinclub-postgres-1  Starting
+2026-10-26T16:52:57.3121770Z  Container luckywinclub-mailpit-1  Started
+2026-10-26T16:52:57.3248837Z  Container luckywinclub-postgres-1  Started
+2026-10-26T16:52:57.3249855Z  Container luckywinclub-postgres-1  Waiting
+2026-10-26T16:52:57.3250800Z  Container luckywinclub-mailpit-1  Waiting
+2026-10-26T16:52:58.8271877Z  Container luckywinclub-mailpit-1  Healthy
+2026-10-26T16:53:01.8267495Z  Container luckywinclub-postgres-1  Healthy
+2026-10-26T16:53:01.8342066Z ##[group]Run npm run test:integration
+2026-10-26T16:53:01.8342364Z [36;1mnpm run test:integration[0m
+2026-10-26T16:53:01.8399613Z shell: /usr/bin/bash -e {0}
+2026-10-26T16:53:01.8399844Z ##[endgroup]
+2026-10-26T16:53:01.9264672Z 
+2026-10-26T16:53:01.9265489Z > test:integration
+2026-10-26T16:53:01.9266286Z > node --test --test-concurrency=1 'test-integration/**/*.test.ts'
+2026-10-26T16:53:01.9266800Z 
+2026-10-26T16:53:02.7970633Z ▶ account isolation
+2026-10-26T16:53:02.7975775Z   ✔ account A cannot read or submit to account B's claim (50.269633ms)
+2026-10-26T16:53:03.0041543Z ✔ account isolation (387.699833ms)
+2026-10-26T16:53:04.1646528Z ▶ admin promotions API
+2026-10-26T16:53:04.1651786Z   ✔ returns 403 to non-admins and 401 to anonymous callers on every endpoint (20.636694ms)
+2026-10-26T16:53:04.2342413Z   ✔ shows the total and rejects activation without or with a stale preview (69.655991ms)
+2026-10-26T16:53:04.2404193Z   ✔ surfaces validation errors (6.463338ms)
+2026-10-26T16:53:04.2694725Z   ✔ reports inventory without any moment field (28.813149ms)
+2026-10-26T16:53:04.2938533Z   ✔ 404s unknown actions (including prototype names) and unknown promotions for inventory (24.478658ms)
+2026-10-26T16:53:04.3142675Z   ✔ reports an unknown rules version as a validation error (20.20042ms)
+2026-10-26T16:53:04.3745992Z   ✔ refuses to activate when the configuration changed after the preview (60.099591ms)
+2026-10-26T16:53:04.4339227Z   ✔ stores mustAward as configured for hourly and daily schedules and forces it for jackpot (55.968143ms)
+2026-10-26T16:53:04.4759048Z ✔ admin promotions API (522.653327ms)
+2026-10-26T16:53:05.2501675Z ▶ audit log
+2026-10-26T16:53:05.2503405Z   ✔ exports no update or delete path (15.490057ms)
+2026-10-26T16:53:05.2652542Z   ✔ redacts before/after on write (17.011785ms)
+2026-10-26T16:53:05.2810831Z   ✔ rejects an admin event without a reason and writes nothing (15.843867ms)
+2026-10-26T16:53:05.2958560Z   ✔ leaves no audit row when the transaction rolls back (14.822036ms)
+2026-10-26T16:53:05.3582548Z   ✔ commits audit with the transaction and lists newest first with pagination (60.081543ms)
+2026-10-26T16:53:05.3834092Z ✔ audit log (324.06883ms)
+2026-10-26T16:53:06.6396935Z ▶ auth + admin guard
+2026-10-26T16:53:06.6407890Z   ✔ refuses an ineligible declaration at sign-up and creates no user (7.111548ms)
+2026-10-26T16:53:06.6946174Z   ✔ eligible sign-up emails an OTP; the declaration is stored only after the owner signs in (56.570736ms)
+2026-10-26T16:53:06.7241339Z   ✔ an unverified sign-up cannot plant a declaration on someone else's address (29.777632ms)
+2026-10-26T16:53:06.7320498Z   ✔ does not auto-create accounts through the OTP endpoint (8.087443ms)
+2026-10-26T16:53:06.7647612Z   ✔ admin route handler: anonymous 401, non-admin 403, admin 200 with body (32.421458ms)
+2026-10-26T16:53:06.7674115Z   ✔ admin sign-in writes an audit row and the OTP never appears in the audit log (1.422605ms)
+2026-10-26T16:53:06.7895169Z   ✔ locks out a code after the allowed wrong attempts (22.598312ms)
+2026-10-26T16:53:06.8078168Z ✔ auth + admin guard (437.579225ms)
+2026-10-26T16:53:07.5799485Z ▶ claim deadline arithmetic
+2026-10-26T16:53:07.5806797Z   ✖ a day is 24 elapsed hours even across a DST change (20.656418ms)
+2026-10-26T16:53:07.6321337Z ✖ claim deadline arithmetic (221.20767ms)
+2026-10-26T16:53:08.4071519Z ▶ claims service
+2026-10-26T16:53:08.4075639Z   ✔ submitVerification stores data, moves needs_info back to pending_verification, and redacts audit (54.504286ms)
+2026-10-26T16:53:08.4822773Z   ✔ submitVerification rejects ineligible declarations and non-submittable states (75.620233ms)
+2026-10-26T16:53:08.5215578Z   ✔ rejects illegal transitions and leaves the claim untouched (38.840047ms)
+2026-10-26T16:53:08.6144948Z   ✔ requires an admin reason (93.149551ms)
+2026-10-26T16:53:08.7088827Z   ✔ forfeiture keeps the award row and records the reason (93.385844ms)
+2026-10-26T16:53:08.7486790Z   ✔ payout_failed retries to payout_submitted against the same award; paid fulfils (40.116231ms)
+2026-10-26T16:53:08.8044875Z   ✔ expiry only expires expirable claims past the deadline (56.059448ms)
+2026-10-26T16:53:08.8743563Z   ✔ expiry respects each promotion rules version deadline (29 of 30 days is not due) (69.890939ms)
+2026-10-26T16:53:08.9110811Z   ✔ listClaimsForAccount returns the owner verification data (34.105955ms)
+2026-10-26T16:53:08.9813932Z ✔ claims service (750.162574ms)
+2026-10-26T16:53:09.9912219Z ▶ entry concurrency
+2026-10-26T16:53:09.9919416Z   ✔ 20 simultaneous clicks after the moment yield exactly one award and claim (275.695091ms)
+2026-10-26T16:53:10.0171295Z   ✔ a before-moment click is a non-win and the stored moment is not exposed (26.611643ms)
+2026-10-26T16:53:10.1175775Z   ✔ concurrent clicks from one account with the same request id create one entry (97.288009ms)
+2026-10-26T16:53:10.1706299Z ✔ entry concurrency (602.160356ms)
+2026-10-26T16:53:11.1552794Z ▶ entry idempotency
+2026-10-26T16:53:11.1553813Z   ✔ a retried request id returns the original winning result and creates nothing new (51.710234ms)
+2026-10-26T16:53:11.3040905Z   ✔ a retry still returns the stored result after the entry limit would otherwise reject it (148.684352ms)
+2026-10-26T16:53:11.5275216Z   ✔ request ids are scoped to the account (221.8333ms)
+2026-10-26T16:53:11.5508006Z ✔ entry idempotency (771.33668ms)
+2026-10-26T16:53:12.7940331Z ▶ entry limits, eligibility and pause
+2026-10-26T16:53:12.7945736Z   ✔ entries per window holds with N concurrent requests (503.433206ms)
+2026-10-26T16:53:12.8318814Z   ✔ prizes per person cap holds across windows (37.856486ms)
+2026-10-26T16:53:12.8674028Z   ✔ rejects an account that did not declare eligibility or is ineligible (35.560502ms)
+2026-10-26T16:53:12.9166437Z   ✔ a paused promotion rejects entries and leaves entries and claims unchanged (44.140826ms)
+2026-10-26T16:53:12.9705221Z ✔ entry limits, eligibility and pause (806.75132ms)
+2026-10-26T16:53:13.7836427Z ▶ entry window selection with an overlapping paused promotion
+2026-10-26T16:53:13.8038589Z   ✔ enters the active window even when a paused one is open at the same time (92.743906ms)
+2026-10-26T16:53:13.8039658Z ✔ entry window selection with an overlapping paused promotion (244.435083ms)
+2026-10-26T16:53:14.5920292Z ▶ entry window boundaries (injected SQL clock)
+2026-10-26T16:53:14.5921176Z   ✔ is closed one millisecond before open and open exactly at open (46.358614ms)
+2026-10-26T16:53:14.6355840Z   ✔ rejects at exactly close and accepts one millisecond before (43.360616ms)
+2026-10-26T16:53:14.6792189Z   ✔ wins only at or after the winning moment (44.186775ms)
+2026-10-26T16:53:14.7185990Z   ✔ rejects outside the promotion bounds (38.581595ms)
+2026-10-26T16:53:14.7416700Z   ✔ enter accepts no client time or timezone input (21.384624ms)
+2026-10-26T16:53:14.7799945Z ✔ entry window boundaries (injected SQL clock) (355.351573ms)
+2026-10-26T16:53:15.5408693Z ▶ migrations
+2026-10-26T16:53:15.5410549Z   ✔ applies and creates the application tables (15.405113ms)
+2026-10-26T16:53:15.5692995Z   ✔ rejects a duplicate (account_id, request_id) entry (29.458899ms)
+2026-10-26T16:53:15.5964762Z   ✔ rejects a second award for a window (27.295492ms)
+2026-10-26T16:53:15.6208043Z   ✔ rejects a second active schedule for one promotion (24.470994ms)
+2026-10-26T16:53:15.6459196Z   ✔ rejects a second active promotion (23.92822ms)
+2026-10-26T16:53:15.7347692Z ✔ migrations (396.920462ms)
+2026-10-26T16:53:16.5400664Z ▶ promotion lifecycle
+2026-10-26T16:53:16.5406128Z   ✔ rejects invalid bounds with Q34 errors (38.176608ms)
+2026-10-26T16:53:16.5551761Z   ✔ rejects an invalid time zone or non-increasing bounds at creation, writing nothing (14.668637ms)
+2026-10-26T16:53:16.5802701Z   ✔ previews windows × amount and defaults jackpot must_award (25.849062ms)
+2026-10-26T16:53:16.6172584Z   ✔ runs the lifecycle with an audit event and reason each (36.892752ms)
+2026-10-26T16:53:16.6423778Z   ✔ requires an admin actor, a reason, and a configured schedule (24.984564ms)
+2026-10-26T16:53:16.6919895Z   ✔ rejects a second active promotion in code and in the DB (49.647037ms)
+2026-10-26T16:53:16.7239713Z   ✔ rejects a second active schedule for one promotion at the DB (31.545558ms)
+2026-10-26T16:53:16.7521634Z   ✔ rejects schedule edits once active or paused (28.009112ms)
+2026-10-26T16:53:16.7858707Z   ✔ attributes lifecycle audit events to their promotion (33.673622ms)
+2026-10-26T16:53:16.8418867Z   ✔ updates a draft promotion with audited eligibility and bounds changes (52.969311ms)
+2026-10-26T16:53:16.8826049Z ✔ promotion lifecycle (550.659799ms)
+2026-10-26T16:53:17.8499927Z ▶ rate limits
+2026-10-26T16:53:17.8500588Z   ✔ rejects the N+1th request for the account (75.487589ms)
+2026-10-26T16:53:17.8710643Z   ✔ rejects the N+1th request for the IP across different accounts (22.331183ms)
+2026-10-26T16:53:17.8887310Z   ✔ starts a fresh window after it elapses (13.865433ms)
+2026-10-26T16:53:18.0904614Z   ✔ counts concurrent requests exactly (202.279052ms)
+2026-10-26T16:53:18.1221471Z ✔ rate limits (673.378197ms)
+2026-10-26T16:53:19.3126736Z ▶ winning moments
+2026-10-26T16:53:19.3128911Z   ✔ is idempotent and leaves existing moments unchanged (47.466494ms)
+2026-10-26T16:53:19.5350315Z   ✔ extends with a later horizon without touching earlier moments (222.082645ms)
+2026-10-26T16:53:19.5647875Z   ✔ places each moment in [open, close) (29.856915ms)
+2026-10-26T16:53:19.5901233Z   ✔ writes audit rows with the window id and no moment value (24.322052ms)
+2026-10-26T16:53:19.6158343Z   ✔ refuses to generate a missing moment for an already-open window (26.767661ms)
+2026-10-26T16:53:19.6446062Z   ✔ is a no-op after opening when the moment already exists (27.05388ms)
+2026-10-26T16:53:19.6776200Z ✔ winning moments (962.008266ms)
+2026-10-26T16:53:19.7054564Z ℹ tests 72
+2026-10-26T16:53:19.7054985Z ℹ suites 15
+2026-10-26T16:53:19.7055261Z ℹ pass 71
+2026-10-26T16:53:19.7055526Z ℹ fail 1
+2026-10-26T16:53:19.7065992Z ℹ cancelled 0
+2026-10-26T16:53:19.7066302Z ℹ skipped 0
+2026-10-26T16:53:19.7066585Z ℹ todo 0
+2026-10-26T16:53:19.7066928Z ℹ duration_ms 17748.449884
+2026-10-26T16:53:19.7067190Z 
+2026-10-26T16:53:19.7067358Z ✖ failing tests:
+2026-10-26T16:53:19.7067529Z 
+2026-10-26T16:53:19.7067852Z test at test-integration/claims-deadline-dst.test.ts:26:3
+2026-10-26T16:53:19.7068608Z ✖ a day is 24 elapsed hours even across a DST change (20.656418ms)
+2026-10-26T16:53:19.7069254Z   AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+2026-10-26T16:53:19.7069767Z   + actual - expected
+2026-10-26T16:53:19.7070065Z   
+2026-10-26T16:53:19.7070302Z   + undefined
+2026-10-26T16:53:19.7070576Z   - 'America/New_York'
+2026-10-26T16:53:19.7070890Z   
+2026-10-26T16:53:19.7071707Z       at TestContext.<anonymous> (file:///home/runner/work/luckywinclub/luckywinclub/test-integration/claims-deadline-dst.test.ts:28:12)
+2026-10-26T16:53:19.7072773Z       at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+2026-10-26T16:53:19.7073515Z       at async Test.run (node:internal/test_runner/test:1409:7)
+2026-10-26T16:53:19.7073995Z       at async Promise.all (index 0)
+2026-10-26T16:53:19.7080410Z       at async Suite.run (node:internal/test_runner/test:1905:7)
+2026-10-26T16:53:19.7081164Z       at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+2026-10-26T16:53:19.7081761Z     generatedMessage: true,
+2026-10-26T16:53:19.7082106Z     code: 'ERR_ASSERTION',
+2026-10-26T16:53:19.7082426Z     actual: undefined,
+2026-10-26T16:53:19.7082787Z     expected: 'America/New_York',
+2026-10-26T16:53:19.7083153Z     operator: 'strictEqual',
+2026-10-26T16:53:19.7083465Z     diff: 'simple'
+2026-10-26T16:53:19.7083710Z   }
+2026-10-26T16:53:19.7206363Z ##[error]Process completed with exit code 1.
+2026-10-26T16:53:19.7252391Z ##[group]Run docker compose logs postgres mailpit
+2026-10-26T16:53:19.7252720Z [36;1mdocker compose logs postgres mailpit[0m
+2026-10-26T16:53:19.7309089Z shell: /usr/bin/bash -e {0}
+2026-10-26T16:53:19.7309326Z ##[endgroup]
+2026-10-26T16:53:19.8012914Z mailpit-1  | time="2026/10/26 16:52:57" level=info msg="[smtpd] starting on [::]:1025 (no encryption)"
+2026-10-26T16:53:19.8015354Z mailpit-1  | time="2026/10/26 16:52:57" level=warning msg="[http] listening on [::]:8025 without --ui-auth-file or --allowed-hosts; the API is reachable from any host that can route to this interface"
+2026-10-26T16:53:19.8016843Z mailpit-1  | time="2026/10/26 16:52:57" level=info msg="[http] starting on [::]:8025"
+2026-10-26T16:53:19.8017939Z mailpit-1  | time="2026/10/26 16:52:57" level=info msg="[http] accessible via http://localhost:8025/"
+2026-10-26T16:53:19.8019561Z postgres-1  | The files belonging to this database system will be owned by user "postgres".
+2026-10-26T16:53:19.8020169Z postgres-1  | This user must also own the server process.
+2026-10-26T16:53:19.8025179Z postgres-1  | 
+2026-10-26T16:53:19.8025875Z postgres-1  | The database cluster will be initialized with locale "en_US.utf8".
+2026-10-26T16:53:19.8026845Z postgres-1  | The default database encoding has accordingly been set to "UTF8".
+2026-10-26T16:53:19.8027688Z postgres-1  | The default text search configuration will be set to "english".
+2026-10-26T16:53:19.8028292Z postgres-1  | 
+2026-10-26T16:53:19.8028751Z postgres-1  | Data page checksums are disabled.
+2026-10-26T16:53:19.8029230Z postgres-1  | 
+2026-10-26T16:53:19.8029863Z postgres-1  | fixing permissions on existing directory /var/lib/postgresql/data ... ok
+2026-10-26T16:53:19.8030587Z postgres-1  | creating subdirectories ... ok
+2026-10-26T16:53:19.8031231Z postgres-1  | selecting dynamic shared memory implementation ... posix
+2026-10-26T16:53:19.8031957Z postgres-1  | selecting default "max_connections" ... 100
+2026-10-26T16:53:19.8032592Z postgres-1  | selecting default "shared_buffers" ... 128MB
+2026-10-26T16:53:19.8033233Z postgres-1  | selecting default time zone ... Etc/UTC
+2026-10-26T16:53:19.8033821Z postgres-1  | creating configuration files ... ok
+2026-10-26T16:53:19.8035127Z postgres-1  | running bootstrap script ... ok
+2026-10-26T16:53:19.8035759Z postgres-1  | performing post-bootstrap initialization ... ok
+2026-10-26T16:53:19.8036386Z postgres-1  | syncing data to disk ... ok
+2026-10-26T16:53:19.8036797Z postgres-1  | 
+2026-10-26T16:53:19.8037161Z postgres-1  | 
+2026-10-26T16:53:19.8037734Z postgres-1  | Success. You can now start the database server using:
+2026-10-26T16:53:19.8038308Z postgres-1  | 
+2026-10-26T16:53:19.8038856Z postgres-1  |     pg_ctl -D /var/lib/postgresql/data -l logfile start
+2026-10-26T16:53:19.8039438Z postgres-1  | 
+2026-10-26T16:53:19.8040115Z postgres-1  | initdb: warning: enabling "trust" authentication for local connections
+2026-10-26T16:53:19.8042063Z postgres-1  | initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+2026-10-26T16:53:19.8043801Z postgres-1  | waiting for server to start....2026-10-26 16:52:58.673 UTC [47] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-10-26T16:53:19.8045497Z postgres-1  | 2026-10-26 16:52:58.674 UTC [47] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+2026-10-26T16:53:19.8046505Z postgres-1  | 2026-10-26 16:52:58.676 UTC [50] LOG:  database system was shut down at 2026-10-26 16:52:57 UTC
+2026-10-26T16:53:19.8047320Z postgres-1  | 2026-10-26 16:52:58.679 UTC [47] LOG:  database system is ready to accept connections
+2026-10-26T16:53:19.8047684Z postgres-1  |  done
+2026-10-26T16:53:19.8048019Z postgres-1  | server started
+2026-10-26T16:53:19.8048422Z postgres-1  | CREATE DATABASE
+2026-10-26T16:53:19.8048783Z postgres-1  | 
+2026-10-26T16:53:19.8050042Z postgres-1  | 
+2026-10-26T16:53:19.8051016Z postgres-1  | /usr/local/bin/docker-entrypoint.sh: ignoring /docker-entrypoint-initdb.d/*
+2026-10-26T16:53:19.8051679Z postgres-1  | 
+2026-10-26T16:53:19.8052258Z postgres-1  | 2026-10-26 16:52:59.111 UTC [47] LOG:  received fast shutdown request
+2026-10-26T16:53:19.8053265Z postgres-1  | waiting for server to shut down....2026-10-26 16:52:59.112 UTC [47] LOG:  aborting any active transactions
+2026-10-26T16:53:19.8054789Z postgres-1  | 2026-10-26 16:52:59.114 UTC [47] LOG:  background worker "logical replication launcher" (PID 53) exited with exit code 1
+2026-10-26T16:53:19.8055724Z postgres-1  | 2026-10-26 16:52:59.114 UTC [48] LOG:  shutting down
+2026-10-26T16:53:19.8056514Z postgres-1  | 2026-10-26 16:52:59.115 UTC [48] LOG:  checkpoint starting: shutdown immediate
+2026-10-26T16:53:19.8057376Z postgres-1  | 2026-10-26 16:52:59.374 UTC [67] FATAL:  the database system is shutting down
+2026-10-26T16:53:19.8059348Z postgres-1  | 2026-10-26 16:52:59.637 UTC [48] LOG:  checkpoint complete: wrote 925 buffers (5.6%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.151 s, sync=0.371 s, total=0.523 s; sync files=301, longest=0.341 s, average=0.002 s; distance=4256 kB, estimate=4256 kB; lsn=0/19179A0, redo lsn=0/19179A0
+2026-10-26T16:53:19.8061089Z postgres-1  | 2026-10-26 16:52:59.644 UTC [47] LOG:  database system is shut down
+2026-10-26T16:53:19.8061679Z postgres-1  |  done
+2026-10-26T16:53:19.8062057Z postgres-1  | server stopped
+2026-10-26T16:53:19.8062457Z postgres-1  | 
+2026-10-26T16:53:19.8063004Z postgres-1  | PostgreSQL init process complete; ready for start up.
+2026-10-26T16:53:19.8063545Z postgres-1  | 
+2026-10-26T16:53:19.8064830Z postgres-1  | 2026-10-26 16:52:59.806 UTC [1] LOG:  starting PostgreSQL 17.11 (Debian 17.11-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+2026-10-26T16:53:19.8066050Z postgres-1  | 2026-10-26 16:52:59.806 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+2026-10-26T16:53:19.8066951Z postgres-1  | 2026-10-26 16:52:59.806 UTC [1] LOG:  listening on IPv6 address "::", port 5432
+2026-10-26T16:53:19.8067955Z postgres-1  | 2026-10-26 16:52:59.807 UTC [1] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5432"
+2026-10-26T16:53:19.8069721Z postgres-1  | 2026-10-26 16:52:59.812 UTC [71] LOG:  database system was shut down at 2026-10-26 16:52:59 UTC
+2026-10-26T16:53:19.8070657Z postgres-1  | 2026-10-26 16:52:59.816 UTC [1] LOG:  database system is ready to accept connections
+2026-10-26T16:53:19.8071647Z postgres-1  | 2026-10-26 16:53:02.802 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8073591Z postgres-1  | 2026-10-26 16:53:02.991 UTC [69] LOG:  checkpoint complete: wrote 6 buffers (0.0%); 1 WAL file(s) added, 0 removed, 0 recycled; write=0.025 s, sync=0.001 s, total=0.190 s; sync files=5, longest=0.001 s, average=0.001 s; distance=4733 kB, estimate=4733 kB; lsn=0/1DB6E30, redo lsn=0/1DB6DD8
+2026-10-26T16:53:19.8075547Z postgres-1  | 2026-10-26 16:53:04.438 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8076655Z postgres-1  | 2026-10-26 16:53:04.463 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=0.001 s, sync=0.001 s, total=0.026 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4700 kB, estimate=4729 kB; lsn=0/224DE68, redo lsn=0/224DE10
+2026-10-26T16:53:19.8077695Z postgres-1  | 2026-10-26 16:53:05.364 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8078845Z postgres-1  | 2026-10-26 16:53:05.366 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4924 kB, estimate=4924 kB; lsn=0/271D070, redo lsn=0/271D018
+2026-10-26T16:53:19.8079778Z postgres-1  | 2026-10-26 16:53:06.795 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8081086Z postgres-1  | 2026-10-26 16:53:06.797 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4687 kB, estimate=4900 kB; lsn=0/2BB0D98, redo lsn=0/2BB0D40
+2026-10-26T16:53:19.8082067Z postgres-1  | 2026-10-26 16:53:07.607 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8083147Z postgres-1  | 2026-10-26 16:53:07.611 UTC [69] LOG:  checkpoint complete: wrote 7 buffers (0.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=0.001 s, sync=0.001 s, total=0.004 s; sync files=6, longest=0.001 s, average=0.001 s; distance=4734 kB, estimate=4884 kB; lsn=0/3050788, redo lsn=0/3050730
+2026-10-26T16:53:19.8084079Z postgres-1  | 2026-10-26 16:53:08.917 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8085374Z postgres-1  | 2026-10-26 16:53:08.960 UTC [69] LOG:  checkpoint complete: wrote 5 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.043 s; sync files=5, longest=0.001 s, average=0.001 s; distance=5171 kB, estimate=5171 kB; lsn=0/355D560, redo lsn=0/355D508
+2026-10-26T16:53:19.8086291Z postgres-1  | 2026-10-26 16:53:10.148 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8087371Z postgres-1  | 2026-10-26 16:53:10.155 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.006 s, sync=0.001 s, total=0.008 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4859 kB, estimate=5140 kB; lsn=0/3A1C390, redo lsn=0/3A1C338
+2026-10-26T16:53:19.8088281Z postgres-1  | 2026-10-26 16:53:11.533 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8089369Z postgres-1  | 2026-10-26 16:53:11.535 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4843 kB, estimate=5110 kB; lsn=0/3ED7030, redo lsn=0/3ED6FD8
+2026-10-26T16:53:19.8090283Z postgres-1  | 2026-10-26 16:53:12.952 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8091348Z postgres-1  | 2026-10-26 16:53:12.954 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4898 kB, estimate=5089 kB; lsn=0/439F968, redo lsn=0/439F910
+2026-10-26T16:53:19.8092460Z postgres-1  | 2026-10-26 16:53:13.790 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8093553Z postgres-1  | 2026-10-26 16:53:13.792 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4744 kB, estimate=5054 kB; lsn=0/4841B80, redo lsn=0/4841B28
+2026-10-26T16:53:19.8095063Z postgres-1  | 2026-10-26 16:53:14.748 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8096236Z postgres-1  | 2026-10-26 16:53:14.756 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.008 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4954 kB, estimate=5044 kB; lsn=0/4D18700, redo lsn=0/4D186A8
+2026-10-26T16:53:19.8097337Z postgres-1  | 2026-10-26 16:53:15.544 UTC [204] ERROR:  duplicate key value violates unique constraint "entries_account_request_idx"
+2026-10-26T16:53:19.8098030Z postgres-1  | 2026-10-26 16:53:15.544 UTC [204] DETAIL:  Key (account_id, request_id)=(acct-1, req-1) already exists.
+2026-10-26T16:53:19.8098801Z postgres-1  | 2026-10-26 16:53:15.544 UTC [204] STATEMENT:  INSERT INTO entries (account_id, window_id, entry_seq, request_id) VALUES ($1, $2, $3, $4) RETURNING id
+2026-10-26T16:53:19.8099576Z postgres-1  | 2026-10-26 16:53:15.573 UTC [205] ERROR:  duplicate key value violates unique constraint "awards_window_idx"
+2026-10-26T16:53:19.8100397Z postgres-1  | 2026-10-26 16:53:15.573 UTC [205] DETAIL:  Key (window_id)=(e7b899ad-bcae-4fce-af2e-ec414729af16) already exists.
+2026-10-26T16:53:19.8101160Z postgres-1  | 2026-10-26 16:53:15.573 UTC [205] STATEMENT:  INSERT INTO awards (window_id, entry_id, account_id, reason) VALUES ($1, $2, $3, 'instant')
+2026-10-26T16:53:19.8101971Z postgres-1  | 2026-10-26 16:53:15.598 UTC [206] ERROR:  duplicate key value violates unique constraint "schedules_one_active_per_promotion_idx"
+2026-10-26T16:53:19.8102707Z postgres-1  | 2026-10-26 16:53:15.598 UTC [206] DETAIL:  Key (promotion_id)=(c2a527b4-9c66-4261-9a1b-bb2294ed4318) already exists.
+2026-10-26T16:53:19.8103613Z postgres-1  | 2026-10-26 16:53:15.598 UTC [206] STATEMENT:  INSERT INTO schedules (promotion_id, kind, prize_amount_minor, currency, must_award, entries_per_window, prizes_per_person, status)
+2026-10-26T16:53:19.8104516Z postgres-1  | 	     VALUES ($1, 'hourly', 1000, 'USD', true, 1, 1, $2) RETURNING id
+2026-10-26T16:53:19.8105214Z postgres-1  | 2026-10-26 16:53:15.622 UTC [207] ERROR:  duplicate key value violates unique constraint "promotions_one_active_idx"
+2026-10-26T16:53:19.8105822Z postgres-1  | 2026-10-26 16:53:15.622 UTC [207] DETAIL:  Key (status)=(active) already exists.
+2026-10-26T16:53:19.8106492Z postgres-1  | 2026-10-26 16:53:15.622 UTC [207] STATEMENT:  INSERT INTO promotions (name, starts_at, ends_at, time_zone, rules_version_id, status)
+2026-10-26T16:53:19.8107110Z postgres-1  | 	     VALUES ('p', now(), now() + interval '1 day', 'UTC', $1, $2) RETURNING id
+2026-10-26T16:53:19.8107608Z postgres-1  | 2026-10-26 16:53:15.651 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8108719Z postgres-1  | 2026-10-26 16:53:15.718 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=0.040 s, sync=0.001 s, total=0.067 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4935 kB, estimate=5033 kB; lsn=0/51EA3C8, redo lsn=0/51EA370
+2026-10-26T16:53:19.8109786Z postgres-1  | 2026-10-26 16:53:16.658 UTC [219] ERROR:  duplicate key value violates unique constraint "promotions_one_active_idx"
+2026-10-26T16:53:19.8110377Z postgres-1  | 2026-10-26 16:53:16.658 UTC [219] DETAIL:  Key (status)=(active) already exists.
+2026-10-26T16:53:19.8111074Z postgres-1  | 2026-10-26 16:53:16.658 UTC [219] STATEMENT:  UPDATE promotions SET status = 'active' WHERE id = $1
+2026-10-26T16:53:19.8111796Z postgres-1  | 2026-10-26 16:53:16.701 UTC [220] ERROR:  duplicate key value violates unique constraint "schedules_one_active_per_promotion_idx"
+2026-10-26T16:53:19.8112550Z postgres-1  | 2026-10-26 16:53:16.701 UTC [220] DETAIL:  Key (promotion_id)=(7f8ff156-d0eb-417e-9718-1cebb02084ec) already exists.
+2026-10-26T16:53:19.8113487Z postgres-1  | 2026-10-26 16:53:16.701 UTC [220] STATEMENT:  INSERT INTO schedules (promotion_id, kind, prize_amount_minor, currency, must_award, entries_per_window, prizes_per_person, status)
+2026-10-26T16:53:19.8114189Z postgres-1  | 	         VALUES ($1, 'hourly', 1, 'USD', false, 1, 1, 'active')
+2026-10-26T16:53:19.8114855Z postgres-1  | 2026-10-26 16:53:16.857 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8115968Z postgres-1  | 2026-10-26 16:53:16.859 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=5201 kB, estimate=5201 kB; lsn=0/56FEA18, redo lsn=0/56FE9C0
+2026-10-26T16:53:19.8116905Z postgres-1  | 2026-10-26 16:53:18.097 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8117980Z postgres-1  | 2026-10-26 16:53:18.100 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=4885 kB, estimate=5169 kB; lsn=0/5BC40F8, redo lsn=0/5BC40A0
+2026-10-26T16:53:19.8119013Z postgres-1  | 2026-10-26 16:53:19.650 UTC [69] LOG:  checkpoint starting: immediate force wait
+2026-10-26T16:53:19.8120102Z postgres-1  | 2026-10-26 16:53:19.653 UTC [69] LOG:  checkpoint complete: wrote 4 buffers (0.0%); 0 WAL file(s) added, 0 removed, 1 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=4, longest=0.001 s, average=0.001 s; distance=5000 kB, estimate=5153 kB; lsn=0/60A6470, redo lsn=0/60A6418
+2026-10-26T16:53:19.8231506Z Post job cleanup.
+2026-10-26T16:53:19.8985750Z [command]/usr/bin/git version
+2026-10-26T16:53:19.9035222Z git version 2.55.0
+2026-10-26T16:53:19.9115571Z Temporarily overriding HOME='/home/runner/work/_temp/bbd196cc-0b46-4b07-855e-8c8b4cf08468' before making global git config changes
+2026-10-26T16:53:19.9116915Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-26T16:53:19.9118053Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/luckywinclub/luckywinclub
+2026-10-26T16:53:19.9119725Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-26T16:53:19.9247087Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-26T16:53:19.9935527Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-26T16:53:19.9975137Z http.https://github.com/.extraheader
+2026-10-26T16:53:20.0017296Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-26T16:53:20.0150231Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-26T16:53:20.0527369Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-26T16:53:20.0581032Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-26T16:53:20.0962045Z Cleaning up orphan processes
+2026-10-26T16:53:20.1352090Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/setup-node@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
