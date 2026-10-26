@@ -79,6 +79,19 @@ test('parseLockfile skips bundled dependencies nested in a parent (LWC-23: @emna
   assert.ok(!top.ok, 'a top-level inBundle entry has no parent tarball to ride in');
   const withUrl = parseLockfile(lock({ 'node_modules/p': reg('p'), 'node_modules/p/node_modules/x': { version: '1.0.0', inBundle: true, resolved: 'https://evil.example/x.tgz' } }));
   assert.ok(!withUrl.ok, 'a bundled entry carrying its own URL is refused');
+  const nested = parseLockfile(lock({ 'node_modules/p': reg('p'), 'node_modules/p/node_modules/a': { version: '1.0.0', inBundle: true }, 'node_modules/p/node_modules/a/node_modules/b': { version: '1.0.0', inBundle: true } }));
+  assert.ok(nested.ok, 'a bundled entry inside an accepted bundled entry of a registry parent is accepted');
+});
+
+test('parseLockfile refuses inBundle entries whose parent is missing, a link or a workspace', () => {
+  const orphan = parseLockfile(lock({ 'node_modules/existing': reg('existing'), 'node_modules/missing/node_modules/x': { version: '1.0.0', inBundle: true } }));
+  assert.ok(!orphan.ok); assert.match(orphan.reason, /parent "node_modules\/missing" is not a verified registry package/);
+  const linkParent = JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'demo', workspaces: ['packages/*'] }, 'packages/core': { name: '@lwc/core', version: '0.0.0' }, 'node_modules/@lwc/core': { resolved: 'packages/core', link: true }, 'node_modules/@lwc/core/node_modules/x': { version: '1.0.0', inBundle: true } } });
+  const l = parseLockfile(linkParent);
+  assert.ok(!l.ok, 'a link parent'); assert.match(l.reason, /not a verified registry package/);
+  const wsParent = JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'demo', workspaces: ['packages/*'] }, 'packages/core': { name: '@lwc/core', version: '0.0.0' }, 'packages/core/node_modules/x': { version: '1.0.0', inBundle: true } } });
+  const w = parseLockfile(wsParent);
+  assert.ok(!w.ok, 'a workspace parent'); assert.match(w.reason, /not a verified registry package/);
 });
 
 test('parseLockfile refuses a workspace entry outside the repository and lockfile v1 / invalid JSON', () => {
