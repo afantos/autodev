@@ -19,7 +19,7 @@ import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
-import { conflictFeedback } from './automerge.ts';
+import { codingModelOverrideKey, conflictFeedback } from './automerge.ts';
 import { looksLikeOfflineMiss, planPrime, readBaseLockfile, readLockfileSafely } from './npm-cache-prime.ts';
 export { scanSecrets } from './secrets.ts';
 
@@ -482,7 +482,8 @@ async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectCon
   ];
 
   const complexity = ticket.estimate ?? 3;
-  const model = complexity >= cfg.models.complexThreshold ? cfg.models.codingComplex : cfg.models.coding;
+  // A second-review escalation runs its rework with codingComplex whatever the estimate (one pass; cleared below).
+  const model = kvGet(db, codingModelOverrideKey(job.id)) ?? (complexity >= cfg.models.complexThreshold ? cfg.models.codingComplex : cfg.models.coding);
   const priorDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- Q: ${d.question}\n  A (${d.authority}): ${d.decision}`).join('\n');
   // Human answers on the [Plan] umbrella issue (e.g. to the plan's open questions) are part of the requirements.
   const planNotes = ticket.parentId ? (await ctx.tracker.listComments(ticket.parentId).catch(() => [])).filter((c) => !c.byAutomation).map((c) => c.body).join('\n---\n') : '';
@@ -532,6 +533,7 @@ When done, leave the changes in the working tree (the orchestrator commits them)
   if (result.status === 'failed') throw new AgentFailure({ ...res, ok: false, errorKind: 'other', error: result.blocker ?? result.summary });
   updateJob(db, job.id, { pending_feedback: null, summary_json: mergeSummary(job, { coding: result }) }, owner);
   kvSet(db, `base-refreshed:${job.id}`, null);
+  kvSet(db, codingModelOverrideKey(job.id), null);
   job.pending_feedback = null;
 }
 

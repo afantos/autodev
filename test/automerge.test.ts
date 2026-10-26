@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeEnv, job } from './helpers.ts';
 import { DEFAULTS } from '../src/agents/fake.ts';
+import type { FakeBehavior } from '../src/agents/fake.ts';
 import { OpenAiReviewer, SECOND_REVIEW_JSON_SCHEMA, SECOND_REVIEW_SYSTEM, effectiveVerdict, parseUsage, priceUsage, requestBytes, worstCaseUsd } from '../src/agents/second-review.ts';
 import type { Pricing, TestIntegrityVerdict, TestUpdateReviewInput } from '../src/agents/second-review.ts';
 import type { SecondReviewer, SecondReviewInput, SecondReviewVerdict } from '../src/agents/second-review.ts';
@@ -137,6 +138,81 @@ test('second review keeps requesting changes: after maxReviewCycles the PR is he
   assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
   assert.equal(approval(e, j.pr_number), null);
   assert.match(await comments(e, t.id), /Auto-merge is on hold[\s\S]*still requests changes after 1 rework cycles/);
+});
+
+// ---------------------------------------------------------------- stalled review loop: one escalated rework (2026-10-26)
+
+/** The first coding run implements; later runs change nothing unless the prompt is the escalated rework. */
+const fixesOnlyWhenEscalated: FakeBehavior = async (spec, n) => {
+  if (n === 1 || /ESCALATED REWORK/.test(spec.prompt)) return DEFAULTS.coding!(spec, n);
+  return { structured: { status: 'completed', summary: 'already handled', filesChanged: [], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } };
+};
+/** The first coding run implements; every later run changes nothing. */
+const neverFixes: FakeBehavior = async (spec, n) => (n === 1 ? DEFAULTS.coding!(spec, n) : { structured: { status: 'completed', summary: 'already handled', filesChanged: [], testsAdded: [], commandsRun: [], decisions: [], knownLimitations: [] } });
+const eventCount = (e: ReturnType<typeof makeEnv>, type: string) => (e.ctx.db.prepare('SELECT COUNT(*) AS n FROM events WHERE type = ?').get(type) as { n: number }).n;
+const codingCalls = (e: ReturnType<typeof makeEnv>) => e.runner.calls.filter((c) => c.role === 'coding');
+
+test('escalation: a no-progress rework becomes one escalated rework with every finding, and the fixed candidate merges', async () => {
+  const reviewer = new FakeReviewer([CHANGES, APPROVE]);
+  const e = env(reviewer, { behaviors: { coding: fixesOnlyWhenEscalated } });
+  const t = await ready(e);
+  await cycles(e, 8);
+  const j = job(e, t.identifier);
+  assert.equal(eventCount(e, 'automerge.rework'), 1);
+  assert.equal(eventCount(e, 'automerge.escalate'), 1, 'exactly one escalation');
+  assert.equal(eventCount(e, 'automerge.hold'), 0, 'never held for a human');
+  const escalation = codingCalls(e).find((c) => /ESCALATED REWORK/.test(c.prompt));
+  assert.ok(escalation, 'the escalated rework ran');
+  for (const part of ['[major/bug] CHANGES.md:1: Loops forever on Infinity', 'Fix: Validate bounds first', 'do not argue it away', 'the previous rework attempt changed nothing']) {
+    assert.ok(escalation.prompt.includes(part), `escalation prompt carries: ${part}`);
+  }
+  assert.equal(reviewer.inputs.length, 2, 'the unchanged candidate reuses its verdict; the escalated one is reviewed');
+  assert.notEqual(reviewer.inputs[1]!.candidateSha, reviewer.inputs[0]!.candidateSha);
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'merged');
+  assert.equal(approval(e, j.pr_number)?.sha, reviewer.inputs[1]!.candidateSha);
+  assert.match(await comments(e, t.id), /escalated rework with opus/);
+});
+
+test('escalation: if the escalated rework also changes nothing, the PR is held as before and nothing more is spent', async () => {
+  const reviewer = new FakeReviewer([CHANGES]);
+  const e = env(reviewer, { behaviors: { coding: neverFixes } });
+  const t = await ready(e);
+  await cycles(e, 8);
+  const j = job(e, t.identifier);
+  assert.equal(eventCount(e, 'automerge.escalate'), 1, 'one escalation, not a loop');
+  assert.equal(j.status, 'awaiting_merge');
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
+  assert.equal(approval(e, j.pr_number), null);
+  assert.match(await comments(e, t.id), /Auto-merge is on hold[\s\S]*the last rework left the candidate unchanged[\s\S]*escalated rework \(opus\)[\s\S]*already tried/);
+  const runs = codingCalls(e).length;
+  await cycles(e, 3);
+  assert.equal(codingCalls(e).length, runs, 'no further coding while held');
+  assert.equal(reviewer.inputs.length, 1);
+});
+
+test('escalation: if the escalated candidate is rejected again, the PR is held as before', async () => {
+  const reviewer = new FakeReviewer([CHANGES]);
+  const e = env(reviewer, { config: { limits: { maxReviewCycles: 1 } } });
+  const t = await ready(e);
+  await cycles(e, 8);
+  const j = job(e, t.identifier);
+  assert.equal(eventCount(e, 'automerge.rework'), 1);
+  assert.equal(eventCount(e, 'automerge.escalate'), 1, 'max cycles reached: one escalation before holding');
+  assert.equal(reviewer.inputs.length, 3, 'initial, after the rework, after the escalation');
+  assert.equal((await e.scm.getPr(e.repo, j.pr_number)).state, 'open');
+  assert.equal(approval(e, j.pr_number), null);
+  assert.match(await comments(e, t.id), /Auto-merge is on hold[\s\S]*still requests changes after 1 rework cycles and an escalated rework \(opus\)/);
+});
+
+test('escalation: the escalated rework runs with models.codingComplex regardless of the estimate; the others do not', async () => {
+  const reviewer = new FakeReviewer([CHANGES, APPROVE]);
+  const e = env(reviewer, { behaviors: { coding: fixesOnlyWhenEscalated }, config: { models: { coding: 'sonnet', codingComplex: 'opus-max' } } });
+  const t = await e.tracker.createTicket({ projectKey: 'demo', title: 'Small', description: 'Do the thing.', status: 'ready', priority: 2, estimate: 1 });
+  await cycles(e, 8);
+  const models = codingCalls(e).map((c) => [/ESCALATED REWORK/.test(c.prompt), c.model]);
+  assert.deepEqual(models, [[false, 'sonnet'], [false, 'sonnet'], [true, 'opus-max']]);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'merged');
+  assert.equal(kvGet(e.ctx.db, `coding-model-override:${job(e, t.identifier).id}`), null, 'the override is one-shot');
 });
 
 // ---------------------------------------------------------------- gates that must hold for a human

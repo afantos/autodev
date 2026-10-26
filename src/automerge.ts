@@ -175,9 +175,27 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     const findings = fmt(decision.blocking);
     // No progress: this exact candidate was already sent back for these findings and the rework changed nothing.
     const reworkKey = `second-review-rework:${job.id}:${sha}:${requirements}`;
-    if (kvGet(db, reworkKey)) return hold(`The second review (${reviewer.model}) still requests changes, but the last rework left the candidate unchanged (${sha.slice(0, 12)}), so another rework would repeat it. A human should decide:\n${verdict.summary}\n${findings}`);
+    const noProgress = !!kvGet(db, reworkKey);
     kvSet(db, reworkKey, '1');
-    if (job.review_cycles >= cfg.limits.maxReviewCycles) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles:\n${verdict.summary}\n${findings}`);
+    const exhausted = job.review_cycles >= cfg.limits.maxReviewCycles;
+    // Before holding, one escalated rework per ticket requirements: every finding verbatim, the strongest coding model,
+    // and an explicit instruction to fix rather than argue. If the escalated candidate is rejected too, or the escalation
+    // changed nothing, hold for a human.
+    const escalationKey = `review-escalated:${job.id}:${requirements}`;
+    const escalated = !!kvGet(db, escalationKey);
+    if (escalated) {
+      const tried = `an escalated rework (${cfg.models.codingComplex}) that received every finding`;
+      if (noProgress) return hold(`The second review (${reviewer.model}) still requests changes, but the last rework left the candidate unchanged (${sha.slice(0, 12)}), so another rework would repeat it; ${tried} was already tried. A human should decide:\n${verdict.summary}\n${findings}`);
+      if (exhausted) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles and ${tried}:\n${verdict.summary}\n${findings}`);
+      return hold(`The second review (${reviewer.model}) still requests changes after ${tried}. A human should decide:\n${verdict.summary}\n${findings}`);
+    }
+    if (noProgress || exhausted) {
+      kvSet(db, escalationKey, sha);
+      kvSet(db, codingModelOverrideKey(job.id), cfg.models.codingComplex);
+      const why = noProgress ? `the last rework left the candidate unchanged (${sha.slice(0, 12)})` : `${cfg.limits.maxReviewCycles} rework cycles did not resolve them`;
+      return requeue({ stage: 'workspace', pending_feedback: escalationFeedback(reviewer.model, verdict, findings, noProgress) },
+        'automerge.escalate', `⏫ Second review (${reviewer.model}) still requests changes and ${why}. autodev is running one escalated rework with ${cfg.models.codingComplex} before asking a human.\n\n${verdict.summary}\n${findings}`);
+    }
     return requeue({ stage: 'workspace', review_cycles: job.review_cycles + 1, pending_feedback: `The independent merge reviewer (${reviewer.model}) requested changes before this can be merged:\n${verdict.summary}\n${findings}\nSpec conformance notes: ${verdict.specConformance}` },
       'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
   }
@@ -221,6 +239,20 @@ export function requirementsHash(ctx: Ctx, ticket: Ticket): string {
  */
 export function humanDecisions(ctx: Ctx, ticket: Ticket): { question: string; decision: string }[] {
   return decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved').map((d) => ({ question: d.question, decision: d.decision ?? '' }));
+}
+
+/** One-shot coding model for the next implement pass (set by a review escalation, cleared once that pass completes). */
+export function codingModelOverrideKey(jobId: string): string {
+  return `coding-model-override:${jobId}`;
+}
+
+/** Feedback for the escalated rework: every blocking finding verbatim, to be fixed, not argued away. */
+export function escalationFeedback(model: string, verdict: SecondReviewVerdict, findings: string, noProgress: boolean): string {
+  return `ESCALATED REWORK. The independent merge reviewer (${model}) still requests changes before this can be merged`
+    + (noProgress ? ', and the previous rework attempt changed nothing: the candidate is identical to the one it rejected.' : ', after the maximum number of rework cycles.')
+    + `\n\nFix every finding below. Each one is required: do not argue it away, do not explain why it is already handled, and do not leave it for later. `
+    + 'Make the code change the finding asks for (or an equivalent one that removes the problem), add or update tests that prove it, and re-run the checks. '
+    + `This is the last automatic attempt before a human is asked.\n\nReviewer summary: ${verdict.summary}\n\nFindings (severity/category, file:line, issue, suggested fix):\n${findings}\n\nSpec conformance notes: ${verdict.specConformance}`;
 }
 
 export function conflictFeedback(base: string, files: string[]): string {
