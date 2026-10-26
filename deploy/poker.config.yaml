@@ -50,7 +50,7 @@ concurrency:
   global: 1                              # first supervised runs: one agent at a time
 
 budget:                                  # USD, SDK estimates; the Claude Console monthly limit is the hard stop
-  dailyUsd: 100                          # 2026-10-26: raised from $50 (owner decision); monthly unchanged
+  dailyUsd: 50
   monthlyUsd: 500
   perTicketUsd: 3
   perTicketOverrides:                    # owner-approved exceptions to perTicketUsd, by ticket
