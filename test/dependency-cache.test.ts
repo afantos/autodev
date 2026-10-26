@@ -36,3 +36,16 @@ test('dependencyCacheSeconds: 0 disables the cache', async () => {
   await e.orch.reconcile(); await e.orch.reconcile();
   assert.equal(n, 2);
 });
+
+test('a failed dependency lookup is not cached; the next tick asks again', async () => {
+  const e = makeEnv({ config: { loop: { dependencyCacheSeconds: 600 } } });
+  const done = await e.tracker.createTicket({ projectKey: 'demo', title: 'Done dep', description: '', status: 'done', priority: 2 });
+  const ready = await e.tracker.createTicket({ projectKey: 'demo', title: 'Blocked by done', description: '', status: 'ready', priority: 2 });
+  await e.tracker.addBlockedBy(ready.id, done.id);
+  const real = e.tracker.getTicket.bind(e.tracker);
+  let n = 0;
+  e.ctx.tracker.getTicket = async (id: string) => { if (id !== done.id) return real(id); n++; if (n === 1) throw new Error('Linear HTTP 429'); return real(id); };
+  assert.equal((await e.orch.reconcile()).has(done.id), false);
+  assert.equal((await e.orch.reconcile()).has(done.id), true, 'retried after the failure');
+  assert.equal(n, 2);
+});

@@ -80,6 +80,9 @@ linear:
     canceled: Canceled
   requireLabel: autodev                  # only tickets carrying this label are touched (safe default)
 
+loop:
+  tickSeconds: 60                       # 2026-10-26: halves per-tick Linear calls (shared key hit 2,500 requests/hour)
+
 concurrency:
   global: 2                              # 2026-10-26 (owner): poker and luckywinclub run side by side; each project keeps maxConcurrent 1
 
