@@ -183,6 +183,9 @@ Adapt the commands, required check names, approved dependencies and protected pa
 repository. Seed its dedicated offline dependency cache and keep `workspaceDir` outside the
 config, state and HOME directories, as described in the [setup guide](docs/SETUP.md#workspace-layout-and-release-gate).
 Projects sharing a Linear team need a `projectName` scope or `project:<key>` ticket labels.
+What the repository itself needs (a `CLAUDE.md`, self-contained offline validation, the sandbox
+self-test, per-job resources and starting concurrency) is in
+[Onboarding a repository](docs/SETUP.md#6-onboarding-a-repository).
 
 Give the coding bot access to the new GitHub repository and the Linear account access to its
 team. Copy and adapt [templates/github/ci.yml](templates/github/ci.yml), then configure branch
