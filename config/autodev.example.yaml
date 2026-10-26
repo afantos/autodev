@@ -31,6 +31,9 @@ projects:
     maxConcurrent: 1
     stackedBranches: false            # true = may base a ticket on an unmerged dependency's PR branch
     approvedDependencies: []          # packages the Decision Agent may add without asking you
+    humanReviewPaths: []              # repo-relative regexes for product specs, architecture or other protected files
+    protectTests: true               # existing test edits require review; new tests are checked for weakening
+    autoMerge: false                 # optional: requires secondReview.enabled and a separate reviewer account (docs/SETUP.md §3b)
 
 linear:
   states:                             # names of your Linear workflow states
@@ -44,6 +47,7 @@ linear:
     failed: Failed
     canceled: Canceled
   requireLabel: ""                    # e.g. "autodev" to only touch labeled tickets
+  holdMergeLabel: hold-merge          # owner label that prevents automated approval and merging
 
 concurrency:
   global: 2

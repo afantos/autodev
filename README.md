@@ -155,6 +155,49 @@ Phases 1–10 are implemented and tested:
 Connecting to **your** Linear, GitHub, and cloud VM needs your credentials and approval. See
 [docs/SETUP.md](docs/SETUP.md).
 
+## Adding a project
+
+Start with [config/autodev.example.yaml](config/autodev.example.yaml) for a new instance, or add
+another entry to `projects:` in your existing instance's config. Project setup is configuration;
+the orchestrator and agents work across repositories without changes to `src/`.
+
+```yaml
+projects:
+  - key: webapp
+    repo: your-org/webapp
+    linear:
+      teamKey: ENG
+      projectName: Web App
+    setup: ["npm ci --offline --no-audit"]
+    npmCacheDir: ./cache/webapp/npm
+    validate: ["npm run typecheck", "npm run lint", "npm test", "NODE_ENV=production npm run build"]
+    requiredChecks: [checks, audit]
+    approvedDependencies: []
+    humanReviewPaths: ['^docs/product-spec\.md$', '^docs/adr/']
+    protectTests: true
+    autoMerge: false
+    docs: [README.md, docs/product-spec.md, docs/adr]
+```
+
+Adapt the commands, required check names, approved dependencies and protected paths to that
+repository. Seed its dedicated offline dependency cache and keep `workspaceDir` outside the
+config, state and HOME directories, as described in the [setup guide](docs/SETUP.md#workspace-layout-and-release-gate).
+Projects sharing a Linear team need a `projectName` scope or `project:<key>` ticket labels.
+
+Give the coding bot access to the new GitHub repository and the Linear account access to its
+team. Copy and adapt [templates/github/ci.yml](templates/github/ci.yml), then configure branch
+protection and matching required checks. Auto-merge additionally needs the separate GitHub
+reviewer account and `secondReview.enabled`; setup steps are in
+[GitHub setup](docs/SETUP.md#3-github-you) and
+[independent review](docs/SETUP.md#3b-auto-merge-with-an-independent-second-reviewer-optional-you).
+Keep credentials in the instance's gitignored `.env`; tickets can be approved by moving them
+to Ready after the workflow mapping passes `autodev linear-check`.
+
+The `hold-merge` Linear label stops automated approval and merging while leaving coding and
+validation available. Set `linear.holdMergeLabel` to change the label name, and remove the
+label when owner review is complete. Budgets and concurrency limits apply across all projects
+in the same instance; use separate instance configs and data directories for independent limits.
+
 ## Commands
 
 ```bash
