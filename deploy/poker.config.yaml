@@ -79,8 +79,10 @@ projects:
     repo: afantos/email-support
     linear:
       teamKey: EML
-    setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
-    npmCacheDir: /opt/autodev/instance/cache/email-support/npm   # starts empty; filled by npmCachePrime
+    # 2026-10-27 (owner, Q35): setup also runs on the fresh checkout before the agent writes code, and the repository has no
+    # lockfile until the scaffold, so it is skipped then. Back to plain `npm ci --offline --no-audit` after EML-2 merges.
+    setup: ["test ! -f package-lock.json || npm ci --offline --no-audit"]   # command networking is disabled inside the sandbox
+    npmCacheDir: /opt/autodev/instance/cache/email-support/npm   # starts with an empty _cacache (the sandbox copies it); filled by npmCachePrime
     npmCachePrime: true
     npmCachePrimeMaxArtifacts: 600
     npmCachePrimeMaxMb: 1500
