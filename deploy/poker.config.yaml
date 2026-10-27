@@ -70,14 +70,22 @@ projects:
 
   # email-support (Linear team EML, repo afantos/email-support), onboarded 2026-10-27. Decisions: email-support
   # docs/adr/0001-initial-decisions.md. The repository starts with documents only (main 4c9547b); the scaffold is the
-  # first ticket. setup/validate stay empty and autoMerge off until the scaffold merges; then add setup, validate,
-  # npmCacheDir and turn on autoMerge with flaggedDiffApprover: second-review (owner decision, ADR 0001 §20).
+  # first ticket (EML-2). autoMerge stays off until the scaffold merges; then turn it on with flaggedDiffApprover:
+  # second-review (owner decision, ADR 0001 §20).
+  # 2026-10-27 (owner, Q34): setup/validate and automatic cache priming are live BEFORE the scaffold ticket, so EML-2's
+  # first validation primes the empty cache from its own lockfile. A probe lockfile of the 19 approved dependencies was
+  # 378 packages / 805 MB (Next.js ships one ~35 MB compiler per platform), above the 400 / 500 MB defaults.
   - key: email-support
     repo: afantos/email-support
     linear:
       teamKey: EML
-    setup: []
-    validate: []
+    setup: ["npm ci --offline --no-audit"]          # command networking is disabled inside the sandbox
+    npmCacheDir: /opt/autodev/instance/cache/email-support/npm   # starts empty; filled by npmCachePrime
+    npmCachePrime: true
+    npmCachePrimeMaxArtifacts: 600
+    npmCachePrimeMaxMb: 1500
+    npmCachePrimeTimeoutMinutes: 15
+    validate: ["npm run typecheck", "npm run lint", "npm test", "npm run build"]   # offline, unit-level; Postgres/RLS tests run in the GitHub integration job
     requiredChecks: ["checks", "integration"]        # both required by branch protection (integration = Postgres via Compose, incl. RLS)
     env:
       NODE_ENV: test
