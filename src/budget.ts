@@ -1,6 +1,7 @@
 import type { Config } from './config.ts';
 import type { Db } from './db.ts';
-import { kvGet, kvSet, logEvent, now, spentOnTicket, spentSince, tx } from './db.ts';
+import { SETTLED_OUTCOME, kvGet, kvSet, logEvent, now, ownerDead, recordUsage, spentOnTicket, spentSince, tx } from './db.ts';
+import type { AgentRole } from './types.ts';
 
 export function startOfDay(t = new Date()): number {
   const d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime();
@@ -52,16 +53,83 @@ export function canStartRun(db: Db, cfg: Config, ticketId?: string | null): Gate
   return { ok: allowance > 0, allowanceUsd: Math.max(0, allowance), reason: allowance > 0 ? undefined : 'no budget remaining' };
 }
 
-export function reserveBudget(db: Db, cfg: Config, owner: string, meta: { ticketId?: string | null; jobId?: string | null }, requested: number): Gate & { reservationId?: string } {
+export function reserveBudget(db: Db, cfg: Config, owner: string, meta: { ticketId?: string | null; jobId?: string | null }, requested: number, run: { role?: AgentRole; model?: string } = {}): Gate & { reservationId?: string } {
   return tx(db, () => {
     const gate = canStartRun(db, cfg, meta.ticketId);
     if (!gate.ok) return gate;
     const amount = Math.min(requested, gate.allowanceUsd);
     if (!Number.isFinite(amount) || amount <= 0) return { ok: false, reason: 'invalid run budget', allowanceUsd: 0 };
     const id = crypto.randomUUID();
-    db.prepare('INSERT INTO budget_reservations VALUES (?,?,?,?,?,?)').run(id, owner, meta.ticketId ?? null, meta.jobId ?? null, amount, now());
+    db.prepare('INSERT INTO budget_reservations (id, owner, ticket_id, job_id, amount_usd, created_at, role, model) VALUES (?,?,?,?,?,?,?,?)')
+      .run(id, owner, meta.ticketId ?? null, meta.jobId ?? null, amount, now(), run.role ?? null, run.model ?? null);
     return { ok: true, allowanceUsd: amount, reservationId: id };
   });
+}
+
+// ---------------- settling reservations whose spend is unknown
+
+interface ReservationRow { id: string; owner: string; ticket_id: string | null; job_id: string | null; amount_usd: number; created_at: number; role: string | null; model: string | null }
+export interface Settlement { reservationId: string; owner: string; jobId: string | null; ticketId: string | null; reservedUsd: number; recordedUsd: number; chargedUsd: number }
+
+/**
+ * Settle one reservation whose run ended without a trustworthy usage total (runner threw, aborted, incomplete usage) or
+ * whose owner process died: charge the reservation minus the usage already recorded for that run, never below 0, as a
+ * usage row with outcome SETTLED_OUTCOME, and delete the reservation. The run's cap (maxBudgetUsd) is the reservation, so
+ * this is the most it could have spent. Must run inside a transaction: the row and the deletion commit together.
+ * Idempotent by reservation id: a reservation already settled (or gone) returns null and charges nothing.
+ */
+export function settleReservationIn(db: Db, id: string): Settlement | null {
+  const r = db.prepare('SELECT * FROM budget_reservations WHERE id = ?').get(id) as ReservationRow | undefined;
+  if (!r) return null;
+  if (db.prepare('SELECT 1 FROM usage WHERE reservation_id = ? AND outcome = ?').get(id, SETTLED_OUTCOME)) {
+    db.prepare('DELETE FROM budget_reservations WHERE id = ?').run(id);
+    return null;
+  }
+  let recorded = (db.prepare('SELECT COUNT(*) n, COALESCE(SUM(cost_usd),0) s FROM usage WHERE reservation_id = ?').get(id) as { n: number; s: number });
+  if (!recorded.n && (r.job_id || r.ticket_id)) {
+    // Reservations made before usage rows carried reservation_id: the partial usage row of the same run is the earliest
+    // unlinked 'usage_unknown' row of its job (or ticket) since the reservation. Link it so no other reservation counts it.
+    const legacy = db.prepare(`SELECT id, cost_usd FROM usage WHERE reservation_id IS NULL AND outcome = 'usage_unknown' AND ts >= ?
+      AND ${r.job_id ? 'job_id = ?' : 'job_id IS NULL AND ticket_id = ?'} ORDER BY ts, id LIMIT 1`).get(r.created_at, r.job_id ?? r.ticket_id) as { id: number; cost_usd: number } | undefined;
+    if (legacy) {
+      db.prepare('UPDATE usage SET reservation_id = ? WHERE id = ?').run(id, legacy.id);
+      recorded = { n: 1, s: legacy.cost_usd };
+    }
+  }
+  const charged = Math.max(0, r.amount_usd - recorded.s);
+  recordUsage(db, {
+    jobId: r.job_id, ticketId: r.ticket_id, role: (r.role as AgentRole | null) ?? 'unknown', model: r.model, costUsd: charged,
+    outcome: SETTLED_OUTCOME, reservationId: id,
+  });
+  db.prepare('DELETE FROM budget_reservations WHERE id = ?').run(id);
+  return { reservationId: id, owner: r.owner, jobId: r.job_id, ticketId: r.ticket_id, reservedUsd: r.amount_usd, recordedUsd: recorded.s, chargedUsd: charged };
+}
+
+export function logSettlement(db: Db, s: Settlement, why: string) {
+  logEvent(db, 'budget.settled', `Reservation ${s.reservationId} ($${s.reservedUsd.toFixed(2)}, owner ${s.owner}) settled: ${why}; charged $${s.chargedUsd.toFixed(3)} as ${SETTLED_OUTCOME} ($${s.recordedUsd.toFixed(3)} already recorded)`,
+    { jobId: s.jobId, ticketId: s.ticketId, level: 'warn', data: s });
+}
+
+/** Settle one reservation in its own transaction and log it. */
+export function settleReservation(db: Db, id: string, why: string): Settlement | null {
+  const s = tx(db, () => settleReservationIn(db, id));
+  if (s) logSettlement(db, s, why);
+  return s;
+}
+
+/**
+ * Startup recovery: settle every reservation whose owner process is dead (a crash or restart mid-run). Reservations of
+ * this process, of live processes (e.g. a CLI planning run) and of other hosts are kept. Safe to repeat.
+ */
+export function settleDeadOwnerReservations(db: Db, self: string, isDead: (owner: string) => boolean = (o) => ownerDead(o, self)): Settlement[] {
+  const rows = db.prepare('SELECT id, owner FROM budget_reservations ORDER BY created_at, id').all() as { id: string; owner: string }[];
+  const out: Settlement[] = [];
+  for (const r of rows) {
+    if (!isDead(r.owner)) continue;
+    const s = settleReservation(db, r.id, `owner process ${r.owner} is gone`);
+    if (s) out.push(s);
+  }
+  return out;
 }
 
 function exhausted(db: Db, cfg: Config, reason: string): Gate {

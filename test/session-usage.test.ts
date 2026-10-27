@@ -101,7 +101,7 @@ test('a terminal budget error records its incremental cost, including genuine ov
   assert.equal(reservations(e), 0);
 });
 
-test('a lost terminal result leaves its reservation and baseline intact, even after a later successful resume', async () => {
+test('a lost terminal result is settled conservatively and leaves the baseline intact, even after a later successful resume', async () => {
   const e = env();
   await call(e, result('lost', 0.302));
   const saved = baseline(e, 'lost');
@@ -109,13 +109,13 @@ test('a lost terminal result leaves its reservation and baseline intact, even af
   const lost = await runAgent(e.ctx, { ...spec(e, 'lost'), maxBudgetUsd: 0.15 }, { ticketId: 'ticket' });
   assert.equal(lost.usageComplete, false);
   assert.equal(baseline(e, 'lost'), saved);
-  assert.equal(reservations(e), 1);
+  assert.equal(reservations(e), 0);
+  assert.ok(Math.abs(spentOnTicket(e.ctx.db, 'ticket') - 0.452) < 1e-12, 'the unknown run is charged its whole reservation');
   await call(e, result('lost', 0.452, 150, 15, 30), 'lost');
-  assert.equal(spentOnTicket(e.ctx.db, 'ticket'), 0.452);
-  assert.equal(reservations(e), 1, 'unknown earlier reservation is never silently released');
+  assert.ok(Math.abs(spentOnTicket(e.ctx.db, 'ticket') - 0.602) < 1e-12, 'never released, even if the resume reports it');
 });
 
-test('zeroed crash results and decreased token totals never reset the saved baseline or release reservations', async () => {
+test('zeroed crash results and decreased token totals never reset the saved baseline or release reservations uncharged', async () => {
   const e = env();
   await call(e, result('zeroed', 0.302));
   const saved = baseline(e, 'zeroed');
@@ -125,19 +125,20 @@ test('zeroed crash results and decreased token totals never reset the saved base
   const decreased = await call(e, result('zeroed', 0.4, 99, 20, 40), 'zeroed', { maxBudgetUsd: 0.1 });
   assert.equal(decreased.usageComplete, false);
   assert.equal(baseline(e, 'zeroed'), saved);
-  assert.equal(reservations(e), 2);
+  assert.equal(reservations(e), 0);
   const out = await call(e, result('zeroed', 0.452, 150, 15, 30), 'zeroed');
   assert.ok(Math.abs(out.costUsd - 0.15) < 1e-12);
-  assert.equal(spentOnTicket(e.ctx.db, 'ticket'), 0.452);
+  assert.ok(Math.abs(spentOnTicket(e.ctx.db, 'ticket') - 0.652) < 1e-12, 'both unknown runs charged their reservations');
 });
 
-test('malformed session results keep the reservation instead of freeing unknown spend', async () => {
+test('malformed session results charge the reservation instead of freeing unknown spend', async () => {
   for (const message of [result('', 0.2), result('invalid', NaN), result('invalid', -0.1), result('invalid', 0.2, -1)]) {
     const e = env();
     const out = await call(e, message);
     assert.equal(out.ok, false);
     assert.equal(out.usageComplete, false);
-    assert.equal(reservations(e), 1);
+    assert.equal(reservations(e), 0);
+    assert.equal(spentOnTicket(e.ctx.db, 'ticket'), 1.5);
     assert.equal(baseline(e, 'invalid'), null);
   }
 });

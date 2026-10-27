@@ -1,7 +1,6 @@
-import { hostname } from 'node:os';
 import type { Ctx } from './context.ts';
-import { canStartRun } from './budget.ts';
-import { acquireInstanceLock, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
+import { canStartRun, settleDeadOwnerReservations } from './budget.ts';
+import { acquireInstanceLock, ownerDead, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
 import { blockJob, markBaseRefreshed, resumeBlocked, runJob } from './pipeline.ts';
 import { conflictFeedback } from './automerge.ts';
 import { approvePlan } from './planning.ts';
@@ -27,11 +26,12 @@ export class Orchestrator {
   /** Main loop. Returns when stop() is called and workers have drained (or the drain timeout passes). */
   async run(opts: { once?: boolean } = {}): Promise<void> {
     const { db, cfg, owner } = this.ctx;
-    if (!acquireInstanceLock(db, owner, cfg.loop.leaseSeconds * 1000, ownerDead)) {
+    if (!acquireInstanceLock(db, owner, cfg.loop.leaseSeconds * 1000, (o) => ownerDead(o))) {
       throw new Error('another autodev instance holds the lock on this state file');
     }
     logEvent(db, 'orchestrator.start', `owner=${owner} concurrency=${cfg.concurrency.global} tracker=${cfg.tracker} scm=${cfg.scm} runner=${cfg.runner}`);
     this.recoverDeadOwners();
+    settleDeadOwnerReservations(db, owner);
     while (!this.stopping) {
       try {
         await this.tick();
@@ -67,7 +67,7 @@ export class Orchestrator {
 
   async tick() {
     const { db, cfg, owner } = this.ctx;
-    if (!acquireInstanceLock(db, owner, cfg.loop.leaseSeconds * 1000, ownerDead)) throw new Error('lost instance lock');
+    if (!acquireInstanceLock(db, owner, cfg.loop.leaseSeconds * 1000, (o) => ownerDead(o))) throw new Error('lost instance lock');
     this.recoverExpiredLeases();
     const tickets = await this.reconcile();
     await this.pollCi();
@@ -77,11 +77,9 @@ export class Orchestrator {
 
   /** Jobs left "running" by a previous process on this host that is no longer alive are recovered immediately. */
   recoverDeadOwners() {
-    const me = hostname();
     for (const j of jobsByStatus(this.ctx.db, 'running')) {
-      const [host, pid] = (j.lease_owner ?? '').split(':');
-      if (j.lease_owner === this.ctx.owner) continue;
-      if (host === me && pid && !pidAlive(Number(pid))) this.requeue(j, `previous orchestrator process ${pid} is gone`);
+      if (!j.lease_owner || j.lease_owner === this.ctx.owner) continue;
+      if (ownerDead(j.lease_owner)) this.requeue(j, `previous orchestrator process ${j.lease_owner.split(':')[1]} is gone`);
     }
   }
 
@@ -327,12 +325,3 @@ export class Orchestrator {
   }
 }
 
-/** An owner string "host:pid:boot" on this host whose process no longer exists. */
-function ownerDead(owner: string): boolean {
-  const [host, pid] = owner.split(':');
-  return host === hostname() && !!pid && !pidAlive(Number(pid));
-}
-
-function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
-}

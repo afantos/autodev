@@ -124,7 +124,7 @@ stage is idempotent and a restart re-runs at most one stage:
 - Every agent run records `total_cost_usd` and tokens from the SDK result into the `usage` table.
 - Limits are `daily_usd`, `monthly_usd`, `per_ticket_usd` and `per_run_usd` (passed to SDK
   `maxBudgetUsd`, clamped to the remaining daily/monthly/ticket allowance after durable reservations). When a limit is hit, no new runs start,
-  current progress is kept, and an event is recorded. Reservation and usage settlement are transactional; unknown results remain reserved until manually reconciled.
+  current progress is kept, and an event is recorded. Reservation and usage settlement are transactional. A run that ends without a usage total (thrown, aborted, incomplete) is settled at once, and a reservation whose owner process died is settled at the next startup: the reservation minus usage already recorded for it is charged as `usage_unknown_settled`, once per reservation id.
 - A `rate_limit_event` with status `rejected`, or a usage-limit error, sets a global
   `paused_until` (the reported reset time, or exponential backoff). Jobs are re-queued without
   using up a retry attempt. **autodev never switches credentials or billing to get around a limit.**

@@ -16,7 +16,7 @@ import type { AgentRunner, AgentRunResult, AgentRunSpec } from './agents/runner.
 import { OpenAiReviewer } from './agents/second-review.ts';
 import type { SecondReviewer } from './agents/second-review.ts';
 import { ClaudeRunner } from './agents/runner.ts';
-import { reserveBudget, clearApiErrorStreak, clearUsageLimitStreak, pauseForApiError, pauseForUsageLimit } from './budget.ts';
+import { reserveBudget, logSettlement, settleReservation, settleReservationIn, clearApiErrorStreak, clearUsageLimitStreak, pauseForApiError, pauseForUsageLimit } from './budget.ts';
 import { runSandboxed } from './command-sandbox.ts';
 import { fetchRegistryPackument, primeNpmCache } from './npm-cache-prime.ts';
 import type { FetchPackument } from './npm-cache-prime.ts';
@@ -114,25 +114,32 @@ export async function runAgent(ctx: Ctx, spec: Omit<AgentRunSpec, 'maxBudgetUsd'
     if (spec.fileOnly) await ctx.ws.assertSnapshot(spec.cwd, guardedWorktree, job!.candidate_sha!);
     else gitReadPaths.push(rec.commonDir, rec.gitDir);
   }
-  const gate = reserveBudget(ctx.db, ctx.cfg, ctx.owner, meta, spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd);
+  const gate = reserveBudget(ctx.db, ctx.cfg, ctx.owner, meta, spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd, { role: spec.role, model: spec.model });
   if (!gate.ok) throw new RunGateClosed(gate.reason!, !!gate.ticketScoped);
+  const reservationId = gate.reservationId!;
   const maxBudgetUsd = Math.min(spec.maxBudgetUsd ?? ctx.cfg.budget.perRunUsd, gate.allowanceUsd);
   logEvent(ctx.db, `agent.${spec.role}.start`, `model=${spec.model} budget=$${maxBudgetUsd.toFixed(2)}${spec.resume ? ' (resume)' : ''}`, { jobId: meta.jobId, ticketId: meta.ticketId });
-  // A thrown runner error or process crash leaves the reservation in place;
-  // actual spend is unknown and must not be silently made available again.
+  // A run that ends without a trustworthy usage total (the runner threw, was aborted, or reported incomplete usage) is
+  // settled at once: its spend is unknown, so the whole reservation (its cap) is charged, never made available again.
+  // A process crash leaves the reservation to the dead-owner settlement at the next startup.
   let res: AgentRunResult;
   try { res = await ctx.runner.run({ ...spec, maxBudgetUsd, protectedPaths, gitReadPaths }); }
-  catch (e) { if (repository) await ctx.ws.verifyAgentWorkspace(guardedWorktree!); throw e; }
-  tx(ctx.db, () => {
+  catch (e) {
+    settleReservation(ctx.db, reservationId, `${spec.role} runner threw: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    if (repository) await ctx.ws.verifyAgentWorkspace(guardedWorktree!);
+    throw e;
+  }
+  const settled = tx(ctx.db, () => {
     res = sessionUsageDelta(ctx.db, res, !!spec.resume, meta);
     recordUsage(ctx.db, {
       jobId: meta.jobId, ticketId: meta.ticketId, sessionId: res.sessionId, role: spec.role, model: spec.model, costUsd: res.costUsd,
       inputTokens: res.inputTokens, outputTokens: res.outputTokens, cacheReadTokens: res.cacheReadTokens, durationMs: res.durationMs,
-      outcome: res.usageComplete === false ? 'usage_unknown' : res.ok ? 'ok' : res.errorKind,
+      outcome: res.usageComplete === false ? 'usage_unknown' : res.ok ? 'ok' : res.errorKind, reservationId,
     });
-    if (res.usageComplete !== false) ctx.db.prepare('DELETE FROM budget_reservations WHERE id = ?').run(gate.reservationId!);
+    if (res.usageComplete !== false) { ctx.db.prepare('DELETE FROM budget_reservations WHERE id = ?').run(reservationId); return null; }
+    return settleReservationIn(ctx.db, reservationId);
   });
-  if (res.usageComplete === false) logEvent(ctx.db, 'budget.unsettled', `No terminal usage result; reservation ${gate.reservationId} remains held`, { jobId: meta.jobId, ticketId: meta.ticketId, level: 'warn' });
+  if (settled) logSettlement(ctx.db, settled, `${spec.role} run ended without a terminal usage result (${res.errorKind ?? 'unknown'})`);
   logEvent(ctx.db, `agent.${spec.role}.end`, `${res.ok ? 'ok' : `error=${res.errorKind}: ${String(res.error).slice(0, 300)}`} cost=$${res.costUsd.toFixed(3)} turns=${res.numTurns} ${(res.durationMs / 1000).toFixed(0)}s`,
     { jobId: meta.jobId, ticketId: meta.ticketId, level: res.ok ? 'info' : 'warn' });
   if (res.errorKind === 'rate_limited') pauseForUsageLimit(ctx.db, res.resetsAt);

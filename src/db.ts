@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import type { Job, JobStatus, Stage, AgentRole } from './types.ts';
 
 const SCHEMA = `
@@ -79,8 +80,8 @@ CREATE TABLE IF NOT EXISTS external_usage (
 );
 CREATE INDEX IF NOT EXISTS external_usage_ts ON external_usage(provider, ts);
 
--- Durable reservations are never expired automatically: a lost result may still
--- have incurred charges. Reconcile unknown spend before releasing a reservation.
+-- Durable reservations are never released without a charge: a lost result may still have incurred spend. A run that
+-- ends without a usage total, or whose owner process died, is settled by charging the reservation (budget.ts).
 CREATE TABLE IF NOT EXISTS budget_reservations (
   id TEXT PRIMARY KEY, owner TEXT NOT NULL, ticket_id TEXT, job_id TEXT,
   amount_usd REAL NOT NULL CHECK(amount_usd > 0), created_at INTEGER NOT NULL
@@ -113,6 +114,9 @@ CREATE TABLE IF NOT EXISTS local_prs (
 
 export type Db = DatabaseSync;
 
+/** Usage outcome of the conservative row that settles a reservation whose actual spend is unknown (see budget.ts). */
+export const SETTLED_OUTCOME = 'usage_unknown_settled';
+
 export function openDb(path: string): Db {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -123,6 +127,11 @@ export function openDb(path: string): Db {
   }
   const usageColumns = db.prepare('PRAGMA table_info(usage)').all() as { name: string }[];
   if (!usageColumns.some(c => c.name === 'session_id')) db.exec('ALTER TABLE usage ADD COLUMN session_id TEXT');
+  // Links a usage row to the budget reservation it settles; at most one conservative settlement row per reservation.
+  if (!usageColumns.some(c => c.name === 'reservation_id')) db.exec('ALTER TABLE usage ADD COLUMN reservation_id TEXT');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS usage_one_settlement ON usage(reservation_id) WHERE outcome = '${SETTLED_OUTCOME}'`);
+  const reservationColumns = new Set((db.prepare('PRAGMA table_info(budget_reservations)').all() as { name: string }[]).map(c => c.name));
+  for (const name of ['role', 'model']) if (!reservationColumns.has(name)) db.exec(`ALTER TABLE budget_reservations ADD COLUMN ${name} TEXT`);
   return db;
 }
 
@@ -171,6 +180,23 @@ export function acquireInstanceLock(db: Db, owner: string, ttlMs: number, isDead
     kvSet(db, 'instance_lock', owner);
     return true;
   });
+}
+
+/**
+ * An owner string "host:pid:startTs" whose process no longer exists on this host. Owners on other hosts are never
+ * judged dead (their liveness can't be checked here). With `self` (this process's owner), an owner that names this
+ * process's pid but a different start is an earlier process whose pid was reused, so it is dead too.
+ */
+export function ownerDead(owner: string, self?: string): boolean {
+  if (self && owner === self) return false;
+  const [host, pid] = owner.split(':');
+  if (host !== hostname() || !pid || !/^\d+$/.test(pid)) return false;
+  if (self && Number(pid) === process.pid) return true;
+  return !pidAlive(Number(pid));
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
 }
 
 export function releaseInstanceLock(db: Db, owner: string) {
@@ -267,11 +293,12 @@ export class LeaseLostError extends Error {
 
 // ---------------- usage ----------------
 
-export interface UsageRow { jobId?: string | null; ticketId?: string | null; sessionId?: string | null; role: AgentRole; model?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; durationMs?: number; outcome?: string }
+/** `role` is 'unknown' only for settling a reservation made before reservations recorded their role. */
+export interface UsageRow { jobId?: string | null; ticketId?: string | null; sessionId?: string | null; role: AgentRole | 'unknown'; model?: string | null; costUsd: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; durationMs?: number; outcome?: string; reservationId?: string | null }
 
 export function recordUsage(db: Db, u: UsageRow) {
-  db.prepare('INSERT INTO usage (ts, job_id, ticket_id, session_id, role, model, cost_usd, input_tokens, output_tokens, cache_read_tokens, duration_ms, outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-    .run(now(), u.jobId ?? null, u.ticketId ?? null, u.sessionId ?? null, u.role, u.model ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.cacheReadTokens ?? 0, u.durationMs ?? 0, u.outcome ?? null);
+  db.prepare('INSERT INTO usage (ts, job_id, ticket_id, session_id, role, model, cost_usd, input_tokens, output_tokens, cache_read_tokens, duration_ms, outcome, reservation_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(now(), u.jobId ?? null, u.ticketId ?? null, u.sessionId ?? null, u.role, u.model ?? null, u.costUsd, u.inputTokens ?? 0, u.outputTokens ?? 0, u.cacheReadTokens ?? 0, u.durationMs ?? 0, u.outcome ?? null, u.reservationId ?? null);
   if (u.jobId) db.prepare('UPDATE jobs SET cost_usd = cost_usd + ? WHERE id = ?').run(u.costUsd, u.jobId);
 }
 

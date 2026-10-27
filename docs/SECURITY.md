@@ -54,7 +54,7 @@ autodev runs AI-generated code and shell commands unattended. The design rule is
 - Allowed agent network domains such as github.com can carry data. Keep the allowlist minimal.
 - Command sandboxing must pass the required smoke test on the target host. Nested sandboxing is unavailable in some development environments; local test skips do not establish successful isolation.
 - Setup and validation are offline and cannot reach package registries, local databases, or service sockets. Prepare dependency artifacts inside the worktree or configure a dedicated `npmCacheDir`; only package data is copied into the private HOME. Use self-contained tests. Workflows requiring network services need a separately reviewed isolation design.
-- Budget reservations cap concurrent allowances, but SDK cost estimates can differ from billing and a model call can cross its configured threshold. Provider-side limits remain the spending backstop. Unknown/crashed runs keep their reservation until reconciled.
+- Budget reservations cap concurrent allowances, but SDK cost estimates can differ from billing and a model call can cross its configured threshold. Provider-side limits remain the spending backstop. Unknown/crashed runs are charged their whole reservation (settled once; crashed owners at the next startup).
 
 ## Git trust boundary
 

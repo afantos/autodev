@@ -112,20 +112,22 @@ test('concurrent runs reserve shared budget atomically across SQLite connections
   assert.equal((e.ctx.db.prepare('SELECT COUNT(*) n FROM budget_reservations').get() as { n: number }).n, 0);
 });
 
-test('budget has no five-cent floor and reservations survive unknown runner failures', async () => {
+test('budget has no five-cent floor and unknown runner failures stay charged', async () => {
   const e = makeEnv({ config: { budget: { dailyUsd: 0.01 } } });
   assert.equal(canStartRun(e.ctx.db, e.ctx.cfg).allowanceUsd, 0.01);
   e.runner.behaviors.coding = async () => { throw new Error('lost result'); };
   await assert.rejects(runAgent(e.ctx, specFor(e.root), {}), /lost result/);
   assert.equal(canStartRun(e.ctx.db, e.ctx.cfg).ok, false);
+  assert.equal(spentSince(e.ctx.db, 0), 0.01, 'settled: the reservation is charged, not released');
 });
 
-test('an aborted SDK run without a terminal usage result retains its reservation', async () => {
+test('an aborted SDK run without a terminal usage result is charged its whole reservation', async () => {
   const e = makeEnv({ config: { budget: { dailyUsd: 1, monthlyUsd: 1 } } });
   e.runner.behaviors.coding = async () => ({ ok: false, costUsd: 0, errorKind: 'timeout', usageComplete: false });
   await runAgent(e.ctx, specFor(e.root), {});
   assert.equal(canStartRun(e.ctx.db, e.ctx.cfg).ok, false);
-  assert.equal((e.ctx.db.prepare('SELECT COUNT(*) n FROM budget_reservations').get() as { n: number }).n, 1);
+  assert.equal((e.ctx.db.prepare('SELECT COUNT(*) n FROM budget_reservations').get() as { n: number }).n, 0);
+  assert.equal(spentSince(e.ctx.db, 0), 1);
 });
 
 test('mandatory diff policy blocks unrequested dependencies before validation or push', async () => {
