@@ -165,6 +165,10 @@ export function kvGet(db: Db, k: string): string | null {
   const r = db.prepare('SELECT v FROM kv WHERE k = ?').get(k) as { v: string } | undefined;
   return r?.v ?? null;
 }
+/** Every kv entry whose key starts with `prefix` (compared literally, no LIKE wildcards). */
+export function kvList(db: Db, prefix: string): { k: string; v: string }[] {
+  return db.prepare('SELECT k, v FROM kv WHERE substr(k, 1, ?) = ? ORDER BY k').all(prefix.length, prefix) as { k: string; v: string }[];
+}
 export function kvSet(db: Db, k: string, v: string | null) {
   if (v === null) db.prepare('DELETE FROM kv WHERE k = ?').run(k);
   else db.prepare('INSERT INTO kv (k, v, updated_at) VALUES (?,?,?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at').run(k, v, now());
