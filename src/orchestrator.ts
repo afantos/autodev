@@ -1,6 +1,6 @@
 import type { Ctx } from './context.ts';
 import { canStartRun, settleDeadOwnerReservations } from './budget.ts';
-import { acquireInstanceLock, ownerDead, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
+import { acquireInstanceLock, ownerDead, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvList, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
 import { blockJob, markBaseRefreshed, resumeBlocked, runJob } from './pipeline.ts';
 import { conflictFeedback } from './automerge.ts';
 import { approvePlan } from './planning.ts';
@@ -11,6 +11,10 @@ import { LABEL_PLAN } from './tracker/types.ts';
 import type { Job, Ticket } from './types.ts';
 import { ACTIVE_JOB_STATUSES } from './types.ts';
 import { maybeSendMorningReport } from './report.ts';
+
+/** kv prefix for merged jobs whose ticket waits on other open PRs that name it (see reconcilePendingCompletion). */
+const PENDING_COMPLETION = 'pending-completion:';
+interface PendingCompletion { ticketId: string; identifier: string; repo: string; merged: number[]; open: number[] }
 
 export class Orchestrator {
   ctx: Ctx;
@@ -129,6 +133,16 @@ export class Orchestrator {
     };
     for (const t of listed) for (const id of [...t.blockedBy, ...t.blocks]) await fetchMissing(id);
 
+    for (const { k, v } of kvList(db, PENDING_COMPLETION)) {
+      try {
+        await this.reconcilePendingCompletion(k, JSON.parse(v) as PendingCompletion, byId);
+      } catch (e) {
+        // A failed lookup leaves the entry in place, so the next tick retries; the warning is logged once per message.
+        const msg = String((e as Error)?.message ?? e).slice(0, 400);
+        const key = `reconcile-error:${k}`;
+        if (kvGet(db, key) !== msg) { kvSet(db, key, msg); logEvent(db, 'reconcile.pending_error', `${k}: ${msg}`, { level: 'warn' }); }
+      }
+    }
     for (const job of jobsByStatus(db, 'awaiting_merge', 'blocked', 'queued', 'waiting_ci')) {
       try {
         await this.reconcileJob(job, byId, fetchMissing);
@@ -140,6 +154,43 @@ export class Orchestrator {
       }
     }
     return byId;
+  }
+
+  /**
+   * A merged job whose ticket another open PR still named (e.g. a stacked workflow PR). The job is finished and holds
+   * no work slot; this re-checks the tracked PRs each tick and marks the ticket Done once all of them have merged.
+   * PRs that start naming the ticket later are tracked too. A tracked PR closed without merging, or a ticket a human
+   * already closed, ends the tracking and leaves the ticket to a human. Comments are posted once, on completion or
+   * on abandonment, never per tick. Errors propagate so the caller keeps the entry and retries.
+   */
+  private async reconcilePendingCompletion(key: string, entry: PendingCompletion, byId: Map<string, Ticket>) {
+    const { db, scm, tracker } = this.ctx;
+    const named = await scm.openPrsReferencing(entry.repo, entry.identifier, entry.merged[0]!);
+    const tracked = [...new Set([...entry.open, ...named.map((p) => p.number)])].filter((n) => !entry.merged.includes(n));
+    const open: number[] = [], merged = [...entry.merged], closed: number[] = [];
+    for (const n of tracked) {
+      const p = await scm.getPr(entry.repo, n);
+      if (p.state === 'open') open.push(n); else if (p.state === 'merged') merged.push(n); else closed.push(n);
+    }
+    const prs = (ns: number[]) => ns.map((n) => `#${n}`).join(', ');
+    if (closed.length > 0) {
+      kvSet(db, key, null);
+      await tracker.comment(entry.ticketId, `${prs(closed)} was closed without merging, so ${entry.identifier} is not marked Done. Left for a human to decide.`).catch(() => {});
+      logEvent(db, 'job.pending_abandoned', `${entry.identifier}: ${prs(closed)} closed unmerged; left open`, { ticketId: entry.ticketId, level: 'warn' });
+      return;
+    }
+    if (open.length > 0) {
+      if (open.join() !== entry.open.join() || merged.length !== entry.merged.length) kvSet(db, key, JSON.stringify({ ...entry, merged, open }));
+      return;
+    }
+    const t = await tracker.getTicket(entry.ticketId);
+    if (t && !['done', 'canceled'].includes(t.status)) {
+      await tracker.setStatus(entry.ticketId, 'done');
+      await tracker.comment(entry.ticketId, `🎉 All PRs for ${entry.identifier} merged (${prs(merged)}) — marked Done by autodev.`).catch(() => {});
+      logEvent(db, 'job.done', `${entry.identifier} merged (${prs(merged)})`, { ticketId: entry.ticketId });
+      byId.set(entry.ticketId, { ...t, status: 'done' });
+    }
+    kvSet(db, key, null);
   }
 
   /** Reconcile one job with its ticket and PR. Errors are contained by the caller. */
@@ -160,13 +211,16 @@ export class Orchestrator {
       if (!pr) return;
       if (pr.state === 'merged') {
         // Done only after GitHub confirms the merge, and only when no other open PR still names the ticket (e.g. a
-        // workflow PR stacked on this one, which the bot can't open itself). Then the job is finished but the ticket
-        // stays where it is for a human to close. A failed lookup throws: reconcile retries next tick, never Done early.
+        // workflow PR stacked on this one, which the bot can't open itself). Then the job is finished and the ticket
+        // waits as a pending completion (reconcilePendingCompletion). A failed lookup throws: reconcile retries next
+        // tick, never Done early.
         const pending = await scm.openPrsReferencing(job.repo, job.ticket_identifier, pr.number);
         if (pending.length > 0) {
           updateJob(db, job.id, { status: 'done' });
+          const entry: PendingCompletion = { ticketId: t.id, identifier: job.ticket_identifier, repo: job.repo, merged: [pr.number], open: pending.map((p) => p.number) };
+          kvSet(db, `${PENDING_COMPLETION}${job.id}`, JSON.stringify(entry));
           const list = pending.map((p) => `#${p.number}`).join(', ');
-          await tracker.comment(t.id, `PR #${pr.number} merged. Not marking Done: ${list} still references ${job.ticket_identifier} and is open. Close the ticket once it merges or is closed.`).catch(() => {});
+          await tracker.comment(t.id, `PR #${pr.number} merged. Not marking Done yet: ${list} still references ${job.ticket_identifier} and is open. autodev marks it Done once that merges.`).catch(() => {});
           logEvent(db, 'job.done_pending_prs', `${job.ticket_identifier} merged (#${pr.number}); left open for ${list}`, { jobId: job.id, ticketId: t.id });
           if (job.worktree) await ctx.ws.removeWorktreeIfClean(job.repo, job.worktree).catch(() => {});
           return;
