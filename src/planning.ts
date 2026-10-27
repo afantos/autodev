@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { Ctx } from './context.ts';
@@ -60,6 +60,7 @@ export async function draftPlan(ctx: Ctx, idea: string, projectKey?: string): Pr
   const base = project.baseBranch ?? (await ctx.scm.defaultBranch(project.repo));
   const wt = await ctx.ws.addDetachedWorktree(project.repo, `_plan-${id.slice(0, 8)}`, `origin/${base}`);
   try {
+    const unrunnable = missingValidation(project.validate, (f) => existsSync(join(wt, f)));
     const existing = await ctx.tracker.listTickets({ projectKey: key });
     const decisions = recentDecisions(ctx, project.repo).map((d) => `- Q: ${d.question} → ${d.decision}`).join('\n') || '(none)';
     const prompt = `${docsHint(project)}
@@ -73,7 +74,11 @@ ${untrusted('linear', existingTicketsSummary(existing))}
 
 Prior technical decisions in this repo:
 ${decisions}
-
+${unrunnable.length ? `
+This repository cannot run its validate commands yet (${unrunnable.join('; ')}). Mark exactly ONE ticket with
+establishesValidation: true: the scaffold that makes these commands run (\`${project.validate.join('`, `')}\`). It must depend on
+no other ticket of this plan; autodev makes every other ticket depend on it, because their validation cannot pass before it merges.
+` : ''}
 Research the codebase thoroughly, then return the structured plan. Reference real files.`;
     const res = await runAgent(ctx, {
       role: 'planning', prompt, systemAppend: PLANNING_SYSTEM, cwd: wt, model: ctx.cfg.models.planning, mode: 'readonly',
@@ -87,8 +92,18 @@ Research the codebase thoroughly, then return the structured plan. Reference rea
       ctx.db.prepare(`UPDATE plans SET status = 'failed', updated_at = ? WHERE id = ?`).run(now(), id);
       throw new Error(`planning failed: ${res.error ?? parsed.error?.message}`);
     }
-    const plan = { ...parsed.data, projectKey: key };
-    validatePlanGraph(plan);
+    let plan: Plan = { ...parsed.data, projectKey: key };
+    try {
+      if (unrunnable.length) {
+        const ordered = orderAfterScaffold(plan, scaffoldTicket(plan).key);
+        plan = ordered.plan;
+        if (ordered.added.length) logEvent(ctx.db, 'plan.validation_order', `scaffold ${scaffoldTicket(plan).key} establishes validation (${unrunnable.join('; ')}); added it as a dependency of ${ordered.added.join(', ')}`);
+      } else plan = { ...plan, tickets: plan.tickets.map((t) => ({ ...t, establishesValidation: false })) };
+      validatePlanGraph(plan);
+    } catch (e) {
+      ctx.db.prepare(`UPDATE plans SET status = 'failed', updated_at = ? WHERE id = ?`).run(now(), id);
+      throw new Error(`planning failed: ${(e as Error).message}`);
+    }
     const markdown = renderPlan(id, idea, plan, project.repo);
     ctx.db.prepare(`UPDATE plans SET status = 'draft', plan_json = ?, updated_at = ? WHERE id = ?`).run(JSON.stringify(plan), now(), id);
     const dir = join(ctx.cfg.dataDir, 'plans');
@@ -116,6 +131,56 @@ export function validatePlanGraph(plan: Plan) {
     visiting.delete(k); done.add(k);
   };
   plan.tickets.forEach((t) => visit(t.key));
+}
+
+/**
+ * Files the project's validate commands need before they can run at all, by tool. Commands of other tools are assumed
+ * runnable (nothing to wait for). Each entry lists alternatives: any one of them is enough.
+ */
+const VALIDATION_FILES: [RegExp, string[]][] = [
+  [/^(?:npm|npx|pnpm|yarn)\b|^node\s+--run\b/, ['package.json']],
+  [/^make\b/, ['Makefile', 'makefile', 'GNUmakefile']],
+  [/^cargo\b/, ['Cargo.toml']],
+  [/^go\s/, ['go.mod']],
+];
+
+/** Why the validate commands cannot run in a checkout yet (empty: they can, or there are none). */
+export function missingValidation(validate: string[], has: (file: string) => boolean): string[] {
+  const out = new Set<string>();
+  for (const command of validate) {
+    for (const part of command.split(/&&|\|\||;|\|/).map((p) => p.trim().replace(/^(?:[A-Z_][A-Z0-9_]*=\S*\s+)+/, ''))) {
+      for (const [tool, files] of VALIDATION_FILES) {
+        if (tool.test(part) && !files.some(has)) out.add(`${files.join(' or ')} missing for \`${command}\``);
+      }
+    }
+  }
+  return [...out];
+}
+
+/** The one ticket the planner marked as establishing validation; anything else is ambiguous and rejected. */
+export function scaffoldTicket(plan: Plan): PlanTicket {
+  const marked = plan.tickets.filter((t) => t.establishesValidation);
+  if (marked.length !== 1) {
+    throw new Error(`the repository cannot run its validate commands yet, so exactly one ticket must establish validation (establishesValidation); found ${marked.length ? marked.map((t) => t.key).join(', ') : 'none'}`);
+  }
+  return marked[0]!;
+}
+
+/**
+ * Make every other ticket depend on the scaffold that establishes validation (never the scaffold itself), then reject
+ * dangling keys and cycles, e.g. a scaffold that depends on another ticket of the plan. Returns a copy.
+ */
+export function orderAfterScaffold(plan: Plan, scaffold: string): { plan: Plan; added: string[] } {
+  if (!plan.tickets.some((t) => t.key === scaffold)) throw new Error(`scaffold ${scaffold} is not a ticket of this plan`);
+  const added: string[] = [];
+  const tickets = plan.tickets.map((t) => {
+    if (t.key === scaffold || t.dependsOn.includes(scaffold)) return { ...t, establishesValidation: t.key === scaffold };
+    added.push(t.key);
+    return { ...t, establishesValidation: false, dependsOn: [...t.dependsOn, scaffold] };
+  });
+  const out = { ...plan, tickets };
+  validatePlanGraph(out);
+  return { plan: out, added };
 }
 
 export function ticketDescription(t: PlanTicket, plan: Plan, repo: string, planId: string, keyToIdentifier: Map<string, string>): string {
@@ -179,6 +244,7 @@ ${plan.openQuestions.map((q) => `- ${q.blocking ? '**[blocking]** ' : ''}${q.que
 ${plan.duplicates.map((d) => `- ${d.existingIdentifier} (${d.relation}): ${d.note}`).join('\n') || '- none found'}
 
 ## Tickets (execution order; ⇉ = can run in parallel)
+${plan.tickets.filter((t) => t.establishesValidation).map((t) => `Validation scaffold: ${t.key}. The repository cannot run its validate commands yet, so every other ticket depends on it.\n`).join('')}
 | Key | Title | Pri | Cx | Depends on |
 |---|---|---|---|---|
 ${order.map((t) => `| ${t.key}${t.parallelizable ? ' ⇉' : ''} | ${t.title} | ${t.priority} | ${t.complexity} | ${t.dependsOn.join(', ') || '—'} |`).join('\n')}
@@ -287,4 +353,56 @@ export async function approvePlan(ctx: Ctx, planId: string, approver: string): P
   ctx.db.prepare(`UPDATE plans SET status = 'approved', updated_at = ? WHERE id = ?`).run(now(), fresh.id);
   logEvent(ctx.db, 'plan.approved', `plan ${fresh.id.slice(0, 8)} approved by ${approver}: ${moved.join(', ')}`);
   return moved;
+}
+
+export interface ValidationReconcile { scaffold: { key: string; identifier: string } | null; missing: { key: string; identifier: string }[]; applied: boolean; note: string }
+
+/**
+ * For a plan published before validation ordering existed: list the "blocked by scaffold" links its tickets lack while the
+ * base branch still cannot run the validate commands. A dry run unless `apply`. Only the plan's own open tickets get links
+ * (not deduplicated external tickets, not Done/Canceled ones); a link that would close a cycle is refused.
+ */
+export async function reconcilePlanValidation(ctx: Ctx, planId: string, opts: { apply?: boolean; scaffold?: string } = {}): Promise<ValidationReconcile> {
+  const row = getPlan(ctx, planId);
+  if (!row?.plan_json || !row.ticket_map_json || !row.parent_ticket_id) throw new Error(`plan ${planId} not found or not published`);
+  const plan = JSON.parse(row.plan_json) as Plan;
+  const project = ctx.cfg.projects.find((p) => p.key === row.project);
+  if (!project) throw new Error(`plan ${planId}: project ${row.project} is not configured`);
+  const map = new Map<string, string>(Object.entries(JSON.parse(row.ticket_map_json)));
+  const clone = await ctx.ws.ensureClone(project.repo);
+  const base = project.baseBranch ?? (await ctx.scm.defaultBranch(project.repo));
+  const files = new Set((await ctx.ws.git(clone, ['ls-tree', '--name-only', '-z', `origin/${base}`])).split('\0').filter(Boolean));
+  const unrunnable = missingValidation(project.validate, (f) => files.has(f));
+  if (!unrunnable.length) return { scaffold: null, missing: [], applied: false, note: `${base} can already run the validate commands; nothing to reconcile` };
+
+  const tickets = new Map<string, Ticket>();
+  for (const t of plan.tickets) { const id = map.get(t.key); const tk = id ? await ctx.tracker.getTicket(id) : null; if (tk) tickets.set(t.key, tk); }
+  let key = opts.scaffold;
+  if (key && !plan.tickets.some((t) => t.key === key)) key = [...tickets].find(([, t]) => t.identifier.toLowerCase() === key!.toLowerCase())?.[0];
+  if (opts.scaffold && !key) throw new Error(`--scaffold ${opts.scaffold} is neither a key nor a ticket of plan ${row.id.slice(0, 8)}`);
+  if (!key) {
+    try { key = scaffoldTicket(plan).key; } catch { throw new Error(`plan ${row.id.slice(0, 8)} does not mark the ticket that establishes validation; pass --scaffold <KEY|TICKET-ID>`); }
+  }
+  const scaffold = tickets.get(key);
+  if (!scaffold) throw new Error(`scaffold ${key} has no ticket in the tracker`);
+
+  // The graph as the tracker has it now (links between this plan's tickets), plus the scaffold links: reject cycles.
+  const byId = new Map([...tickets].map(([k, t]) => [t.id, k]));
+  const current: Plan = { ...plan, tickets: plan.tickets.map((t) => ({ ...t, dependsOn: (tickets.get(t.key)?.blockedBy ?? []).map((id) => byId.get(id)).filter((k): k is string => !!k) })) };
+  orderAfterScaffold(current, key);
+
+  const missing: { key: string; identifier: string; id: string }[] = [];
+  for (const t of plan.tickets) {
+    const tk = tickets.get(t.key);
+    if (t.key === key || !tk || tk.parentId !== row.parent_ticket_id || ['done', 'canceled'].includes(tk.status)) continue;
+    if (!tk.blockedBy.includes(scaffold.id)) missing.push({ key: t.key, identifier: tk.identifier, id: tk.id });
+  }
+  if (opts.apply) {
+    for (const m of missing) await ctx.tracker.addBlockedBy(m.id, scaffold.id);
+    if (missing.length) logEvent(ctx.db, 'plan.reconciled', `plan ${row.id.slice(0, 8)}: ${missing.map((m) => m.identifier).join(', ')} now blocked by scaffold ${scaffold.identifier} (${unrunnable.join('; ')})`, { ticketId: row.parent_ticket_id });
+  }
+  return {
+    scaffold: { key, identifier: scaffold.identifier }, missing: missing.map(({ key: k, identifier }) => ({ key: k, identifier })), applied: !!opts.apply,
+    note: unrunnable.join('; '),
+  };
 }

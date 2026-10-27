@@ -8,7 +8,7 @@ import type { Ctx } from './context.ts';
 import { allJobs, jobsByStatus, kvSet, logEvent } from './db.ts';
 import { FakeRunner } from './agents/fake.ts';
 import { Orchestrator } from './orchestrator.ts';
-import { approvePlan, draftPlan, getPlan, publishPlan } from './planning.ts';
+import { approvePlan, draftPlan, getPlan, publishPlan, reconcilePlanValidation } from './planning.ts';
 import { buildReport, maybeSendMorningReport } from './report.ts';
 import { startDashboard } from './dashboard.ts';
 import { LinearTracker } from './tracker/linear.ts';
@@ -34,6 +34,9 @@ Planning
   plan-publish <planId>       Create the drafted plan's tickets in Linear (Backlog)
   plan-approve <planId>       Approve: move the plan's tickets to Ready (human action)
   plans                       List plans
+  plan-reconcile <planId> [--scaffold KEY|TICKET-ID] [--apply]
+                              List the plan's tickets missing a "blocked by" link to the scaffold that establishes
+                              validation (dry run); --apply adds them
 
 Humans in the loop
   answer <TICKET-ID> "<text>" Answer a blocked ticket's question and resume it
@@ -57,7 +60,7 @@ async function main() {
     options: {
       config: { type: 'string', short: 'c' }, project: { type: 'string' }, publish: { type: 'boolean' }, hours: { type: 'string' },
       send: { type: 'boolean' }, pending: { type: 'boolean' }, apply: { type: 'boolean' }, title: { type: 'string' }, desc: { type: 'string' },
-      status: { type: 'string' }, priority: { type: 'string' }, estimate: { type: 'string' }, 'blocked-by': { type: 'string', multiple: true }, help: { type: 'boolean', short: 'h' },
+      status: { type: 'string' }, priority: { type: 'string' }, estimate: { type: 'string' }, 'blocked-by': { type: 'string', multiple: true }, scaffold: { type: 'string' }, help: { type: 'boolean', short: 'h' },
     },
   });
   const [cmd, ...rest] = positionals;
@@ -119,6 +122,14 @@ async function main() {
       const moved = await approvePlan(ctx, need(rest[0], 'planId'), `${process.env.USER ?? 'human'} via CLI`);
       return console.log(`Approved. Ready: ${moved.join(', ') || '(none — were tickets already moved?)'}`);
     }
+    case 'plan-reconcile': {
+      const r = await reconcilePlanValidation(ctx, need(rest[0], 'planId'), { apply: !!values.apply, scaffold: values.scaffold });
+      if (!r.scaffold) return console.log(r.note);
+      console.log(`Scaffold ${r.scaffold.key} (${r.scaffold.identifier}) establishes validation: ${r.note}`);
+      for (const m of r.missing) console.log(`  ${m.identifier} (${m.key}) is not blocked by ${r.scaffold.identifier}${r.applied ? ' → added' : ''}`);
+      if (!r.missing.length) return console.log('No missing links.');
+      return console.log(r.applied ? `Added ${r.missing.length} link(s).` : 'Dry run. Re-run with --apply to add these links.');
+    }
     case 'plans': {
       const rows = ctx.db.prepare('SELECT * FROM plans ORDER BY created_at DESC LIMIT 30').all() as { id: string; project: string; status: string; idea: string }[];
       for (const r of rows) console.log(`${r.id.slice(0, 8)}  ${r.status.padEnd(9)} ${r.project.padEnd(12)} ${r.idea.split('\n')[0].slice(0, 80)}`);
@@ -145,7 +156,7 @@ async function main() {
     }
     case 'usage': {
       const reservations = ctx.db.prepare('SELECT id, owner, amount_usd, created_at FROM budget_reservations ORDER BY created_at').all() as { id: string; owner: string; amount_usd: number; created_at: number }[];
-      for (const r of reservations) console.log(`reserved ${r.id} $${r.amount_usd.toFixed(2)} owner=${r.owner} since=${new Date(r.created_at).toISOString()} (active or unsettled; never expires automatically)`);
+      for (const r of reservations) console.log(`reserved ${r.id} $${r.amount_usd.toFixed(2)} owner=${r.owner} since=${new Date(r.created_at).toISOString()} (an active run, or an owner on another host; dead owners are settled at startup)`);
       const rows = ctx.db.prepare(`SELECT role, model, COUNT(*) runs, SUM(cost_usd) cost, AVG(cost_usd) avg, SUM(CASE WHEN outcome='ok' THEN 1 ELSE 0 END) ok, AVG(duration_ms)/1000 secs FROM usage WHERE ts >= ? GROUP BY role, model ORDER BY cost DESC`).all(startOfMonth()) as { role: string; model: string; runs: number; cost: number; avg: number; ok: number; secs: number }[];
       console.log(`today $${spentSince(ctx.db, startOfDay()).toFixed(2)} / $${cfg.budget.dailyUsd}   month $${spentSince(ctx.db, startOfMonth()).toFixed(2)} / $${cfg.budget.monthlyUsd}`);
       for (const r of rows) console.log(`${r.role.padEnd(9)} ${String(r.model).padEnd(8)} runs=${r.runs} ok=${r.ok} cost=$${r.cost.toFixed(2)} avg=$${r.avg.toFixed(3)} avg=${r.secs.toFixed(0)}s`);

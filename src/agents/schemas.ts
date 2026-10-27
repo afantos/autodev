@@ -15,6 +15,8 @@ export const PlanTicketSchema = z.object({
   security: z.string().describe('Security / architectural considerations, or "none"'),
   definitionOfDone: z.array(z.string()).min(1),
   parallelizable: z.boolean(),
+  establishesValidation: z.boolean().optional()
+    .describe("True only for the ONE ticket that makes the project's validate commands runnable (e.g. creates package.json and its scripts) when the repository cannot run them yet; false otherwise"),
 });
 
 export const PlanSchema = z.object({

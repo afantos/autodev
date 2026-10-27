@@ -212,6 +212,7 @@ in the same instance; use separate instance configs and data directories for ind
 ```bash
 autodev plan "Add Stripe subscriptions with Free, Personal and Business plans" --project webapp --publish
 autodev plan-approve <planId>        # or move the [Plan] issue to Ready in Linear
+autodev plan-reconcile <planId> [--scaffold KEY] [--apply]  # repo can't validate yet: block the plan's tickets on its scaffold
 autodev run                          # the service (systemd)
 autodev status | report | usage | decisions --pending
 autodev answer ENG-42 "Use $12/month for Personal"   # or comment "/answer …" in Linear + move to Ready
