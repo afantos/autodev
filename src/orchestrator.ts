@@ -184,7 +184,9 @@ export class Orchestrator {
       return;
     }
     const t = await tracker.getTicket(entry.ticketId);
-    if (t && !['done', 'canceled'].includes(t.status)) {
+    // An empty response is a failed lookup, not a closed ticket: keep the record so the next tick retries.
+    if (!t) throw new Error(`ticket ${entry.identifier} lookup returned nothing; retrying`);
+    if (!['done', 'canceled'].includes(t.status)) {
       await tracker.setStatus(entry.ticketId, 'done');
       await tracker.comment(entry.ticketId, `🎉 All PRs for ${entry.identifier} merged (${prs(merged)}) — marked Done by autodev.`).catch(() => {});
       logEvent(db, 'job.done', `${entry.identifier} merged (${prs(merged)})`, { ticketId: entry.ticketId });
