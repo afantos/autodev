@@ -8,7 +8,7 @@ import { recordTriageDecision } from './decisions.ts';
 import { tail } from './exec.ts';
 import { cachedVerdict, reservedReview } from './external-review.ts';
 import { ClearanceSchema, EvidenceSchema, TriageSchema, clearanceTask, evidenceTask, flaggedReviewTask, taskBytes, triageTask } from './agents/triage.ts';
-import type { CheckResult, Clearance, FlaggedReview, KeywordMatch, StructuredTask, Triage, TriageCandidateTicket } from './agents/triage.ts';
+import type { CheckResult, Clearance, FlaggedReview, FlaggedReviewContext, KeywordMatch, StructuredTask, Triage, TriageCandidateTicket } from './agents/triage.ts';
 import { onlyKeywordFindings } from './policy.ts';
 import type { PolicyInspection } from './policy.ts';
 import { holdResume, prepareResume, projectEnv } from './pipeline.ts';
@@ -122,10 +122,38 @@ export function aiApprovalEligible(ctx: Ctx, project: ProjectConfig | undefined,
  * What an approval covers: the exact diff hash AND the findings judged AND the ticket requirements (description and
  * recorded decisions). A new finding (e.g. a config change adds a protected path) or a clarified ticket asks again.
  */
-const approvalScope = (policy: PolicyInspection, requirements: string) =>
-  createHash('sha256').update(policy.hash).update('\0').update(JSON.stringify([...policy.reasons].sort())).update('\0').update(requirements).digest('hex');
+const approvalScope = (policy: PolicyInspection, requirements: string, context: FlaggedReviewContext) =>
+  createHash('sha256').update(policy.hash).update('\0').update(JSON.stringify([...policy.reasons].sort())).update('\0').update(requirements)
+    .update('\0').update(JSON.stringify(context)).digest('hex');
 const aiApprovedKey = (job: Job, scope: string) => `policy-ai-approved:${job.id}:${scope}`;
-export const isAiApproved = (ctx: Ctx, job: Job, policy: PolicyInspection, requirements: string) => !!kvGet(ctx.db, aiApprovedKey(job, approvalScope(policy, requirements)));
+
+const DOC_EXCERPT_CHARS = 4_000;
+const DOC_CONTEXT_CHARS = 40_000;
+
+/**
+ * The reviewer's trusted context: the approved-dependency list from config and short excerpts of the project's decision
+ * docs (project.docs, ADRs first) read from the merged base commit in the trusted object store, never the candidate, so
+ * a candidate cannot argue for itself by editing them. Part of the approval/verdict scope: a deploy that changes it, or
+ * a newly merged ADR, asks again instead of reusing an old "cannot verify" verdict.
+ */
+export async function flaggedReviewContext(ctx: Ctx, job: Job, project: ProjectConfig): Promise<FlaggedReviewContext> {
+  const baseSha = ctx.ws.trustedState(job.worktree!).base_sha;
+  const all = (await ctx.ws.git(job.worktree!, ['ls-tree', '-r', '-z', '--name-only', '--full-tree', baseSha])).split('\0').filter(Boolean);
+  const under = (f: string, d: string) => f === d || f.startsWith(`${d.replace(/\/$/, '')}/`);
+  const wanted = all.filter((f) => /\.md$/i.test(f) && project.docs.some((d) => under(f, d)))
+    .sort((a, b) => Number(under(b, project.adrDir)) - Number(under(a, project.adrDir)) || a.localeCompare(b));
+  const decisionDocs: FlaggedReviewContext['decisionDocs'] = [];
+  let budget = DOC_CONTEXT_CHARS;
+  for (const path of wanted) {
+    if (budget <= 0) break;
+    const content = await ctx.ws.git(job.worktree!, ['cat-file', 'blob', `${baseSha}:${path}`]);
+    const limit = Math.min(DOC_EXCERPT_CHARS, budget);
+    const excerpt = content.length > limit ? `${content.slice(0, limit)}\n[…]` : content;
+    budget -= excerpt.length;
+    decisionDocs.push({ path, excerpt });
+  }
+  return { approvedDependencies: [...project.approvedDependencies].sort(), baseSha, decisionDocs };
+}
 
 /** Enforced in code: approve only if the model accepted every finding, each exactly once. */
 export function flaggedReviewAccepted(v: FlaggedReview, ids: string[]): boolean {
@@ -143,19 +171,26 @@ export type FlaggedApprovalOutcome = { kind: 'approved'; note: string } | { kind
 
 export async function approveFlaggedDiff(ctx: Ctx, job: Job, project: ProjectConfig, policy: PolicyInspection, decisions: { question: string; decision: string }[], requirements: string): Promise<FlaggedApprovalOutcome> {
   if (!aiApprovalEligible(ctx, project, policy)) return { kind: 'human', note: 'not eligible for second-review approval' };
-  const scope = approvalScope(policy, requirements);
-  if (isAiApproved(ctx, job, policy, requirements)) return { kind: 'approved', note: 'approved earlier for this exact diff, findings and requirements' };
+  const context = await flaggedReviewContext(ctx, job, project);
+  const scope = approvalScope(policy, requirements, context);
+  if (kvGet(ctx.db, aiApprovedKey(job, scope))) return { kind: 'approved', note: 'approved earlier for this exact diff, findings, requirements and project context' };
   const findings = policy.reasons.map((reason, i) => ({ id: `f${i + 1}`, reason }));
   const ticket = (await ctx.tracker.getTicket(job.ticket_id))!;
   const diff = await ctx.ws.diff(job.worktree!, job.base_branch!);
-  const task = flaggedReviewTask({ repo: job.repo, ticket, candidateSha: job.candidate_sha!, findings, decisions, diff });
+  const task = flaggedReviewTask({ repo: job.repo, ticket, candidateSha: job.candidate_sha!, findings, decisions, diff, context });
   const r = await ask(ctx, job, `flagged-review:${job.id}:${scope}`, 'policy.ai_review', task, (v) => ({ outcome: v.verdict, summary: v.summary }));
   if (r.kind === 'waiting') return { kind: 'waiting' };
   if (r.kind === 'failed') return { kind: 'human', note: `second-review approval unavailable: ${r.message.slice(0, 300)}` };
   const v = r.value;
   const detail = v.findings.map((f) => `- ${f.id} ${f.acceptable ? 'acceptable' : 'NOT acceptable'}: ${f.explanation}`).join('\n');
   if (!flaggedReviewAccepted(v, findings.map((f) => f.id))) {
-    logEvent(ctx.db, 'policy.ai_escalated', `${job.ticket_identifier}: ${r.model} did not approve flagged diff ${policy.hash.slice(0, 12)}: ${v.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    // A held PR re-reads this cached verdict every tick: log it once per (job, diff, verdict), like automerge.hold.
+    const logged = `policy-ai-escalated:${job.id}:${policy.hash}`;
+    const verdictHash = shortHash(JSON.stringify([scope, v]));
+    if (kvGet(ctx.db, logged) !== verdictHash) {
+      kvSet(ctx.db, logged, verdictHash);
+      logEvent(ctx.db, 'policy.ai_escalated', `${job.ticket_identifier}: ${r.model} did not approve flagged diff ${policy.hash.slice(0, 12)}: ${v.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+    }
     return { kind: 'human', note: `${r.model} did not approve the flagged change(s): ${v.summary}\n${detail}` };
   }
   kvSet(ctx.db, aiApprovedKey(job, scope), JSON.stringify({ model: r.model, summary: v.summary, hash: policy.hash, reasons: policy.reasons }));
