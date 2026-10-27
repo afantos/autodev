@@ -159,7 +159,18 @@ export class Orchestrator {
       const pr = await scm.getPr(job.repo, job.pr_number).catch(() => null);
       if (!pr) return;
       if (pr.state === 'merged') {
-        // Done only after GitHub confirms the merge.
+        // Done only after GitHub confirms the merge, and only when no other open PR still names the ticket (e.g. a
+        // workflow PR stacked on this one, which the bot can't open itself). Then the job is finished but the ticket
+        // stays where it is for a human to close. A failed lookup throws: reconcile retries next tick, never Done early.
+        const pending = await scm.openPrsReferencing(job.repo, job.ticket_identifier, pr.number);
+        if (pending.length > 0) {
+          updateJob(db, job.id, { status: 'done' });
+          const list = pending.map((p) => `#${p.number}`).join(', ');
+          await tracker.comment(t.id, `PR #${pr.number} merged. Not marking Done: ${list} still references ${job.ticket_identifier} and is open. Close the ticket once it merges or is closed.`).catch(() => {});
+          logEvent(db, 'job.done_pending_prs', `${job.ticket_identifier} merged (#${pr.number}); left open for ${list}`, { jobId: job.id, ticketId: t.id });
+          if (job.worktree) await ctx.ws.removeWorktreeIfClean(job.repo, job.worktree).catch(() => {});
+          return;
+        }
         await tracker.setStatus(t.id, 'done');
         updateJob(db, job.id, { status: 'done' });
         await tracker.comment(t.id, `🎉 PR #${pr.number} merged — marked Done by autodev.`).catch(() => {});

@@ -1,5 +1,11 @@
 import type { CheckResult, PullRequest } from '../types.ts';
 
+/** True if `text` names the ticket `key` (DEV-20 matches "DEV-20" and "dev-20-fix", never DEV-203). */
+export function mentionsKey(text: string, key: string): boolean {
+  const k = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Za-z0-9])${k}(?![0-9])`, 'i').test(text);
+}
+
 export interface Scm {
   /** URL to clone from. */
   cloneUrl(repo: string): string;
@@ -25,6 +31,9 @@ export interface Scm {
   markReady(repo: string, pr: PullRequest): Promise<void>;
   /** Approve exactly `sha` as the separate reviewer account. Throws if no reviewer identity is configured. */
   approve(repo: string, number: number, sha: string, body: string): Promise<void>;
+  /** Open PRs other than `exclude` whose title, body or head branch names the ticket `key` (as a whole word), e.g. a
+   *  workflow PR stacked on the ticket's code PR. The ticket isn't Done while any remain. */
+  openPrsReferencing(repo: string, key: string, exclude: number): Promise<{ number: number; url: string }[]>;
   /** Squash-merge, refusing unless the PR head is still exactly `sha`. */
   mergePr(repo: string, number: number, sha: string, title: string): Promise<void>;
 }

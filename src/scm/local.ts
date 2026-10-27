@@ -4,6 +4,7 @@ import type { Db } from '../db.ts';
 import { kvGet, kvSet, now } from '../db.ts';
 import { run, runOk, tail } from '../exec.ts';
 import type { CheckResult, PullRequest } from '../types.ts';
+import { mentionsKey } from './types.ts';
 import type { Scm } from './types.ts';
 import { runSandboxed } from '../command-sandbox.ts';
 
@@ -46,6 +47,15 @@ export class LocalScm implements Scm {
   async getPr(_repo: string, number: number) {
     const r = this.db.prepare('SELECT * FROM local_prs WHERE number = ?').get(number) as unknown as PrRow;
     return this.toPr(r);
+  }
+  async openPrsReferencing(repo: string, key: string, exclude: number) {
+    const rows = this.db.prepare("SELECT * FROM local_prs WHERE repo = ? AND state = 'open' AND number != ?").all(repo, exclude) as unknown as PrRow[];
+    const out: { number: number; url: string }[] = [];
+    for (const r of rows) {
+      const pr = await this.toPr(r);
+      if (pr.state === 'open' && [r.title, r.body, r.head].some((s) => mentionsKey(s, key))) out.push({ number: pr.number, url: pr.url });
+    }
+    return out;
   }
   async createPr(repo: string, pr: { head: string; base: string; title: string; body: string; draft: boolean }) {
     const r = this.db.prepare("INSERT INTO local_prs (repo, head, base, title, body, state, draft, created_at) VALUES (?,?,?,?,?,'open',?,?)")
