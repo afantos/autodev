@@ -211,9 +211,13 @@ export class LinearTracker implements Tracker {
   private async labelId(teamId: string, name: string): Promise<string> {
     const k = `${teamId}:${name}`;
     if (!this.labelIds.has(k)) {
-      const d = await this.gql<{ issueLabels: { nodes: { id: string }[] } }>(
-        'query($n:String!){ issueLabels(filter:{ name:{ eq:$n } }){ nodes { id } } }', { n: name });
-      let id = d.issueLabels.nodes[0]?.id;
+      // Linear rejects labels owned by another team ("labelIds for incorrect team"): use this team's label, else a
+      // workspace label (no team), else create one in this team. Never pick another team's label of the same name.
+      const d = await this.gql<{ issueLabels: { nodes: { id: string; team: { id: string } | null }[] } }>(
+        'query($n:String!, $t:ID!){ issueLabels(filter:{ name:{ eq:$n }, or:[{ team:{ id:{ eq:$t } } }, { team:{ null:true } }] }){ nodes { id team { id } } } }',
+        { n: name, t: teamId });
+      const nodes = d.issueLabels.nodes;
+      let id = (nodes.find((l) => l.team?.id === teamId) ?? nodes.find((l) => !l.team))?.id;
       if (!id) {
         const c = await this.gql<{ issueLabelCreate: { issueLabel: { id: string } } }>(
           'mutation($i:IssueLabelCreateInput!){ issueLabelCreate(input:$i){ issueLabel { id } } }', { i: { name, teamId } });
