@@ -70,8 +70,9 @@ projects:
 
   # email-support (Linear team EML, repo afantos/email-support), onboarded 2026-10-27. Decisions: email-support
   # docs/adr/0001-initial-decisions.md. The repository starts with documents only (main 4c9547b); the scaffold is the
-  # first ticket (EML-2). autoMerge stays off until the scaffold merges; then turn it on with flaggedDiffApprover:
-  # second-review (owner decision, ADR 0001 §20).
+  # first ticket (EML-2).
+  # 2026-10-27 (owner, Q36): autoMerge on now, before the scaffold merges, with flaggedDiffApprover: second-review, so
+  # policy-flagged diffs (manifests, migrations, ADRs, tests) are judged by the second reviewer instead of the owner.
   # 2026-10-27 (owner, Q34): setup/validate and automatic cache priming are live BEFORE the scaffold ticket, so EML-2's
   # first validation primes the empty cache from its own lockfile. A probe lockfile of the 19 approved dependencies was
   # 378 packages / 805 MB (Next.js ships one ~35 MB compiler per platform), above the 400 / 500 MB defaults.
@@ -97,8 +98,11 @@ projects:
     # Migrations are human-reviewed because one can drop a Row-Level Security policy (ADR 0001 §11, §19).
     humanReviewPaths: ['(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/', '^packages/db/migrations/']
     protectTests: true
-    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
-    autoMerge: false
+    flaggedDiffApprover: second-review
+    # GitHub workflows, deploy files, real .env files and credentials always go to the owner. .env.example (placeholders
+    # only) is exempt so tickets adding a variable go through the second reviewer (owner, Q36).
+    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env(?!\.example$)', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
+    autoMerge: true                                  # clean PRs merge after CI + Claude review + second review
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr, docs/supervised-checklist.md]
 
 linear:
