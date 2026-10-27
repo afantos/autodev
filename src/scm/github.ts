@@ -1,6 +1,7 @@
 import { excerptCiLog } from '../ci-log.ts';
 import { Octokit } from '@octokit/rest';
 import type { CheckFailure, CheckResult, PullRequest } from '../types.ts';
+import { mentionsKey } from './types.ts';
 import type { Scm } from './types.ts';
 
 function split(repo: string) {
@@ -43,6 +44,13 @@ export class GitHubScm implements Scm {
 
   async mergePr(repo: string, number: number, sha: string, title: string) {
     await this.gh.pulls.merge({ ...split(repo), pull_number: number, sha, merge_method: 'squash', commit_title: title });
+  }
+
+  async openPrsReferencing(repo: string, key: string, exclude: number) {
+    const prs = await this.gh.paginate(this.gh.pulls.list, { ...split(repo), state: 'open', per_page: 100 });
+    return prs
+      .filter((p) => p.number !== exclude && [p.title, p.body ?? '', p.head.ref].some((s) => mentionsKey(s, key)))
+      .map((p) => ({ number: p.number, url: p.html_url }));
   }
 
   cloneUrl(repo: string) { return `https://github.com/${repo}.git`; }
