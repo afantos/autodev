@@ -1,4 +1,4 @@
-# autodev configuration for the DigitalOcean droplet (autodev-1), projects: poker (Linear team DEV) and luckywinclub (Linear team LWC).
+# autodev configuration for the DigitalOcean droplet (autodev-1), projects: poker (Linear team DEV), luckywinclub (Linear team LWC) and email-support (Linear team EML).
 # Installed to /opt/autodev/instance/autodev.config.yaml. Contains NO secrets: credentials come only from
 # /opt/autodev/instance/.env. All choices below were made by the operator on 2026-10-24.
 
@@ -67,6 +67,29 @@ projects:
     alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
     autoMerge: true                                  # clean PRs merge after CI + Claude review + second review; flagged PRs wait for a human
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr]
+
+  # email-support (Linear team EML, repo afantos/email-support), onboarded 2026-10-27. Decisions: email-support
+  # docs/adr/0001-initial-decisions.md. The repository starts with documents only (main 4c9547b); the scaffold is the
+  # first ticket. setup/validate stay empty and autoMerge off until the scaffold merges; then add setup, validate,
+  # npmCacheDir and turn on autoMerge with flaggedDiffApprover: second-review (owner decision, ADR 0001 §20).
+  - key: email-support
+    repo: afantos/email-support
+    linear:
+      teamKey: EML
+    setup: []
+    validate: []
+    requiredChecks: ["checks", "integration"]        # both required by branch protection (integration = Postgres via Compose, incl. RLS)
+    env:
+      NODE_ENV: test
+    maxConcurrent: 1
+    stackedBranches: false
+    approvedDependencies: [next, react, react-dom, "@types/react", "@types/react-dom", fastify, drizzle-orm, drizzle-kit, pg, "@types/pg", pg-boss, better-auth, zod, tailwindcss, "@tailwindcss/postcss", typescript, "@types/node", eslint, typescript-eslint]
+    # Migrations are human-reviewed because one can drop a Row-Level Security policy (ADR 0001 §11, §19).
+    humanReviewPaths: ['(^|/)tsconfig(\.base)?\.json$', '^eslint\.config\.js$', '^CLAUDE\.md$', '^docs/product-spec\.md$', '^docs/adr/', '^docker-compose', '^\.github/', '^packages/db/migrations/']
+    protectTests: true
+    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
+    autoMerge: false
+    docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr, docs/supervised-checklist.md]
 
 linear:
   states:                                # must match your Linear workflow state names
