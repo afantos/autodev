@@ -157,3 +157,17 @@ test('a ticket a human already closed while pending is left alone', async () => 
   assert.equal((await e.tracker.getTicket(t.id))!.status, 'canceled');
   assert.equal(await countMatching(e, t.id, /marked Done by autodev/), 0);
 });
+
+test('an empty ticket lookup keeps the pending record; the ticket is marked Done once the lookup recovers', async () => {
+  const { e, t } = await inReview();
+  const stacked = await stackedThenMerge(e, t);
+  await mergeStacked(e, stacked.number);
+  const real = e.tracker.getTicket.bind(e.tracker);
+  e.tracker.getTicket = async (id: string) => (id === t.id ? null : real(id));
+  for (let i = 0; i < 2; i++) await e.cycle();
+  e.tracker.getTicket = real;
+  assert.equal((await e.tracker.getTicket(t.id))!.status, 'review', 'not Done, and not dropped, while the lookup is empty');
+  await e.cycle();
+  assert.equal((await e.tracker.getTicket(t.id))!.status, 'done', 'completed after the lookup recovers');
+  assert.equal(await countMatching(e, t.id, /marked Done by autodev/), 1);
+});
