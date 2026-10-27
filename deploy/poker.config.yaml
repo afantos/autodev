@@ -101,7 +101,15 @@ projects:
     flaggedDiffApprover: second-review
     # GitHub workflows, deploy files, real .env files and credentials always go to the owner. .env.example (placeholders
     # only) is exempt so tickets adding a variable go through the second reviewer (owner, Q36).
-    alwaysHumanPaths: ['(^|/)\.github/', '(^|/)(deploy|infrastructure|terraform)(/|$)', '(^|/)\.env(?!\.example$)', '(^|/)(secrets?|credentials?)(/|[._-]|$)']
+    # Credential-handling source (including secrets/ and secrets.test.ts) goes through the second reviewer.
+    # Named credential files, data inside credential directories and private-key files still need the owner.
+    alwaysHumanPaths:
+      - '(^|/)\.github/'
+      - '(^|/)(deploy|infrastructure|terraform)(/|$)'
+      - '(^|/)\.env(?!\.example$)'
+      - '(^|/)\.?(secrets?|credentials?)(?:$|(?:[._-][^/]+)?\.(?:json|ya?ml|toml|ini|conf|config|env|properties|txt|enc)$)'
+      - '(^|/)\.?(secrets?|credentials?)/.*\.(?:json|ya?ml|toml|ini|conf|config|env|properties|txt|enc)$'
+      - '(^|/)(?:id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:pem|key|p12|pfx))$'
     autoMerge: true                                  # clean PRs merge after CI + Claude review + second review
     docs: [CLAUDE.md, README.md, docs/product-spec.md, docs/adr, docs/supervised-checklist.md]
 
