@@ -1,0 +1,11 @@
+[Unit]
+Description=Check main CI for a new autodev release
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=120s
+RandomizedDelaySec=15s
+Unit=autodev-deploy.service
+
+[Install]
+WantedBy=timers.target

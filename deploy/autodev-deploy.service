@@ -1,0 +1,12 @@
+[Unit]
+Description=Deploy autodev after successful main CI (outbound GitHub polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/autodev/deploy
+ExecStart=/usr/bin/node /opt/autodev/deploy/ci-poll.ts
+TimeoutStartSec=20min
+UMask=0022
