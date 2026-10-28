@@ -202,9 +202,13 @@ through CI, the Claude review and the normal second review and merges. Files mat
 Keep credentials in the instance's gitignored `.env`; tickets can be approved by moving them
 to Ready after the workflow mapping passes `autodev linear-check`.
 
-The `hold-merge` Linear label stops automated approval and merging while leaving coding and
-validation available. Set `linear.holdMergeLabel` to change the label name, and remove the
-label when owner review is complete. Budgets and concurrency limits apply across all projects
+Merge holds are **off by default** (`linear.holdMergeEnabled: false`), so existing `hold-merge`
+labels do not interrupt automatic review and merge. To use holds, enable that setting and add
+the label named by `linear.holdMergeLabel`. Held PRs still refresh onto main and run the GPT
+review/fix loop; approval and merge wait for label removal. Review fixes are bounded by
+`limits.maxReviewCycles` (default two), followed by at most one stronger-model attempt. An
+unchanged candidate reuses its review; only blocking correctness findings prevent progress.
+Review API failures stop spending after three attempts per candidate. Budgets and concurrency limits apply across all projects
 in the same instance; use separate instance configs and data directories for independent limits.
 
 ## Commands

@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import type { Ctx } from './context.ts';
 import { canStartRun, settleDeadOwnerReservations } from './budget.ts';
 import { acquireInstanceLock, ownerDead, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvList, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
@@ -37,15 +38,21 @@ export class Orchestrator {
     this.recoverDeadOwners();
     settleDeadOwnerReservations(db, owner);
     while (!this.stopping) {
+      // CI starts a release behind a root-owned guard. Migrations and the instance lock are checked, but no ticket,
+      // GitHub or paid-agent work may run until health checks commit the deployment (or restore the old state).
+      const deployGuard = process.env.AUTODEV_DEPLOY_GUARD;
+      const guarded = !!deployGuard && existsSync(deployGuard);
       try {
-        await this.tick();
+        if (guarded) {
+          if (!acquireInstanceLock(db, owner, cfg.loop.leaseSeconds * 1000, (o) => ownerDead(o))) throw new Error('lost instance lock');
+        } else await this.tick();
       } catch (e) {
         logEvent(db, 'tick.error', String((e as Error)?.stack ?? e).slice(0, 2000), { level: 'error' });
       }
-      if (opts.once) break;
+      if (opts.once || this.stopping) break;
       // stop() and finishing workers wake the loop early; the timer is cleared so it cannot hold the process open.
       await new Promise<void>((r) => {
-        const timer = setTimeout(r, cfg.loop.tickSeconds * 1000);
+        const timer = setTimeout(r, guarded ? 1000 : cfg.loop.tickSeconds * 1000);
         this.wake = () => { clearTimeout(timer); r(); };
       });
       this.wake = null;

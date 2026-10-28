@@ -49,22 +49,22 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
   // Only a ticket a human hasn't moved elsewhere (Canceled, Backlog, Done, back to Ready...) may merge.
   if (ticket.status !== 'review') return 'skipped';
-  // Owner hold, checked first (before any refresh or review spend), again after marking the PR ready and before
-  // approving, and once more before merging. Fails closed: a ticket that can't be read stops the merge.
-  const holdLabel = cfg.linear.holdMergeLabel;
+  // Holds stop approval and merge only. Refresh and review keep making progress while held.
+  // Ticket reads still fail closed; moving the ticket out of Review stops all automatic work here.
+  const holdLabel = cfg.linear.holdMergeEnabled ? cfg.linear.holdMergeLabel : '';
   const holdReason = `The ticket carries the \`${holdLabel}\` label, so auto-merge is on hold. Remove the label to let it continue.`;
-  const mayProceed = async (): Promise<'ok' | 'held' | 'skipped'> => {
+  const mayProceed = async (checkHold = true): Promise<'ok' | 'held' | 'skipped'> => {
     let current: Ticket | null = null;
     try { current = await tracker.getTicket(ticket.id); } catch (e) {
       await hold(`The ticket's state could not be verified (${(e as Error).message.slice(0, 200)}), so auto-merge stopped; it retries on the next pass.`);
       return 'held';
     }
     if (!current) { await hold('The ticket could not be found, so its hold state could not be verified; auto-merge stopped.'); return 'held'; }
-    if (holdLabel && current.labels.includes(holdLabel)) { await hold(holdReason); return 'held'; }
+    if (checkHold && holdLabel && current.labels.includes(holdLabel)) { await hold(holdReason); return 'held'; }
     if (current.status !== 'review') return 'skipped';
     return 'ok';
   };
-  { const g = await mayProceed(); if (g !== 'ok') return g; }
+  { const g = await mayProceed(false); if (g !== 'ok') return g; }
   const pr = await scm.getPr(job.repo, job.pr_number);
   if (pr.state !== 'open') return 'skipped';
   if (pr.baseBranch !== job.base_branch) return hold(`The PR now targets \`${pr.baseBranch}\`, but autodev validated it against \`${job.base_branch}\`. It won't merge a retargeted PR.`);

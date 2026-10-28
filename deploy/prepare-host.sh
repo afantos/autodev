@@ -11,6 +11,12 @@ APP=/opt/autodev/app
 INSTANCE=/opt/autodev/instance
 WORK=/opt/autodev/instance-work
 
+# This is a bootstrap tool. An existing installation is updated only by the serialized CI deployment transaction.
+[ ! -e "$APP/.installed-commit" ] || { echo "already installed; updates must use the CI deploy workflow"; exit 1; }
+install -d -m 0755 /opt/autodev/deploy
+exec 9>/opt/autodev/deploy/lock
+flock -w 600 9 || { echo "another deployment holds the lock"; exit 1; }
+
 echo "== preconditions"
 . /etc/os-release; [ "$VERSION_ID" = "24.04" ] || { echo "expected Ubuntu 24.04, got $PRETTY_NAME"; exit 1; }
 node -v | grep -q '^v24' || { echo "Node 24 required"; exit 1; }

@@ -47,7 +47,8 @@ linear:
     failed: Failed
     canceled: Canceled
   requireLabel: ""                    # e.g. "autodev" to only touch labeled tickets
-  holdMergeLabel: hold-merge          # owner label that prevents automated approval and merging
+  holdMergeEnabled: false            # opt in to label holds; review/fixes and base refresh continue while held
+  holdMergeLabel: hold-merge          # ignored unless holdMergeEnabled is true
 
 concurrency:
   global: 2

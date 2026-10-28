@@ -123,6 +123,35 @@ Anything flagged still waits for you. Setup:
    against Claude's budget.
 3. **Turn off** by setting `autoMerge: false`. PRs then wait for a human again.
 
+### Automatic autodev deployment
+
+The `Check` workflow's deploy job runs after `checks` only for pushes to `main`. It deploys
+the tested SHA and skips a commit superseded on main. Deployment concurrency follows
+[GitHub's deployment guidance](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/control-deployments).
+
+One-time host setup (root, after the existing bootstrap): install `deploy/ci-deploy.sh` and
+`deploy/ci-receive.sh` into `/opt/autodev/deploy/`, owned by root, mode 0755. This directory
+must be traversable by the service user so it can read the `pending` startup guard. Install
+`deploy/autodev.service`, then `systemctl daemon-reload` (CI performs the first restart).
+Create a dedicated Ed25519 key and add only its public key to root's `authorized_keys` as:
+
+```text
+restrict,command="/opt/autodev/deploy/ci-receive.sh" ssh-ed25519 PUBLIC_KEY autodev-ci
+```
+
+Set repository secrets `AUTODEV_DEPLOY_KEY` (dedicated private key) and
+`AUTODEV_DEPLOY_KNOWN_HOSTS` (the independently verified SSH host public key); set repository
+variable `AUTODEV_DEPLOY_HOST` to the hostname/IP. The key cannot open a shell or forward ports;
+its only command accepts a SHA, workflow run number and release archive. The receiver starts
+a systemd transaction so SSH disconnection cannot interrupt rollback. No account/API credentials
+from the running instance are given to GitHub. Host prerequisites: Node 24+, npm, Python 3.12+,
+sqlite3, flock and systemd (all available in the Ubuntu host setup).
+
+CI updates app code and its unit. The deployment controller lives outside releases so a failed
+release cannot replace the code responsible for its rollback. Updating the controller itself
+requires explicitly installing its reviewed version under the same host lock. Runtime config,
+credentials and app databases are not release artifacts. See the [upgrade runbook](RUNBOOK.md#upgrading).
+
 ## 4. Cloud VM (you: this costs money)
 
 Sizing for 2 concurrent agents: **4 vCPU, 8–16 GB RAM, 80 GB SSD**, Ubuntu 24.04. Claude runs in
