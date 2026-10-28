@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, copyFileSync, symlinkSync, existsSync, realpathSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, copyFileSync, symlinkSync, existsSync, realpathSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -14,6 +14,8 @@ function fixture(failure: string, linked = false) {
   const app = join(root, linked ? 'releases/old' : 'app');
   for (const dir of [app, join(root, 'instance/data'), join(root, 'deploy'), join(root, 'bin'), join(root, 'stage/src'), join(root, 'stage/deploy')]) mkdirSync(dir, { recursive: true });
   if (linked) symlinkSync(app, join(root, 'app'));
+  copyFileSync(join(repo, 'deploy/deployment-config.ts'), join(root, 'deploy/deployment-config.ts'));
+  writeFileSync(join(root, 'deploy/config.json'), JSON.stringify({ autoDeployEnabled: true }));
   writeFileSync(join(app, '.installed-commit'), oldSha);
   writeFileSync(join(root, 'unit'), 'previous unit\n');
   writeFileSync(join(root, 'instance/autodev.config.yaml'), 'projects: [{key: demo, repo: demo}]\n');
@@ -34,7 +36,7 @@ function fixture(failure: string, linked = false) {
   shim('chown', '');
   shim('sleep', '');
   shim('flock', `if(process.env.DEPLOY_FAILURE==='lock') process.exit(1)`);
-  shim('npm', `if(process.env.DEPLOY_FAILURE==='install') process.exit(1);require('fs').symlinkSync(${JSON.stringify(realpathSync(join(repo, 'node_modules')))},'node_modules')`);
+  shim('npm', `if(process.env.DEPLOY_FAILURE==='disable-during-install') require('fs').writeFileSync(require('path').join(process.env.AUTODEV_DEPLOY_ROOT,'deploy/config.json'),'{"autoDeployEnabled":false}');if(process.env.DEPLOY_FAILURE==='install') process.exit(1);require('fs').symlinkSync(${JSON.stringify(realpathSync(join(repo, 'node_modules')))},'node_modules')`);
   shim('systemctl', `
 const fs=require('fs'),path=require('path');
 const root=process.env.AUTODEV_DEPLOY_ROOT, file=path.join(root,'state.json');
@@ -108,4 +110,24 @@ test('CI checks stay on hosted runners; deployment provenance is enforced by the
   const workflow=parse(readFileSync(join(repo,'.github/workflows/check.yml'),'utf8'));
   assert.equal(workflow.jobs.checks['runs-on'],'ubuntu-24.04');
   assert.deepEqual(Object.keys(workflow.jobs),['checks']);
+});
+
+for (const value of [false, 'missing', 'invalid']) test(`deployment setting ${value} leaves the running service untouched`, () => {
+  const {root,run}=fixture('');
+  if (value === 'missing') unlinkSync(join(root,'deploy/config.json'));
+  else writeFileSync(join(root,'deploy/config.json'),value === 'invalid' ? '{' : '{"autoDeployEnabled":false}');
+  const result=run();
+  if(value==='invalid') assert.notEqual(result.status,0);
+  else assert.equal(result.status,0,result.stdout+result.stderr);
+  assert.equal(readFileSync(join(root,'app/.installed-commit'),'utf8'),oldSha);
+  assert.deepEqual(JSON.parse(readFileSync(join(root,'state.json'),'utf8')).calls,[]);
+});
+
+test('turning deployment off during dependency installation prevents the restart', () => {
+  const {root,run}=fixture('disable-during-install');const result=run();
+  assert.equal(result.status,0,result.stdout+result.stderr);
+  assert.match(result.stdout,/Automatic deployment is disabled/);
+  assert.equal(readFileSync(join(root,'app/.installed-commit'),'utf8'),oldSha);
+  assert.equal(existsSync(join(root,'deploy/pending')),false);
+  assert.deepEqual(JSON.parse(readFileSync(join(root,'state.json'),'utf8')).calls,[]);
 });

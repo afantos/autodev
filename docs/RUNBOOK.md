@@ -65,8 +65,13 @@ autodev tick           # → Done
 
 ## Upgrading
 
-Push reviewed changes to `main`. The `Check` workflow deploys that exact commit only after its
-checks pass. The outbound `autodev-deploy.timer` notices successful main CI within about two
+Automatic deployment is **off by default**. Set `autoDeployEnabled` in
+`/opt/autodev/deploy/config.json` to `true` to opt in, or `false` to turn it off. The timer
+re-reads the file each poll; no restart is required. A missing setting defaults off, and an
+invalid setting prevents deployment. This flag controls autodev itself, independently of
+project auto-merge settings.
+
+When enabled, push reviewed changes to `main`; only a commit with successful CI is deployed. The outbound `autodev-deploy.timer` notices successful main CI within about two
 minutes, verifies that main still matches, and runs the transaction under `/opt/autodev/deploy/lock`.
 Older queued runs are skipped. `prepare-host.sh` is for a new host only.
 

@@ -125,16 +125,31 @@ Anything flagged still waits for you. Setup:
 
 ### Automatic autodev deployment
 
-After the `Check` workflow passes on a push to `main`, a root-owned outbound service on the
-host deploys that exact SHA. Tests continue to run on GitHub-hosted runners; no general CI
+When `autoDeployEnabled` is explicitly true, a root-owned outbound service deploys the exact
+SHA after the `Check` workflow passes on a push to `main`. Automatic deployment defaults off. Tests continue to run on GitHub-hosted runners; no general CI
 runner or incoming deployment connection is needed on the droplet.
 
 One-time host setup (root, after the existing bootstrap): install `deploy/ci-deploy.sh` and
-`deploy/ci-poll.ts` into `/opt/autodev/deploy/`, owned by root, mode 0755. This directory
+`deploy/ci-poll.ts` and `deploy/deployment-config.ts` into `/opt/autodev/deploy/`, owned by root,
+mode 0755. Copy `deploy/autodev-deploy.config.json` to `/opt/autodev/deploy/config.json`
+(root-owned, mode 0644) only if that file is absent; never overwrite the operator’s setting. This directory
 must be traversable by the service user so it can read the `pending` startup guard. Create
 `/opt/autodev/incoming` with root ownership and mode 0700. Install `deploy/autodev-deploy.service`
 and `deploy/autodev-deploy.timer` in `/etc/systemd/system/`, then run `systemctl daemon-reload`
 and `systemctl enable --now autodev-deploy.timer`.
+
+The deployment flag lives outside app releases in `/opt/autodev/deploy/config.json`:
+
+```json
+{ "autoDeployEnabled": false }
+```
+
+Set it to `true` explicitly to enable automatic deployment, or `false` to turn it off. The
+running timer reads it on every poll, so no service restart is needed. Missing config defaults
+off, and malformed settings block deployment. A disabled poll makes no GitHub calls. The flag
+is checked again after CI queries and after dependency installation, before the app is stopped.
+A deployment that has already stopped the app finishes its transaction/rollback.
+This setting controls autodev itself; each application needs its own deployment setup.
 
 The public repository needs no deployment credentials. Every two minutes (plus up to 15 seconds
 of jitter), the poller checks GitHub's public API for a successful main push to `check.yml`.

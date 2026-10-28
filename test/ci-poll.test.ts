@@ -52,6 +52,7 @@ test('installed commit uses one API request per poll, within the public API rate
 function root() {
   const dir = mkdtempSync(join(tmpdir(), 'deploy-poll-'));
   mkdirSync(join(dir, 'app'));mkdirSync(join(dir, 'deploy'));
+  writeFileSync(join(dir, 'deploy/config.json'), JSON.stringify({ autoDeployEnabled: true }));
   writeFileSync(join(dir, 'app/.installed-commit'), 'a'.repeat(40));
   return dir;
 }
