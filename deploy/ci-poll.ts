@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { autoDeployEnabled } from './deployment-config.ts';
 
 const api = 'https://api.github.com/repos/afantos/autodev';
 export type Candidate = { sha: string; sequence: number; runId: number };
@@ -48,11 +49,13 @@ async function install(root: string, next: Candidate): Promise<void> {
 }
 
 export async function poll(root: string, fetchImpl: typeof fetch = fetch, deploy: (root: string, next: Candidate) => Promise<void> = install): Promise<void> {
+  if (!autoDeployEnabled(root)) { console.log('Automatic deployment is disabled (autoDeployEnabled=false)'); return; }
   const installed = readFileSync(join(root, 'app/.installed-commit'), 'utf8').trim();
   const failureFile = join(root, 'deploy/failed-sha');
   const failed = existsSync(failureFile) ? readFileSync(failureFile, 'utf8').trim() : '';
   const next = await candidate(fetchImpl, installed, failed);
   if (!next) { console.log('No new successful CI commit on current main'); return; }
+  if (!autoDeployEnabled(root)) { console.log('Automatic deployment was disabled during the CI check'); return; }
   try {
     await deploy(root, next);
   } catch (e) {

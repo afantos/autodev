@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Root-owned CI deploy controller, outside the release being replaced. Called only by ci-receive.sh.
+# Root-owned CI deploy controller, outside the release being replaced. Called by ci-poll.ts.
 set -euo pipefail
 [[ $(id -u) == 0 ]] || { echo 'root required' >&2; exit 2; }
 sha=${1:?SHA required}
@@ -16,6 +16,13 @@ install -d -m 0700 "$root/backups"
 install -d -m 0755 "$root/releases"
 exec 9>"$control/lock"
 flock -w 600 9 || { echo 'another deployment holds the lock' >&2; exit 1; }
+deployment_allowed() {
+  local result=0
+  node "$control/deployment-config.ts" "$root" || result=$?
+  if (( result == 3 )); then echo 'Automatic deployment is disabled (autoDeployEnabled=false)'; exit 0; fi
+  if (( result != 0 )); then echo 'Invalid deployment setting; leaving the running app untouched' >&2; exit 1; fi
+}
+deployment_allowed
 # A delayed older CI run must never replace a newer successful deployment.
 if [[ -f $control/sequence && $sequence -le $(cat "$control/sequence") ]]; then
   echo 'Skipping superseded deployment'; exit 0
@@ -79,6 +86,8 @@ rollback() {
 trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' HUP TERM
+# Re-read after dependency installation/lock waits: an operator can turn deployment off before the app is stopped.
+deployment_allowed
 # Prevent any candidate work during the startup observation window. The unit's sandbox self-test runs as usual.
 printf '%s\n' "$sha" > "$control/pending"
 stopped=1
