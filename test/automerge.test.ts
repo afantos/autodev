@@ -766,3 +766,18 @@ test('P1 (defense in depth): a major finding with a missing or unknown category 
   for (const c of [undefined, null, '', 'performance', 'Bug']) assert.equal(effectiveVerdict(v(c)).decision, 'request_changes', `category ${JSON.stringify(c)}`);
   for (const c of ['style', 'docs', 'other']) assert.equal(effectiveVerdict(v(c)).decision, 'approve', `category ${c}`);
 });
+
+test('review API failures stop spending after three attempts across polling ticks', async () => {
+  const reviewer = new FakeReviewer([APPROVE]);
+  reviewer.fail = new Error('review service unavailable');
+  const e = env(reviewer);
+  const t = await ready(e);
+  await cycles(e, 10);
+  assert.equal(reviewer.inputs.length, 3);
+  assert.equal(eventCount(e, 'second_review.error'), 3);
+  const spend = externalSpentSince(e.ctx.db, 'openai', 0);
+  await cycles(e, 5);
+  assert.equal(reviewer.inputs.length, 3);
+  assert.equal(externalSpentSince(e.ctx.db, 'openai', 0), spend);
+  assert.equal((await e.scm.getPr(e.repo, job(e, t.identifier).pr_number)).state, 'open');
+});

@@ -125,6 +125,7 @@ linear:
     failed: Failed
     canceled: Canceled
   requireLabel: autodev                  # only tickets carrying this label are touched (safe default)
+  holdMergeEnabled: false                # owner: automatic review and merge; existing hold-merge labels are ignored
 
 loop:
   tickSeconds: 60                       # 2026-10-26: halves per-tick Linear calls (shared key hit 2,500 requests/hour)

@@ -14,6 +14,7 @@ WorkingDirectory=/opt/autodev/instance
 EnvironmentFile=/opt/autodev/instance/.env
 Environment=AUTODEV_CONFIG=/opt/autodev/instance/autodev.config.yaml
 Environment=TZ=America/New_York
+Environment=AUTODEV_DEPLOY_GUARD=/opt/autodev/deploy/pending
 # Refuse to start unless the command sandbox works under THIS unit's hardening (otherwise every ticket fails setup).
 ExecStartPre=/usr/bin/node /opt/autodev/app/scripts/sandbox-selftest.ts
 ExecStart=/usr/bin/node /opt/autodev/app/src/cli.ts run

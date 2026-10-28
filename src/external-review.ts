@@ -31,6 +31,10 @@ export async function reservedReview<T>(ctx: Ctx, job: Job, sha: string, event: 
   Promise<{ kind: 'ok'; value: T } | { kind: 'waiting' } | { kind: 'failed'; failures: number; message: string }> {
   const { db, cfg } = ctx;
   const reviewer = ctx.secondReviewer!;
+  const failKey = `${failPrefix}:${job.id}:${sha}`;
+  // A terminal failure must remain terminal across polling ticks and restarts, before reserving or spending again.
+  const previousFailures = Number(kvGet(db, failKey) ?? 0);
+  if (previousFailures >= 3) return { kind: 'failed', failures: previousFailures, message: kvGet(db, `${failKey}:message`) ?? 'retry limit reached for this candidate' };
   const reservation = tx(db, () => {
     const day = externalSpentSince(db, reviewer.provider, startOfDay());
     const month = externalSpentSince(db, reviewer.provider, startOfMonth());
@@ -57,9 +61,9 @@ export async function reservedReview<T>(ctx: Ctx, job: Job, sha: string, event: 
     // Known usage → settle to it. Unknown (network error, timeout, unreadable body) → keep the worst-case charge.
     if (typeof err.costUsd === 'number') settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: err.costUsd, inputTokens: err.inputTokens ?? 0, outputTokens: err.outputTokens ?? 0, outcome: 'error' });
     else settleExternalUsage(db, reservation.id, { model: reviewer.model, costUsd: worst, inputTokens: 0, outputTokens: 0, outcome: 'error-usage-unknown' });
-    const failKey = `${failPrefix}:${job.id}:${sha}`;
     const failures = Number(kvGet(db, failKey) ?? 0) + 1;
     kvSet(db, failKey, String(failures));
+    kvSet(db, `${failKey}:message`, err.message.slice(0, 500));
     logEvent(db, `${event}.error`, `${job.ticket_identifier}: ${err.message.slice(0, 300)}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
     return failures >= 3 ? { kind: 'failed', failures, message: err.message } : { kind: 'waiting' };
   }

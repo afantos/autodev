@@ -33,7 +33,7 @@ function pushToMain(repo: string, files: Record<string, string>) {
   git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'main moves'); git(dir, 'push', '-q', 'origin', 'HEAD:main');
 }
 function env(reviewer: Reviewer) {
-  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true } } });
+  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true }, linear: { holdMergeEnabled: true } } });
   pushToMain(e.repo, { 'CHANGES.md': 'changes\n' });
   return e;
 }
@@ -57,7 +57,7 @@ test('an existing hold-merge label blocks auto-merge across status changes and a
   assert.equal(j.status, 'awaiting_merge');
   assert.equal(await merged(e, t.identifier), false);
   assert.equal(approval(e, j.pr_number), null, 'never approved while held');
-  assert.equal(reviewer.inputs.length, 0, 'no review spend while held');
+  assert.equal(reviewer.inputs.length, 1, 'held candidates still receive the independent review');
   assert.match(holds(e)[0]!, /carries the `hold-merge` label/);
   // A human moves the ticket around, and main moves: still held.
   await e.tracker.setStatus(t.id, 'blocked');
@@ -67,6 +67,8 @@ test('an existing hold-merge label blocks auto-merge across status changes and a
   await cycles(e, 6);
   assert.equal(await merged(e, t.identifier), false, 'status changes and a moved base do not release the hold');
   assert.equal(approval(e, job(e, t.identifier).pr_number), null);
+  assert.equal(job(e, t.identifier).base_sha, git(e.repo, 'rev-parse', 'main').trim(), 'held PR refreshed and revalidated');
+  assert.equal(reviewer.inputs.length, 2, 'the refreshed candidate received a new review');
   // Owner removes the label: the gate refreshes onto the new main, revalidates and merges.
   removeLabel(e, t.id, 'hold-merge');
   await cycles(e, 8);
@@ -100,7 +102,7 @@ test('a hold added between approval and merge still stops the merge (rechecked i
 
 test('the hold label is configurable and can be disabled', async () => {
   const reviewer = new Reviewer();
-  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true }, linear: { holdMergeLabel: '' } } });
+  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true }, linear: { holdMergeEnabled: true, holdMergeLabel: '' } } });
   pushToMain(e.repo, { 'CHANGES.md': 'changes\n' });
   const t = await ticket(e);
   await e.tracker.addLabel(t.id, 'hold-merge');
@@ -140,4 +142,41 @@ test('regression (P2): a hold added while the PR is marked ready stops the appro
   assert.equal(approval(e, job(e, t.identifier).pr_number), null, 'not approved');
   assert.equal(await merged(e, t.identifier), false);
   assert.match(holds(e).at(-1)!, /hold-merge/);
+});
+
+test('holds are off by default: an old hold-merge label does not stop independent review or merge', async () => {
+  const reviewer = new Reviewer();
+  const e = makeEnv({ secondReviewer: reviewer, project: { autoMerge: true }, config: { secondReview: { enabled: true } } });
+  assert.equal(e.ctx.cfg.linear.holdMergeEnabled, false);
+  const t = await ticket(e);
+  await e.tracker.addLabel(t.id, 'hold-merge');
+  await cycles(e, 6);
+  assert.equal(reviewer.inputs.length, 1);
+  assert.equal(await merged(e, t.identifier), true);
+});
+
+test('an enabled hold allows the review/fix loop to finish, then waits without further spend', async () => {
+  const reviewer = new Reviewer();
+  const review = reviewer.review.bind(reviewer);
+  reviewer.review = async (input) => {
+    const out = await review(input);
+    if (reviewer.inputs.length === 1) out.verdict = {
+      verdict: 'request_changes', summary: 'Missing bounds.', specConformance: 'incomplete',
+      findings: [{ severity: 'major', category: 'bug', file: 'CHANGES.md', line: 1, issue: 'Unbounded input', suggestion: 'Validate bounds' }],
+    };
+    return out;
+  };
+  const e = env(reviewer);
+  const t = await ticket(e);
+  await e.tracker.addLabel(t.id, 'hold-merge');
+  await cycles(e, 8);
+  assert.equal(reviewer.inputs.length, 2, 'reworked candidate was reviewed while held');
+  assert.equal(await merged(e, t.identifier), false);
+  const calls = e.runner.calls.length;
+  await cycles(e, 3);
+  assert.equal(e.runner.calls.length, calls);
+  assert.equal(reviewer.inputs.length, 2, 'no repeat review purchases');
+  removeLabel(e, t.id, 'hold-merge');
+  await cycles(e, 2);
+  assert.equal(await merged(e, t.identifier), true);
 });

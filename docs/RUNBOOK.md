@@ -65,9 +65,25 @@ autodev tick           # → Done
 
 ## Upgrading
 
-```bash
-cd /opt/autodev/app && git pull && npm ci && npm run check && sudo systemctl restart autodev
-```
+Push reviewed changes to `main`. The `Check` workflow deploys that exact commit only after its
+checks pass. Older queued runs are skipped; deployments are serialized in GitHub and by
+`/opt/autodev/deploy/lock` on the host. `prepare-host.sh` is for a new host only.
+
+The controller stages dependencies before stopping the old process, backs up the stopped
+SQLite database and installed unit, and switches `/opt/autodev/app` to an immutable release.
+The candidate starts behind a root-owned guard: it acquires its instance lock and runs schema
+migrations, but makes no tracker, GitHub or agent calls during the check. For 15 seconds the
+controller requires a stable systemd PID, a fresh startup event and that process's fresh
+instance lock. A failure restores code, unit and the database snapshot, restarts the previous
+release, and fails the CI job. State rollback is safe during this window because the guard
+prevents candidate work. After the guard is removed, later operational failures require
+investigation; this is a startup rollback, not an automatic rollback of already published work.
+
+Inspect `journalctl -u 'autodev-deploy-*'` and `journalctl -u autodev`. Backups are under
+`/opt/autodev/backups/`; releases are under `/opt/autodev/releases/`. Retain these for recovery.
+An abandoned `deploy/pending` marker stops subsequent deployments for recovery; do not remove
+it until the installed release and state are checked. See [deployment setup](SETUP.md#automatic-autodev-deployment)
+for the one-time CI identity installation. Runtime config and `.env` are never copied from a release.
 
 After restarting, inspect queued work and unsettled budget reservations. Leases and stages preserve progress; remote writes are retried and reconciliation checks merges before marking Done.
 
