@@ -104,13 +104,8 @@ test('an older queued run cannot downgrade a newer successful deployment', () =>
   assert.deepEqual(JSON.parse(readFileSync(join(root,'state.json'),'utf8')).calls,[]);
 });
 
-test('CI deploys only successful main pushes, serializes deployments and uses pinned SSH host keys', () => {
+test('CI checks stay on hosted runners; deployment provenance is enforced by the outbound poller', () => {
   const workflow=parse(readFileSync(join(repo,'.github/workflows/check.yml'),'utf8'));
-  const deploy=workflow.jobs.deploy;
-  assert.equal(deploy.needs,'checks');
-  assert.equal(deploy.if,"github.event_name == 'push' && github.ref == 'refs/heads/main'");
-  assert.equal(deploy.concurrency['cancel-in-progress'],false);
-  const command=deploy.steps.find((s: {run?:string})=>s.run?.includes('git archive')).run;
-  assert.match(command,/StrictHostKeyChecking=yes/);
-  assert.match(command,/current.*!=.*GITHUB_SHA/);
+  assert.equal(workflow.jobs.checks['runs-on'],'ubuntu-24.04');
+  assert.deepEqual(Object.keys(workflow.jobs),['checks']);
 });

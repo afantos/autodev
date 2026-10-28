@@ -125,32 +125,30 @@ Anything flagged still waits for you. Setup:
 
 ### Automatic autodev deployment
 
-The `Check` workflow's deploy job runs after `checks` only for pushes to `main`. It deploys
-the tested SHA and skips a commit superseded on main. Deployment concurrency follows
-[GitHub's deployment guidance](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/control-deployments).
+After the `Check` workflow passes on a push to `main`, a root-owned outbound service on the
+host deploys that exact SHA. Tests continue to run on GitHub-hosted runners; no general CI
+runner or incoming deployment connection is needed on the droplet.
 
 One-time host setup (root, after the existing bootstrap): install `deploy/ci-deploy.sh` and
-`deploy/ci-receive.sh` into `/opt/autodev/deploy/`, owned by root, mode 0755. This directory
-must be traversable by the service user so it can read the `pending` startup guard. Install
-`deploy/autodev.service`, then `systemctl daemon-reload` (CI performs the first restart).
-Create a dedicated Ed25519 key and add only its public key to root's `authorized_keys` as:
+`deploy/ci-poll.ts` into `/opt/autodev/deploy/`, owned by root, mode 0755. This directory
+must be traversable by the service user so it can read the `pending` startup guard. Create
+`/opt/autodev/incoming` with root ownership and mode 0700. Install `deploy/autodev-deploy.service`
+and `deploy/autodev-deploy.timer` in `/etc/systemd/system/`, then run `systemctl daemon-reload`
+and `systemctl enable --now autodev-deploy.timer`.
 
-```text
-restrict,command="/opt/autodev/deploy/ci-receive.sh" ssh-ed25519 PUBLIC_KEY autodev-ci
-```
+The public repository needs no deployment credentials. Every two minutes (plus up to 15 seconds
+of jitter), the poller checks GitHub's public API for a successful main push to `check.yml`.
+It verifies the repository, event, workflow path, required `checks` job and current main SHA,
+then downloads that commit's archive directly from GitHub. It rechecks main before starting
+`ci-deploy.sh`. Normal polls make one API call, within GitHub's unauthenticated rate limit.
+A failed deployment transaction is recorded in `deploy/failed-sha` and waits for a new green
+commit or an explicit operator retry; transient API/download failures retry on the next poll.
+Host prerequisites: Node 24+, npm, Python 3.12+, sqlite3, flock and systemd.
 
-Set repository secrets `AUTODEV_DEPLOY_KEY` (dedicated private key) and
-`AUTODEV_DEPLOY_KNOWN_HOSTS` (the independently verified SSH host public key); set repository
-variable `AUTODEV_DEPLOY_HOST` to the hostname/IP. The key cannot open a shell or forward ports;
-its only command accepts a SHA, workflow run number and release archive. The receiver starts
-a systemd transaction so SSH disconnection cannot interrupt rollback. No account/API credentials
-from the running instance are given to GitHub. Host prerequisites: Node 24+, npm, Python 3.12+,
-sqlite3, flock and systemd (all available in the Ubuntu host setup).
-
-CI updates app code and its unit. The deployment controller lives outside releases so a failed
-release cannot replace the code responsible for its rollback. Updating the controller itself
-requires explicitly installing its reviewed version under the same host lock. Runtime config,
-credentials and app databases are not release artifacts. See the [upgrade runbook](RUNBOOK.md#upgrading).
+The deployment controller lives outside releases so a failed release cannot replace the code
+responsible for rollback. Updating the controller/poller itself requires explicitly installing
+its reviewed version under the same host lock. Runtime config, credentials and app databases
+are not release artifacts. See the [upgrade runbook](RUNBOOK.md#upgrading).
 
 ## 4. Cloud VM (you: this costs money)
 
