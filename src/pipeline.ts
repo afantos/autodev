@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveReview, continuePolicyKey } from './review-resolution.ts';
 import { join, resolve } from 'node:path';
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
@@ -9,7 +10,7 @@ import { CODING_SYSTEM, REVIEW_SYSTEM, docsHint, ticketBlock, untrusted } from '
 import type { AgentRunResult, AgentTool } from './agents/runner.ts';
 import { CodingResultSchema, ReviewSchema, jsonSchema } from './agents/schemas.ts';
 import type { CodingResult, Review } from './agents/schemas.ts';
-import { decisionsForTicket, recordHumanDecision, resolveQuestion } from './decisions.ts';
+import { activeDecisionsForTicket, recordHumanDecision, resolveQuestion } from './decisions.ts';
 import { shellQuote, slugify, tail } from './exec.ts';
 import { similarity } from './planning.ts';
 import { LABEL_SUGGESTED } from './tracker/types.ts';
@@ -19,7 +20,7 @@ import { scanSecrets, UnsafePushError } from './secrets.ts';
 import { WorktreeTamperedError } from './scm/git.ts';
 import { inspectChanges, onlyKeywordFindings, onlyNarrowTestUpdates } from './policy.ts';
 import { aiApprovalEligible, clearKeywordFlags, isCleared, triageBlocker, triageEnabled } from './triage.ts';
-import { codingModelOverrideKey, conflictFeedback } from './automerge.ts';
+import { codingModelOverrideKey, conflictFeedback, requirementsHash } from './automerge.ts';
 import { baseFailsNote, failingTestFilesOfChecks, inDiff, outsideDiffNote } from './ci-flake.ts';
 import { looksLikeOfflineMiss, planPrime, readBaseLockfile, readLockfileSafely } from './npm-cache-prime.ts';
 export { scanSecrets } from './secrets.ts';
@@ -104,7 +105,7 @@ export async function runJob(ctx: Ctx, jobId: string): Promise<void> {
     }
     // All stages complete → awaiting human merge.
     releaseLease(db, jobId, owner, 'awaiting_merge', { error: null });
-    logEvent(db, 'job.review', `${job.ticket_identifier} ready for human review: ${job.pr_url}`, { jobId, ticketId: job.ticket_id });
+    logEvent(db, 'job.review', `${job.ticket_identifier} ready for ${project.decisionMode === 'continue' ? 'automatic resolution' : 'human review'}: ${job.pr_url}`, { jobId, ticketId: job.ticket_id });
   } catch (e) {
     let failure = abort.signal.aborted ? abort.signal.reason : e;
     if (!(failure instanceof LeaseLostError)) {
@@ -260,7 +261,7 @@ async function runStage(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConf
       await mayContinue(ctx, job, signal);
       await tracker.setStatus(ticket.id, 'review');
       const s = JSON.parse(job.summary_json ?? '{}');
-      const lead = project.autoMerge ? `✅ Ready: ${pr.url}\nautodev merges it automatically once the second review and every merge gate pass; otherwise it asks for your review.` : `✅ Ready for your review: ${pr.url}`;
+      const lead = (project.autoMerge || project.decisionMode === 'continue') ? `✅ Ready: ${pr.url}\nautodev merges it automatically once the second review and every merge gate pass; otherwise it asks for your review.` : `✅ Ready for your review: ${pr.url}`;
       await tracker.comment(ticket.id, `${lead}${preview ? `\nPreview: ${preview}` : ''}\n\n${s.coding?.summary ?? ''}\n\nAI review: ${s.review?.outcome ?? 'n/a'} — ${s.review?.summary ?? ''}`);
       return;
     }
@@ -331,6 +332,26 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
   const state = ctx.ws.trustedState(job.worktree!);
   if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
   const result = await inspectChanges(ctx.ws, job.worktree!, job.base_branch!, project, ctx.cfg);
+  if (project.decisionMode === 'continue') {
+    const reasons = result.reasons;
+    if (!reasons.length) return;
+    const requirements = requirementsHash(ctx, (await ctx.tracker.getTicket(job.ticket_id))!);
+    const approvalKey = continuePolicyKey(job.id, result.hash, requirements, reasons, ctx.cfg.models.reviewArbitration);
+    if (kvGet(ctx.db, approvalKey)) return;
+    const ticket = (await ctx.tracker.getTicket(job.ticket_id))!;
+    const view = await ctx.ws.candidateSnapshot(job.worktree!, candidate(job));
+    const resolution = await resolveReview(ctx, { ...job, candidate_worktree: view }, ticket, project, {
+      source: 'policy', requirements, summary: 'Resolve every protected-diff policy finding before implementation continues.',
+      complaints: reasons.map((issue, i) => ({ id: `finding-${i}`, issue })),
+    });
+    if (resolution.kind === 'accept') { kvSet(ctx.db, approvalKey, resolution.note); return; }
+    if (resolution.kind === 'rework') {
+      kvSet(ctx.db, resolution.key!, candidate(job));
+      updateJob(ctx.db, job.id, { pending_feedback: resolution.note, stage: 'workspace', validated_sha: null, reviewed_sha: null, candidate_worktree: null }, ctx.owner);
+      throw new Divert('requeue', 'Policy tie-breaker requested rework');
+    }
+    throw new Divert('requeue', resolution.note);
+  }
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
   // A human approved this same change (same fingerprint) with the same or more findings; only the base moved since.
   const carried = result.fingerprint ? kvGet(ctx.db, `policy-approved-change:${job.id}:${result.fingerprint}`) : null;
@@ -540,7 +561,7 @@ async function implement(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectCon
   const complexity = ticket.estimate ?? 3;
   // A second-review escalation runs its rework with codingComplex whatever the estimate (one pass; cleared below).
   const model = kvGet(db, codingModelOverrideKey(job.id)) ?? (complexity >= cfg.models.complexThreshold ? cfg.models.codingComplex : cfg.models.coding);
-  const priorDecisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- Q: ${d.question}\n  A (${d.authority}): ${d.decision}`).join('\n');
+  const priorDecisions = activeDecisionsForTicket(ctx, ticket, project).map((d) => `- Q: ${d.question}\n  A (${d.authority}): ${d.decision}`).join('\n');
   // Human answers on the [Plan] umbrella issue (e.g. to the plan's open questions) are part of the requirements.
   const planNotes = ticket.parentId ? (await ctx.tracker.listComments(ticket.parentId).catch(() => [])).filter((c) => !c.byAutomation).map((c) => c.body).join('\n---\n') : '';
   const refreshed = baseRefreshNote(ctx, job);
@@ -634,7 +655,7 @@ Full diff from the orchestrator's protected object store:
 ${untrusted('git-diff', diff)}
 
 Decisions already approved for this ticket (from the decision log — authoritative requirements, do not re-question them):
-${decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved').map((d) => `- (${d.authority}) Q: ${d.question}\n  A: ${d.decision}`).join('\n') || '- none'}
+${activeDecisionsForTicket(ctx, ticket, project).map((d) => `- (${d.authority}) Q: ${d.question}\n  A: ${d.decision}`).join('\n') || '- none'}
 
 Orchestrator-verified facts:
 - Validation commands passed: ${project.validate.join(', ') || '(none configured)'}
@@ -658,8 +679,8 @@ Review this supplied diff and the surrounding files in this candidate snapshot. 
   const parsed = ReviewSchema.safeParse(res.structured);
   if (!parsed.success) throw new AgentFailure({ ...res, ok: false, errorKind: 'structured_output', error: parsed.error.message });
   const r: Review = parsed.data;
-  updateJob(db, job.id, { summary_json: mergeSummary(job, { review: r }) }, owner);
-  job.summary_json = mergeSummary(job, { review: r });
+  updateJob(db, job.id, { summary_json: mergeSummary(job, { review: r, reviewResolution: null }) }, owner);
+  job.summary_json = mergeSummary(job, { review: r, reviewResolution: null });
   logEvent(db, 'review', `${r.outcome}: ${r.summary.slice(0, 200)}`, { jobId: job.id, ticketId: job.ticket_id });
   for (const f of r.followUps.slice(0, 3)) await proposeTicket(ctx, job, ticket, f.title, f.description).catch(() => {});
   void diff;
@@ -671,6 +692,27 @@ Review this supplied diff and the surrounding files in this candidate snapshot. 
   const findings = r.findings.filter((f) => f.severity !== 'nit').map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.issue}\n  Fix: ${f.suggestion}`).join('\n');
   const unmet = r.acceptanceCriteria.filter((a) => !a.met).map((a) => `- NOT MET: ${a.criterion} (${a.evidence})`).join('\n');
   if (job.review_cycles >= cfg.limits.maxReviewCycles) {
+    if (project.decisionMode === 'continue') {
+      const resolution = await resolveReview(ctx, job, ticket, project, {
+        source: 'review_loop', requirements: requirementsHash(ctx, ticket), summary: r.summary, signal,
+        complaints: [
+          ...r.findings.filter(f => f.severity !== 'nit').map((f, i) => ({ id: `finding-${i}`, issue: `${f.issue}\nSuggested fix: ${f.suggestion}`, file: f.file })),
+          ...r.acceptanceCriteria.filter(a => !a.met).map((a, i) => ({ id: `criterion-${i}`, issue: `${a.criterion}: ${a.evidence}` })),
+        ],
+      });
+      if (resolution.kind === 'accept') {
+        updateJob(db, job.id, { reviewed_sha: candidate(job), summary_json: mergeSummary(job, { reviewResolution: resolution.note }) }, owner);
+        return;
+      }
+      if (resolution.kind === 'rework') {
+        kvSet(db, resolution.key!, candidate(job));
+        kvSet(db, codingModelOverrideKey(job.id), cfg.models.codingComplex);
+        updateJob(db, job.id, { pending_feedback: resolution.note, stage: 'workspace', reviewed_sha: null, validated_sha: null, candidate_worktree: null }, owner);
+        throw new Divert('requeue', 'AI tie-breaker requested one targeted rework');
+      }
+      if (resolution.kind === 'waiting') throw new Divert('requeue', resolution.note);
+      throw new Divert('requeue', resolution.note);
+    }
     throw new Divert('blocked', 'review loop exhausted', { reason: `review still requests changes after ${cfg.limits.maxReviewCycles} fix cycles`, question: `Open review findings:\n${findings}\n${unmet}\nHow should we proceed?`, options: ['Accept as-is and review manually', 'Clarify requirements and retry', 'Cancel'], recommendation: null, decisionId: null });
   }
   updateJob(db, job.id, { review_cycles: job.review_cycles + 1, pending_feedback: `Independent code review requested changes:\n${r.summary}\n${findings}\n${unmet}`, stage: 'workspace' }, owner);
@@ -714,6 +756,11 @@ async function handleDivert(ctx: Ctx, job: Job, project: ProjectConfig, e: unkno
     const k = e.res.errorKind;
     if (k === 'rate_limited' || k === 'api') {
       releaseLease(db, job.id, owner, 'queued', { error: e.message, stage: 'workspace' });
+      return;
+    }
+    if (k === 'auth' && project.decisionMode === 'continue') {
+      releaseLease(db, job.id, owner, 'queued', { error: e.message, stage: 'workspace' });
+      logEvent(db, 'auth.automatic_wait', e.message, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
       return;
     }
     if (k === 'auth') {
@@ -796,6 +843,24 @@ export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   // Save the interrupted run's work as a local commit first, whatever happens next: triage may park or requeue the job
   // without reaching a human, and a later base refresh refuses a dirty workspace. Nothing is pushed unvalidated.
   await preserveWork(ctx, job, 'blocked');
+  const project = ctx.cfg.projects.find(p => p.key === job.project)!;
+  if (project.decisionMode === 'continue') {
+    const ticket = await tracker.getTicket(job.ticket_id);
+    let note = b.reason;
+    if (ticket && job.worktree) {
+      try {
+        const result = await resolveQuestion(ctx, { job, ticket, project, worktree: job.worktree,
+          question: b.question, context: `${b.reason}\nResolve this stop autonomously. Give a concrete repair or continuation plan; do not ask the owner.`, options: b.options });
+        if (result.kind === 'answered') note = result.text;
+        else note = `Automatic resolution unavailable: ${result.reason}`;
+        if (b.decisionId && result.kind === 'answered') ctx.db.prepare("UPDATE decisions SET status = 'superseded', superseded_by = ? WHERE id = ? AND status = 'pending_human'").run(result.decisionId, b.decisionId);
+      } catch (e) { note = `Automatic resolution retry: ${String(e).slice(0, 500)}`; }
+    }
+    releaseLease(db, job.id, owner, 'queued', { stage: 'workspace', pending_feedback: note, blocked_reason: null, error: note });
+    await tracker.setStatus(job.ticket_id, 'in_progress');
+    logEvent(db, 'blocker.delegated', note, { jobId: job.id, ticketId: job.ticket_id });
+    return;
+  }
   if (b.triage) {
     const t = await triageBlocker(ctx, job, b).catch((e) => ({ kind: 'human' as const, note: `triage failed: ${(e as Error).message.slice(0, 300)}`, recommendation: null }));
     if (t?.kind === 'resolved') return;
@@ -831,6 +896,9 @@ function recordPending(ctx: Ctx, job: Job, b: Blocker): string {
 
 async function fail(ctx: Ctx, job: Job, message: string) {
   const { db, owner, tracker } = ctx;
+  if (ctx.cfg.projects.find(p => p.key === job.project)?.decisionMode === 'continue') return blockJob(ctx, job, {
+    reason: message, question: 'Resolve this execution failure autonomously with a concrete repair plan.', options: ['Repair and retry', 'Propose a follow-up recovery task'], recommendation: null, decisionId: null,
+  });
   await preserveWork(ctx, job, 'failed');
   releaseLease(db, job.id, owner, 'failed', { error: message, attempts: job.attempts });
   await tracker.comment(job.ticket_id, `❌ autodev could not complete this ticket.\n\n\`\`\`\n${message.slice(0, 2500)}\n\`\`\`\nWork so far is on branch \`${job.branch ?? '(none)'}\`. Move back to **Ready** to retry from scratch.`).catch(() => {});
@@ -896,10 +964,10 @@ export function assertionDelta(diff: string): string {
 }
 
 async function prBody(ctx: Ctx, job: Job, ticket: Ticket, preview: string | null, state: string): Promise<string> {
-  const s = JSON.parse(job.summary_json ?? '{}') as { coding?: CodingResult; review?: Review; ci?: string };
-  const decisions = decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved');
-  const files = job.worktree && job.base_branch ? await ctx.ws.changedFiles(job.worktree, job.base_branch).catch(() => []) : [];
+  const s = JSON.parse(job.summary_json ?? '{}') as { coding?: CodingResult; review?: Review; reviewResolution?: string; ci?: string };
   const project = ctx.cfg.projects.find((p) => p.key === job.project)!;
+  const decisions = activeDecisionsForTicket(ctx, ticket, project);
+  const files = job.worktree && job.base_branch ? await ctx.ws.changedFiles(job.worktree, job.base_branch).catch(() => []) : [];
   return `Linear: [${ticket.identifier}](${ticket.url}) — ${ticket.title}
 Status: **${state}** · autodev job \`${job.id.slice(0, 8)}\`${preview ? `\nPreview: ${preview}` : ''}
 
@@ -919,6 +987,7 @@ ${project.validate.map((c) => `- \`${c}\` ✅ (run by orchestrator)`).join('\n')
 
 ## AI review
 ${s.review ? `**${s.review.outcome}** — ${s.review.summary}\n${s.review.findings.map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''} ${f.issue}`).join('\n')}` : '_pending_'}
+${s.reviewResolution ? `\n**Disagreement resolution:**\n${s.reviewResolution}` : ''}
 
 ## Known limitations
 ${(s.coding?.knownLimitations ?? []).map((l) => `- ${l}`).join('\n') || '- none reported'}
@@ -927,7 +996,7 @@ ${(s.coding?.knownLimitations ?? []).map((l) => `- ${l}`).join('\n') || '- none 
 ${preview ? `Open the preview: ${preview}` : `\`git fetch origin && git switch ${job.branch}\`, then: ${project.setup.concat(project.validate).map((c) => `\`${c}\``).join(', ') || 'run the app'}.`}
 
 ---
-🤖 Generated by autodev using [Claude Code](https://claude.com/claude-code). Merge authority stays with a human.`;
+🤖 Generated by autodev using [Claude Code](https://claude.com/claude-code). ${project.decisionMode === 'continue' ? 'Approval and merge decisions are delegated to autodev.' : 'Merge authority stays with a human.'}`;
 }
 
 export type { PullRequest };

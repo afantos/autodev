@@ -1,3 +1,4 @@
+import { resolveReview, continuePolicyKey } from './review-resolution.ts';
 import type { ProjectConfig } from './config.ts';
 import type { Ctx } from './context.ts';
 import { kvGet, kvSet, logEvent, updateJob } from './db.ts';
@@ -27,10 +28,22 @@ import { createHash } from 'node:crypto';
 export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project: ProjectConfig): Promise<'merged' | 'requeued' | 'waiting' | 'held' | 'skipped'> {
   const { cfg, db, scm, ws, tracker } = ctx;
   const reviewer = ctx.secondReviewer;
-  if (!project.autoMerge || !cfg.secondReview.enabled || !reviewer) return 'skipped';
+  if (!project.autoMerge && project.decisionMode !== 'continue') return 'skipped';
+  if (!cfg.secondReview.enabled || !reviewer) {
+    if (project.decisionMode === 'continue') { logEvent(db, 'automerge.automatic_wait', 'Reviewer integration unavailable; automatic merge will retry.', { jobId: job.id, ticketId: job.ticket_id }); return 'waiting'; }
+    return 'skipped';
+  }
   if (job.status !== 'awaiting_merge' || !job.pr_number || !job.worktree || !job.base_branch) return 'skipped';
   const sha = job.candidate_sha;
-  const hold = async (reason: string): Promise<'held'> => {
+  const hold = async (reason: string): Promise<'held' | 'requeued' | 'waiting'> => {
+    if (project.decisionMode === 'continue') {
+      logEvent(db, 'automerge.automatic_wait', reason, { jobId: job.id, ticketId: job.ticket_id });
+      if (!job.worktree || !job.candidate_worktree || !sha) return 'waiting';
+      const result = await resolveReview(ctx, job, ticket, project, { source: 'blocker', requirements: requirementsHash(ctx, ticket),
+        summary: 'Resolve a merge stop. Execution checks must pass after any repair.', complaints: [{ id: 'finding-0', issue: reason }] });
+      if (result.kind === 'held' || result.kind === 'waiting') return 'waiting';
+      return requeue({ stage: 'workspace', fix_attempts: 0, pending_feedback: result.note }, 'automerge.stop_rework', result.note);
+    }
     const key = `automerge-hold:${job.id}:${sha}`;
     if (kvGet(db, key) !== reason) {
       kvSet(db, key, reason);
@@ -53,13 +66,14 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   // Ticket reads still fail closed; moving the ticket out of Review stops all automatic work here.
   const holdLabel = cfg.linear.holdMergeEnabled ? cfg.linear.holdMergeLabel : '';
   const holdReason = `The ticket carries the \`${holdLabel}\` label, so auto-merge is on hold. Remove the label to let it continue.`;
-  const mayProceed = async (checkHold = true): Promise<'ok' | 'held' | 'skipped'> => {
+  const mayProceed = async (checkHold = true): Promise<'ok' | 'held' | 'skipped' | 'requeued' | 'waiting'> => {
     let current: Ticket | null = null;
     try { current = await tracker.getTicket(ticket.id); } catch (e) {
       await hold(`The ticket's state could not be verified (${(e as Error).message.slice(0, 200)}), so auto-merge stopped; it retries on the next pass.`);
       return 'held';
     }
     if (!current) { await hold('The ticket could not be found, so its hold state could not be verified; auto-merge stopped.'); return 'held'; }
+    // The owner's hold-merge label is a hard stop in every decisionMode, including continue.
     if (checkHold && holdLabel && current.labels.includes(holdLabel)) { await hold(holdReason); return 'held'; }
     if (current.status !== 'review') return 'skipped';
     return 'ok';
@@ -104,7 +118,23 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   // Triage exception: findings that come only from the keyword heuristic, cleared for this exact diff hash.
   const policy = await inspectChanges(ws, job.worktree, job.base_branch, project, cfg);
   let policyNote = 'clean';
-  if (policy.reasons.length) {
+  if (project.decisionMode === 'continue') {
+    const reasons = policy.reasons;
+    if (reasons.length) {
+      const requirements = requirementsHash(ctx, ticket);
+      const approvalKey = continuePolicyKey(job.id, policy.hash, requirements, reasons, ctx.cfg.models.reviewArbitration);
+      let approval = kvGet(db, approvalKey);
+      if (!approval) {
+        const resolution = await resolveReview(ctx, job, ticket, project, { source: 'policy', requirements,
+          summary: 'Resolve every protected-diff policy finding before merge.', complaints: reasons.map((issue, i) => ({ id: `finding-${i}`, issue })) });
+        if (resolution.kind === 'rework') return requeue({ stage: 'workspace', pending_feedback: resolution.note }, 'automerge.policy_rework', resolution.note);
+        if (resolution.kind !== 'accept') return hold(resolution.note);
+        approval = resolution.note; kvSet(db, approvalKey, approval);
+      }
+      policyNote = `delegated policy approval for exact diff ${policy.hash.slice(0, 12)}`;
+    }
+  }
+  if (policy.reasons.length && project.decisionMode !== 'continue') {
     const approval = kvGet(db, `policy-approved:${job.id}:${policy.hash}`);
     const humanApproved = !!approval;
     // Only `/answer approve` of this exact hash; an approval carried over by fingerprint after a base refresh is not one.
@@ -114,7 +144,7 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       // The owner approved this exact diff (by hash); the second review and the CI/head gates still apply.
       policyNote = `flagged changes approved by the owner for this exact diff (${policy.hash.slice(0, 12)})`;
     } else if (!humanApproved && onlyNarrowTestUpdates(policy)) {
-      const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, hold);
+      const gate = await testIntegrityGate(ctx, job, ticket, policy, sha, async reason => { await hold(reason); return 'held'; });
       if (gate !== 'approved') return gate;
       policyNote = 'narrow existing-test update approved by the test-integrity review';
     } else {
@@ -171,6 +201,7 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (decision.overridden) {
     logEvent(db, 'second_review.overridden', `${job.ticket_identifier}: model said ${verdict.verdict}; ${decision.blocking.length} blocking finding(s) → ${decision.decision}`, { jobId: job.id, ticketId: job.ticket_id });
   }
+  let arbitrationNote = '';
   if (decision.decision !== 'approve') {
     const findings = fmt(decision.blocking);
     // No progress: this exact candidate was already sent back for these findings and the rework changed nothing.
@@ -183,30 +214,47 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
     // changed nothing, hold for a human.
     const escalationKey = `review-escalated:${job.id}:${requirements}`;
     const escalated = !!kvGet(db, escalationKey);
-    if (escalated) {
-      const tried = `an escalated rework (${cfg.models.codingComplex}) that received every finding`;
-      if (noProgress) return hold(`The second review (${reviewer.model}) still requests changes, but the last rework left the candidate unchanged (${sha.slice(0, 12)}), so another rework would repeat it; ${tried} was already tried. A human should decide:\n${verdict.summary}\n${findings}`);
-      if (exhausted) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles and ${tried}:\n${verdict.summary}\n${findings}`);
-      return hold(`The second review (${reviewer.model}) still requests changes after ${tried}. A human should decide:\n${verdict.summary}\n${findings}`);
+    if (project.decisionMode === 'continue' && (escalated || noProgress || exhausted)) {
+      const resolution = await resolveReview(ctx, job, ticket, project, {
+        source: 'merge_review', requirements, summary: `${verdict.summary}\n${verdict.specConformance}`,
+        complaints: decision.blocking.map((f, i) => ({ id: `finding-${i}`, issue: `${f.issue}\nSuggested fix: ${f.suggestion}`, file: f.file, category: f.category })),
+      });
+      if (resolution.kind === 'held') { logEvent(db, 'automerge.automatic_wait', resolution.note, { jobId: job.id, ticketId: ticket.id }); return 'waiting'; }
+      if (resolution.kind === 'waiting') return 'waiting';
+      if (resolution.kind === 'rework') {
+        kvSet(db, resolution.key!, sha);
+        kvSet(db, codingModelOverrideKey(job.id), cfg.models.codingComplex);
+        return requeue({ stage: 'workspace', pending_feedback: resolution.note }, 'automerge.arbitration_rework', resolution.note);
+      }
+      arbitrationNote = resolution.note;
     }
-    if (noProgress || exhausted) {
-      kvSet(db, escalationKey, sha);
-      kvSet(db, codingModelOverrideKey(job.id), cfg.models.codingComplex);
-      const why = noProgress ? `the last rework left the candidate unchanged (${sha.slice(0, 12)})` : `${cfg.limits.maxReviewCycles} rework cycles did not resolve them`;
-      return requeue({ stage: 'workspace', pending_feedback: escalationFeedback(reviewer.model, verdict, findings, noProgress) },
-        'automerge.escalate', `⏫ Second review (${reviewer.model}) still requests changes and ${why}. autodev is running one escalated rework with ${cfg.models.codingComplex} before asking a human.\n\n${verdict.summary}\n${findings}`);
+    if (!arbitrationNote) {
+      if (escalated) {
+        const tried = `an escalated rework (${cfg.models.codingComplex}) that received every finding`;
+        if (noProgress) return hold(`The second review (${reviewer.model}) still requests changes, but the last rework left the candidate unchanged (${sha.slice(0, 12)}), so another rework would repeat it; ${tried} was already tried. A human should decide:\n${verdict.summary}\n${findings}`);
+        if (exhausted) return hold(`The second review (${reviewer.model}) still requests changes after ${cfg.limits.maxReviewCycles} rework cycles and ${tried}:\n${verdict.summary}\n${findings}`);
+        return hold(`The second review (${reviewer.model}) still requests changes after ${tried}. A human should decide:\n${verdict.summary}\n${findings}`);
+      }
+      if (noProgress || exhausted) {
+        kvSet(db, escalationKey, sha);
+        kvSet(db, codingModelOverrideKey(job.id), cfg.models.codingComplex);
+        const why = noProgress ? `the last rework left the candidate unchanged (${sha.slice(0, 12)})` : `${cfg.limits.maxReviewCycles} rework cycles did not resolve them`;
+        return requeue({ stage: 'workspace', pending_feedback: escalationFeedback(reviewer.model, verdict, findings, noProgress) },
+          'automerge.escalate', `⏫ Second review (${reviewer.model}) still requests changes and ${why}. autodev is running one escalated rework with ${cfg.models.codingComplex} before asking a human.\n\n${verdict.summary}\n${findings}`);
+      }
+      return requeue({ stage: 'workspace', review_cycles: job.review_cycles + 1, pending_feedback: `The independent merge reviewer (${reviewer.model}) requested changes before this can be merged:\n${verdict.summary}\n${findings}\nSpec conformance notes: ${verdict.specConformance}` },
+        'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
     }
-    return requeue({ stage: 'workspace', review_cycles: job.review_cycles + 1, pending_feedback: `The independent merge reviewer (${reviewer.model}) requested changes before this can be merged:\n${verdict.summary}\n${findings}\nSpec conformance notes: ${verdict.specConformance}` },
-      'automerge.rework', `🔁 Second review (${reviewer.model}) requested changes; autodev is reworking the PR.\n\n${verdict.summary}\n${findings}`);
   }
 
   // All gates passed. Re-check everything that can change while the review ran, immediately before acting.
   const latest = await tracker.getTicket(ticket.id);
-  if (latest && holdLabel && latest.labels.includes(holdLabel)) return hold(holdReason);
+  if (latest && holdLabel && latest.labels.includes(holdLabel)) { const gate = await mayProceed(); if (gate !== 'ok') return gate; }
   if (!latest || latest.status !== 'review') {
     logEvent(db, 'automerge.skipped', `${job.ticket_identifier}: ticket moved to ${latest?.status ?? 'missing'} during review; not merging`, { jobId: job.id, ticketId: job.ticket_id });
     return 'skipped';
   }
+  if (requirementsHash(ctx, latest) !== requirements) return 'waiting';
   const now = await scm.getPr(job.repo, pr.number);
   if (now.state !== 'open') return 'skipped';
   if (now.baseBranch !== job.base_branch) return hold(`The PR was retargeted to \`${now.baseBranch}\` during review; autodev validated it against \`${job.base_branch}\`.`);
@@ -215,7 +263,8 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
 
   // Approve exactly this sha as the reviewer account, then squash-merge pinned to it.
   const notes = decision.notes.length ? `\n\nNon-blocking notes from the second review:\n${fmt(decision.notes)}` : '';
-  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: approved\n- Second review (${reviewer.model}): approved: ${verdict.summary}\n- Diff policy: ${policyNote}\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}`;
+  const firstResolution = (JSON.parse(job.summary_json ?? '{}') as { reviewResolution?: string }).reviewResolution;
+  const body = `Automated merge review for ${sha.slice(0, 12)}.\n\n- CI: passed\n- Claude review: ${firstResolution ? 'disagreement resolved by AI tie-breaker' : 'approved'}\n- Second review (${reviewer.model}): ${arbitrationNote ? 'disagreement resolved by AI tie-breaker' : 'approved'}: ${verdict.summary}\n- Diff policy: ${policyNote}\n- Base: up to date with ${job.base_branch} (${job.base_sha!.slice(0, 12)})${notes}${firstResolution ? `\n\n${firstResolution}` : ''}${arbitrationNote ? `\n\n${arbitrationNote}` : ''}`;
   await scm.markReady(job.repo, pr);
   // A hold added while marking the PR ready stops the approval.
   { const g = await mayProceed(); if (g !== 'ok') return g; }
@@ -224,7 +273,7 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
   { const g = await mayProceed(); if (g !== 'ok') return g; }
   await scm.mergePr(job.repo, pr.number, sha, `${job.ticket_identifier}: ${ticket.title} (#${pr.number})`);
   logEvent(db, 'automerge.merged', `${job.ticket_identifier}: PR #${pr.number} merged at ${sha.slice(0, 12)}`, { jobId: job.id, ticketId: job.ticket_id });
-  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude review ✓, ${reviewer.model} review ✓, policy ${policyNote === 'clean' ? 'clean' : `(${policyNote})`}, up to date with ${job.base_branch}.${notes}`).catch(() => {});
+  await tracker.comment(ticket.id, `🤖 Auto-merged PR #${pr.number}: CI ✓, Claude ${firstResolution ? 'disagreement resolved by AI tie-breaker' : 'review ✓'}, ${reviewer.model} ${arbitrationNote ? 'disagreement resolved by AI tie-breaker' : 'review ✓'}, policy ${policyNote === 'clean' ? 'clean' : `(${policyNote})`}, up to date with ${job.base_branch}.${notes}`).catch(() => {});
   return 'merged';
 }
 
@@ -238,7 +287,7 @@ export function requirementsHash(ctx: Ctx, ticket: Ticket): string {
  * reviewer prompts, so a decision that invalidates a cached verdict is always shown to the fresh review.
  */
 export function humanDecisions(ctx: Ctx, ticket: Ticket): { question: string; decision: string }[] {
-  return decisionsForTicket(ctx, ticket.id).filter((d) => d.authority === 'human' && d.status === 'resolved').map((d) => ({ question: d.question, decision: d.decision ?? '' }));
+  return decisionsForTicket(ctx, ticket.id).filter((d) => d.status === 'resolved' && (d.authority === 'human' || (d.authority === 'delegated' && ctx.cfg.projects.some(p => p.key === ticket.projectKey && p.decisionMode === 'continue')))).map((d) => ({ question: d.question, decision: `${d.authority === 'delegated' ? '[Delegated by decisionMode=continue] ' : ''}${d.decision ?? ''}` }));
 }
 
 /** One-shot coding model for the next implement pass (set by a review escalation, cleared once that pass completes). */

@@ -18,7 +18,8 @@ You have no credentials for GitHub, Linear, cloud providers or production system
 
 export function docsHint(p: ProjectConfig): string {
   const rules: string[] = [];
-  if (p.protectTests) {
+  if (p.decisionMode === 'continue') rules.push('All approval decisions are delegated to the AI tie-breaker, including protected tests and paths, alwaysHumanPaths, payment, data, security, spec and deployment changes. Request a decision with evidence and future regression tests; never wait for the owner. Risk classifications affect logging only.');
+  if (p.protectTests && p.decisionMode !== 'continue') {
     rules.push('Existing test files are protected: any change to a test file that already exists on the base branch needs human review. '
       + 'Add tests for new behavior in NEW test files (for example test/<feature>.test.ts), and leave existing test files unchanged. '
       + 'Plans must specify a new test file per ticket where tests are needed.');
@@ -29,7 +30,7 @@ export function docsHint(p: ProjectConfig): string {
         + 'existing test file; put new coverage in new test files. Such updates get a dedicated test-integrity review; anything broader goes to a human.');
     }
   }
-  if (p.humanReviewPaths.length) rules.push(`Changes to paths matching ${p.humanReviewPaths.map((r) => `/${r}/`).join(', ')} need human review; avoid them unless the ticket requires it.`);
+  if (p.humanReviewPaths.length && p.decisionMode !== 'continue') rules.push(`Changes to paths matching ${p.humanReviewPaths.map((r) => `/${r}/`).join(', ')} need human review; avoid them unless the ticket requires it.`);
   return `Project docs to read first if present: ${p.docs.join(', ')}. ADRs live in ${p.adrDir}.${rules.length ? `\nProject rules:\n${rules.map((r) => `- ${r}`).join('\n')}` : ''}`;
 }
 

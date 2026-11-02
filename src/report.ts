@@ -1,3 +1,4 @@
+import { riskReasons } from './risk-tags.ts';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Ctx } from './context.ts';
@@ -45,7 +46,7 @@ export async function snapshot(ctx: Ctx, sinceMs: number): Promise<Snapshot> {
     failed: jobs.filter((j) => j.status === 'failed' && j.updated_at >= sinceMs),
     running: jobsByStatus(db, 'running', 'waiting_ci'),
     queued: jobsByStatus(db, 'queued'),
-    autoDecisions: db.prepare(`SELECT * FROM decisions WHERE authority = 'auto' AND created_at >= ? ORDER BY created_at`).all(sinceMs) as unknown as DecisionRow[],
+    autoDecisions: (db.prepare(`SELECT * FROM decisions WHERE authority IN ('auto', 'delegated', 'review_tiebreaker') AND status = 'resolved' AND created_at >= ? ORDER BY created_at`).all(sinceMs) as unknown as DecisionRow[]).sort((a, b) => riskRank(b) - riskRank(a) || a.created_at - b.created_at),
     pendingDecisions: db.prepare(`SELECT * FROM decisions WHERE status = 'pending_human' ORDER BY created_at`).all() as unknown as DecisionRow[],
     suggested: (db.prepare(`SELECT message, ts FROM events WHERE type = 'ticket.suggested' AND ts >= ?`).all(sinceMs) as { message: string; ts: number }[]),
     costs: {
@@ -131,4 +132,8 @@ export async function maybeSendMorningReport(ctx: Ctx, force = false) {
   }
   logEvent(db, 'report.sent', `morning report written to ${path}${hook ? ' and posted to webhook' : ''}`);
   return path;
+}
+
+function riskRank(d: DecisionRow): number {
+  return Number(d.category === 'high_risk' || riskReasons(`${d.question}\n${d.reasoning}`, [], d.category ?? undefined).length > 0);
 }

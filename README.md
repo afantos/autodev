@@ -257,3 +257,47 @@ scripts/            branch protection helper
 Requirements: Node ≥ 24, git, and a working OS sandbox (bubblewrap on Linux or Seatbelt on macOS). Setup and validation run offline with a private temporary HOME. Prepare dependencies in the worktree or a dedicated offline npm cache before running commands; see the setup guide.
 
 The orchestrator keeps authoritative hashes and independent Git objects in protected `dataDir`; `workspaceDir` contains disposable agent checkouts and separate validation/review snapshots. Agent-visible refs are never used as policy or secret-scan boundaries. See the setup guide for the required folder layout and migration restrictions. Ubuntu VM and live-Claude verification of this latest change remain outstanding.
+
+### Delegated decision flag
+
+Set `decisionMode: ask` (default) or `decisionMode: continue` per project in trusted
+configuration. **ask** preserves existing owner-approval behavior. **continue**
+delegates all approval stops in managed jobs to the AI, including `alwaysHumanPaths`,
+protected paths/tests, payments/prizes, user data/security, GitHub settings, specs,
+deployment/secrets and budget-change decisions. There is no always-ask exception in
+continue. Existing owner-only path rules remain findings for the tie-breaker to
+adjudicate, not reasons to request an owner answer.
+
+The tie-breaker (`models.reviewArbitration`, default `opus`) handles protected-diff
+policy findings, both review-disagreement paths, merge stops, and blocker questions.
+It must decide each complaint: **accept**, **rework**, or **follow_up**, with reasoning,
+evidence and concrete future tests. General blocker questions also use this model.
+Risk tags are metadata: high-risk decisions appear first in the automatic-decision
+report; a tag never holds or pauses work. Review rework remains automatic past the
+old owner-escalation boundary. Every new candidate still goes through validation.
+`limits.maxReviewCycles` defaults to 3 for the initial review rounds.
+
+Question records are written to `docs/autodev-decisions/<decision-id>.md`. Review
+and policy records live under `dataDir/review-decisions/<hash>.md`, with database
+rows, events and ticket comments. Original complaints, decisions, reasoning,
+evidence and pending regression tests remain inspectable. Deferred work gets a
+deduplicated follow-up ticket with acceptance criteria and future tests before a
+merge. Tie-breaker-approved follow-ups are scheduled Ready with the source ticket
+as a dependency, so they wait for that merge rather than an owner approval. Failed documentation or incomplete AI output cannot create an approval;
+they remain automatic retries/waits, not owner questions. A proposed test is not
+reported as a passed test.
+
+Approvals are bound to candidate/base, requirements, policy findings and model.
+A changed protected-path rule invalidates a cached policy approval. AI approvals
+are stored separately from human approvals and cannot carry over into ask mode.
+Existing blocked managed jobs with intact candidates are requeued automatically
+when continue is enabled. Merge-hold labels are also adjudicated in continue;
+explicit cancellation and the global stop/pause controls remain authoritative.
+
+This delegates decisions, not execution success: failed CI, invalid snapshots,
+missing credentials, unavailable services and exhausted runtime budgets cannot be
+reported as successful checks. Automatic repair/retry still uses the sandbox,
+validated candidate and configured spending controls. The flag does not grant
+new service credentials or edit GitHub branch protection. Continue also delegates the final merge handoff when `autoMerge` is off; the
+reviewer integration is still needed to execute the approval. External PR intake
+is a separate capability. No live configuration is changed by this implementation.
