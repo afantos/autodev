@@ -134,8 +134,9 @@ export class Orchestrator {
       const ttl = cfg.loop.dependencyCacheSeconds * 1000;
       if (cached && now() - cached.at < ttl) { if (cached.ticket) byId.set(id, cached.ticket); return cached.ticket; }
       const t = await tracker.getTicket(id).catch(() => null);
-      // Only successful lookups are cached: a failure (e.g. HTTP 429) is retried next tick, not remembered as "missing".
-      if (t) this.dependencyCache.set(id, { ticket: t, at: now() });
+      // Only successful lookups of settled tickets are cached: a failure (e.g. HTTP 429) is retried next tick, and a
+      // Backlog/Ideas dependency can still become Done, which a parked job must notice on the next tick.
+      if (t && (t.status === 'done' || t.status === 'canceled')) this.dependencyCache.set(id, { ticket: t, at: now() });
       if (t) byId.set(id, t);
       return t;
     };

@@ -355,6 +355,8 @@ export async function resumeIfFixesMerged(ctx: Ctx, job: Job, ticketById: (id: s
   if (!prep.ok) { await holdResume(ctx, job, b, prep.error); return true; }
   const feedback = `Autodev triage answered a blocking question.\nQuestion: ${b.question}\nAnswer: ${b.triageWait.answer}\nContinue the implementation accordingly.${prep.note ? `\n\n${prep.note}` : ''}`;
   logEvent(ctx.db, 'triage.base_refreshed', `${job.ticket_identifier}: ${prep.patch.base_sha && prep.patch.base_sha !== job.base_sha ? `merged the latest ${job.base_branch}` : `already on the latest ${job.base_branch}`}`, { jobId: job.id, ticketId: job.ticket_id });
+  // A resume on new evidence starts the continue no-progress counters afresh.
+  kvSet(ctx.db, `continue-progress:${job.id}`, null); kvSet(ctx.db, `continue-blocks:${job.id}`, null);
   updateJob(ctx.db, job.id, { ...prep.patch, status: 'queued', stage: 'workspace', blocked_reason: null, attempts: 0, fix_attempts: 0, review_cycles: 0, pending_feedback: feedback });
   await ctx.tracker.setStatus(job.ticket_id, 'in_progress').catch(() => {});
   await ctx.tracker.comment(job.ticket_id, '🧭 The prerequisite fix ticket(s) merged. autodev refreshes this branch with them and resumes the work.').catch(() => {});

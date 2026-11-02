@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { resolveReview, continuePolicyKey } from './review-resolution.ts';
 import { join, resolve } from 'node:path';
 import type { ProjectConfig } from './config.ts';
@@ -35,6 +36,8 @@ export interface Blocker {
   policyFingerprint?: string; policyReasons?: string[];
   /** A question (from the coding or review agent) that triage may try to resolve before it reaches a human. */
   triage?: boolean;
+  /** Parked until these ticket ids are Done; resumeIfFixesMerged then resumes the job with `answer` as feedback. */
+  triageWait?: { tickets: string[]; answer: string };
 }
 
 /** Thrown inside a stage to divert the job; handled centrally in runJob. */
@@ -846,6 +849,54 @@ async function preserveWork(ctx: Ctx, job: Job, why: string) {
   }
 }
 
+/** Under decisionMode=continue: the same blocker on an unchanged base this many times in a row parks the job. */
+export const CONTINUE_SAME_BLOCKER_LIMIT = 2;
+/** Under decisionMode=continue: total stops per job before it parks, whatever the blocker's wording. */
+export const CONTINUE_TOTAL_BLOCK_LIMIT = 6;
+
+function blockerFingerprint(b: Blocker): string {
+  const norm = (t: string) => t.toLowerCase().replace(/\b[0-9a-f]{7,40}\b/g, '').replace(/\$?\d+(\.\d+)?/g, '#').replace(/\s+/g, ' ').trim();
+  return createHash('sha256').update(norm(b.question)).digest('hex');
+}
+
+/**
+ * No-progress guard for decisionMode=continue. Counts stops per job in the state database (so cached or reused answers,
+ * restarts and cosmetic commits do not reset it): the same blocker on the same base CONTINUE_SAME_BLOCKER_LIMIT times in
+ * a row, or CONTINUE_TOTAL_BLOCK_LIMIT stops in total, parks the job instead of starting another paid run. A parked job
+ * waits for the unfinished tickets it depends on (its blocked-by links plus ticket ids named in the blocker) and is
+ * resumed by resumeIfFixesMerged once they are Done; with none to wait for it is a hard stop.
+ */
+async function continueNoProgressPark(ctx: Ctx, job: Job, b: Blocker): Promise<Blocker | null> {
+  const { db, tracker } = ctx;
+  const fp = blockerFingerprint(b);
+  const key = `continue-progress:${job.id}`;
+  let prev: { fp?: string; base?: string | null; n?: number } = {};
+  try { prev = JSON.parse(kvGet(db, key) ?? '{}'); } catch { /* reset */ }
+  const n = prev.fp === fp && prev.base === (job.base_sha ?? null) ? (prev.n ?? 0) + 1 : 1;
+  kvSet(db, key, JSON.stringify({ fp, base: job.base_sha ?? null, n }));
+  const total = Number(kvGet(db, `continue-blocks:${job.id}`) ?? '0') + 1;
+  kvSet(db, `continue-blocks:${job.id}`, String(total));
+  if (n < CONTINUE_SAME_BLOCKER_LIMIT && total < CONTINUE_TOTAL_BLOCK_LIMIT) return null;
+
+  const ticket = await tracker.getTicket(job.ticket_id).catch(() => null);
+  const named = new Set<string>();
+  for (const m of `${b.question}\n${b.reason}\n${b.recommendation ?? ''}`.matchAll(/\b([A-Z][A-Z0-9]{1,9}-\d+)\b/g)) if (m[1] !== job.ticket_identifier) named.add(m[1]);
+  const waits: Ticket[] = [];
+  for (const id of ticket?.blockedBy ?? []) { const t = await tracker.getTicket(id).catch(() => null); if (t && t.status !== 'done' && t.status !== 'canceled') waits.push(t); }
+  if (named.size) {
+    const all = await tracker.listTickets().catch(() => [] as Ticket[]);
+    for (const t of all) if (named.has(t.identifier) && t.status !== 'done' && t.status !== 'canceled' && !waits.some(w => w.id === t.id)) waits.push(t);
+  }
+  const why = n >= CONTINUE_SAME_BLOCKER_LIMIT ? `the same blocker repeated ${n} times on an unchanged base` : `${total} automatic stops on this job`;
+  logEvent(db, 'continue.parked', `${job.ticket_identifier}: ${why}${waits.length ? `; waiting for ${waits.map(w => w.identifier).join(', ')}` : ''}`, { jobId: job.id, ticketId: job.ticket_id, level: 'warn' });
+  if (waits.length) {
+    return { ...b, triage: false, hardStop: true,
+      reason: `Parked: ${why}. autodev resumes this ticket automatically once ${waits.map(w => w.identifier).join(', ')} ${waits.length === 1 ? 'is' : 'are'} Done.\n\n${b.reason}`,
+      triageWait: { tickets: waits.map(w => w.id), answer: `The prerequisite ticket(s) ${waits.map(w => w.identifier).join(', ')} are now Done and on the base branch. Re-check the blocker against the current code and continue the implementation.` } };
+  }
+  return { ...b, triage: false, hardStop: true, reason: `Stopped: ${why}, and no unfinished prerequisite ticket was found to wait for. Move the ticket back to Ready to retry.\n\n${b.reason}` };
+}
+
 /** Automatic resolutions under decisionMode=continue that may fail in a row before the job stops. */
 export const MAX_UNRESOLVED_CONTINUE_RETRIES = 2;
 
@@ -856,6 +907,11 @@ export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   // without reaching a human, and a later base refresh refuses a dirty workspace. Nothing is pushed unvalidated.
   await preserveWork(ctx, job, 'blocked');
   const project = ctx.cfg.projects.find(p => p.key === job.project)!;
+  if (project.decisionMode === 'continue' && !b.hardStop) {
+    // Checked before any paid resolution: a reused or cached answer is not progress.
+    const parked = await continueNoProgressPark(ctx, job, b);
+    if (parked) b = parked;
+  }
   if (project.decisionMode === 'continue' && !b.hardStop) {
     const ticket = await tracker.getTicket(job.ticket_id);
     let note = b.reason;
