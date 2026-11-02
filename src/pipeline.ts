@@ -327,7 +327,7 @@ function gateDivert(ctx: Ctx, job: Job, e: RunGateClosed): Divert {
 function ticketBudgetBlocker(ctx: Ctx, job: Job): Blocker {
   const spent = (ctx.db.prepare('SELECT COALESCE(SUM(cost_usd),0) s FROM usage WHERE ticket_id = ?').get(job.ticket_id) as { s: number }).s;
   const limit = perTicketLimit(ctx.db, ctx.cfg, job.ticket_id);
-  return { reason: `ticket budget $${limit} exhausted ($${spent.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null };
+  return { reason: `ticket budget $${limit} exhausted ($${spent.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null, hardStop: true };
 }
 
 /** A tie-breaker that could not decide (tool failure, budget, invalid output). Requeueing would re-run coding or the
@@ -846,6 +846,9 @@ async function preserveWork(ctx: Ctx, job: Job, why: string) {
   }
 }
 
+/** Automatic resolutions under decisionMode=continue that may fail in a row before the job stops. */
+export const MAX_UNRESOLVED_CONTINUE_RETRIES = 2;
+
 export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   const { db, owner, tracker } = ctx;
   let b = blocker;
@@ -856,19 +859,29 @@ export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   if (project.decisionMode === 'continue' && !b.hardStop) {
     const ticket = await tracker.getTicket(job.ticket_id);
     let note = b.reason;
+    let unresolved = false;
     if (ticket && job.worktree) {
       try {
         const result = await resolveQuestion(ctx, { job, ticket, project, worktree: job.worktree,
           question: b.question, context: `${b.reason}\nResolve this stop autonomously. Give a concrete repair or continuation plan; do not ask the owner.`, options: b.options });
         if (result.kind === 'answered') note = result.text;
-        else note = `Automatic resolution unavailable: ${result.reason}`;
+        else { note = `Automatic resolution unavailable: ${result.reason}`; unresolved = true; }
         if (b.decisionId && result.kind === 'answered') ctx.db.prepare("UPDATE decisions SET status = 'superseded', superseded_by = ? WHERE id = ? AND status = 'pending_human'").run(result.decisionId, b.decisionId);
-      } catch (e) { note = `Automatic resolution retry: ${String(e).slice(0, 500)}`; }
-    }
+      } catch (e) { note = `Automatic resolution retry: ${String(e).slice(0, 500)}`; unresolved = true; }
+    } else unresolved = true;
+    // An unresolved stop is retried a bounded number of times; requeueing it forever re-enters the same stop on every
+    // pass (observed live 2026-11-02). After the retries it stops like a hard stop; moving the ticket to Ready retries.
+    const retryKey = `continue-unresolved:${job.id}`;
+    const retries = Number(kvGet(db, retryKey) ?? '0');
+    if (unresolved && retries >= MAX_UNRESOLVED_CONTINUE_RETRIES) {
+      b = { ...b, reason: `${b.reason}\n\n${note}`, hardStop: true };
+    } else {
+    kvSet(db, retryKey, String(unresolved ? retries + 1 : 0));
     releaseLease(db, job.id, owner, 'queued', { stage: 'workspace', pending_feedback: note, blocked_reason: null, error: note });
     await tracker.setStatus(job.ticket_id, 'in_progress');
     logEvent(db, 'blocker.delegated', note, { jobId: job.id, ticketId: job.ticket_id });
     return;
+    }
   }
   if (b.triage) {
     const t = await triageBlocker(ctx, job, b).catch((e) => ({ kind: 'human' as const, note: `triage failed: ${(e as Error).message.slice(0, 300)}`, recommendation: null }));
