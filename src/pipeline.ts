@@ -29,6 +29,8 @@ const nextStage = (s: Stage): Stage | null => STAGES[STAGES.indexOf(s) + 1] ?? n
 
 export interface Blocker {
   reason: string; question: string; options: string[]; recommendation: string | null; decisionId: string | null; policyHash?: string;
+  /** Stop even under decisionMode=continue: automatic continuation would only repeat the same failing, paid step. */
+  hardStop?: boolean;
   /** For diff-policy blockers: the change's fingerprint and findings, so a human approval can carry over to the same change on a moved base. */
   policyFingerprint?: string; policyReasons?: string[];
   /** A question (from the coding or review agent) that triage may try to resolve before it reaches a human. */
@@ -328,6 +330,14 @@ function ticketBudgetBlocker(ctx: Ctx, job: Job): Blocker {
   return { reason: `ticket budget $${limit} exhausted ($${spent.toFixed(2)} spent)`, question: 'Continue spending on this ticket?', options: ['Raise the per-ticket budget and move back to Ready', 'Split the ticket', 'Cancel'], recommendation: 'Split the ticket', decisionId: null };
 }
 
+/** A tie-breaker that could not decide (tool failure, budget, invalid output). Requeueing would re-run coding or the
+ * paid review on every pass and adjudicate again, so the job stops with a retry instruction instead of looping. */
+function tieBreakerFailed(note: string): Divert {
+  return new Divert('blocked', 'AI tie-breaker could not decide', { reason: `the AI tie-breaker could not reach a decision: ${note.slice(0, 500)}`,
+    question: 'The AI tie-breaker failed for a technical reason (no decision was made). Move the ticket back to Ready to retry it.',
+    options: ['Retry the tie-breaker (move back to Ready)', 'Cancel'], recommendation: 'Retry the tie-breaker (move back to Ready)', decisionId: null, hardStop: true });
+}
+
 async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig) {
   const state = ctx.ws.trustedState(job.worktree!);
   if (state.base_sha !== job.base_sha || state.head_sha !== candidate(job)) throw new WorktreeTamperedError(job.worktree!, 'policy hashes differ from the job candidate');
@@ -350,7 +360,7 @@ async function requireChangeApproval(ctx: Ctx, job: Job, project: ProjectConfig)
       updateJob(ctx.db, job.id, { pending_feedback: resolution.note, stage: 'workspace', validated_sha: null, reviewed_sha: null, candidate_worktree: null }, ctx.owner);
       throw new Divert('requeue', 'Policy tie-breaker requested rework');
     }
-    throw new Divert('requeue', resolution.note);
+    throw tieBreakerFailed(resolution.note);
   }
   if (!result.reasons.length || kvGet(ctx.db, `policy-approved:${job.id}:${result.hash}`)) return;
   // A human approved this same change (same fingerprint) with the same or more findings; only the base moved since.
@@ -710,8 +720,7 @@ Review this supplied diff and the surrounding files in this candidate snapshot. 
         updateJob(db, job.id, { pending_feedback: resolution.note, stage: 'workspace', reviewed_sha: null, validated_sha: null, candidate_worktree: null }, owner);
         throw new Divert('requeue', 'AI tie-breaker requested one targeted rework');
       }
-      if (resolution.kind === 'waiting') throw new Divert('requeue', resolution.note);
-      throw new Divert('requeue', resolution.note);
+      throw tieBreakerFailed(resolution.note);
     }
     throw new Divert('blocked', 'review loop exhausted', { reason: `review still requests changes after ${cfg.limits.maxReviewCycles} fix cycles`, question: `Open review findings:\n${findings}\n${unmet}\nHow should we proceed?`, options: ['Accept as-is and review manually', 'Clarify requirements and retry', 'Cancel'], recommendation: null, decisionId: null });
   }
@@ -844,7 +853,7 @@ export async function blockJob(ctx: Ctx, job: Job, blocker: Blocker) {
   // without reaching a human, and a later base refresh refuses a dirty workspace. Nothing is pushed unvalidated.
   await preserveWork(ctx, job, 'blocked');
   const project = ctx.cfg.projects.find(p => p.key === job.project)!;
-  if (project.decisionMode === 'continue') {
+  if (project.decisionMode === 'continue' && !b.hardStop) {
     const ticket = await tracker.getTicket(job.ticket_id);
     let note = b.reason;
     if (ticket && job.worktree) {

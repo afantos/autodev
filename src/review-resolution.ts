@@ -24,6 +24,18 @@ export const ResolutionSchema = z.object({
 });
 type Resolution = z.infer<typeof ResolutionSchema>;
 export interface Complaint { id: string; issue: string; file?: string; category?: string }
+/** How long a failed adjudication of unchanged inputs is reused before it is tried again. */
+export const FAILURE_RETRY_MS = 60 * 60_000;
+function parseFailure(raw: string | null | undefined): { at: number; note: string } | null {
+  if (!raw) return null;
+  try { const v = JSON.parse(raw); if (typeof v?.at === 'number' && typeof v?.note === 'string') return v; } catch { /* legacy plain note */ }
+  return null; // legacy entries carry no time: retry them once
+}
+/** True while a recorded failure for unchanged inputs is still inside FAILURE_RETRY_MS. */
+export function resolveFailureFresh(raw: string | null | undefined): boolean {
+  const f = parseFailure(raw);
+  return !!f && now() - f.at < FAILURE_RETRY_MS;
+}
 export type ResolutionResult = { kind: 'accept' | 'rework' | 'held' | 'waiting'; note: string; key?: string };
 
 export function completeResolution(r: Resolution, complaints: Complaint[]): boolean {
@@ -55,9 +67,11 @@ export async function resolveReview(ctx: Ctx, job: Job, ticket: Ticket, project:
   if (Buffer.byteLength(JSON.stringify(payload)) > ctx.cfg.secondReview.maxInputChars) return { kind: 'held', note: 'Review disagreement exceeds the configured input limit; no content was truncated.' };
   await ctx.ws.assertCandidate(job.worktree, job.candidate_sha);
   await ctx.ws.assertSnapshot(job.candidate_worktree, job.worktree, job.candidate_sha);
-  const failed = kvGet(ctx.db, `${cacheKey}:failure`);
-  if (failed) return { kind: 'held', note: failed };
-  const fail = (note: string): ResolutionResult => { kvSet(ctx.db, `${cacheKey}:failure`, note); return { kind: 'held', note }; };
+  // A failed adjudication of unchanged inputs is not re-run on every pass (no repeated spend), but it is retried after
+  // FAILURE_RETRY_MS: a failure can be transient (budget, timeout) and must not block the job forever.
+  const raw = kvGet(ctx.db, `${cacheKey}:failure`);
+  if (resolveFailureFresh(raw)) return { kind: 'held', note: parseFailure(raw)!.note };
+  const fail = (note: string): ResolutionResult => { kvSet(ctx.db, `${cacheKey}:failure`, JSON.stringify({ at: now(), note })); return { kind: 'held', note }; };
   let resolution: Resolution | undefined;
   const cached = kvGet(ctx.db, cacheKey);
   if (cached) {
@@ -139,9 +153,10 @@ export async function resumeReviewDisagreement(ctx: Ctx, job: Job, ticket: Ticke
   const project = ctx.cfg.projects.find(p => p.key === job.project);
   if (project?.decisionMode !== 'continue' || job.status !== 'blocked' || !['blocked', 'ready', 'in_progress', 'review'].includes(ticket.status)) return false;
 
-  let blocker: { reason?: string; decisionId?: string };
+  let blocker: { reason?: string; decisionId?: string; hardStop?: boolean };
   try { blocker = JSON.parse(job.blocked_reason ?? '{}'); } catch { return false; }
-  if (!blocker.reason) return false;
+  // A hard stop (for example a tie-breaker that technically failed) waits for an explicit move back to Ready.
+  if (!blocker.reason || blocker.hardStop) return false;
   let canReview = false;
   if (job.worktree && job.candidate_worktree && job.candidate_sha && job.validated_sha === job.candidate_sha && job.base_branch) {
     try {
