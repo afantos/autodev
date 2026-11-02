@@ -57,6 +57,7 @@ export const DecisionSchema = z.object({
   confidence: z.number().min(0).max(1),
   requiresHuman: z.boolean(),
   significantArchitecture: z.boolean().describe('True if this deserves an ADR'),
+  futureTests: z.array(z.string().trim().min(1)).optional().describe('Concrete regression tests and expected results for this decision; required for delegated continuation'),
 });
 export type Decision = z.infer<typeof DecisionSchema>;
 

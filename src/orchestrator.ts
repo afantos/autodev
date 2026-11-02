@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { resumeReviewDisagreement } from './review-resolution.ts';
 import type { Ctx } from './context.ts';
 import { canStartRun, settleDeadOwnerReservations } from './budget.ts';
 import { acquireInstanceLock, ownerDead, releaseInstanceLock, acquireLease, activeJobForTicket, claimTicket, expiredLeases, jobsByStatus, kvGet, kvList, kvSet, logEvent, now, releaseLease, updateJob } from './db.ts';
@@ -214,6 +215,7 @@ export class Orchestrator {
       return;
     }
     if (job.status === 'blocked' && t.status === 'blocked' && await resumeIfFixesMerged(ctx, job, fetchMissing)) return;
+    if (await resumeReviewDisagreement(ctx, job, t)) return;
     if (job.status === 'blocked' && t.status === 'ready') { await resumeBlocked(ctx, job); return; }
     if (job.status === 'awaiting_merge' && job.pr_number) {
       const pr = await scm.getPr(job.repo, job.pr_number).catch(() => null);
@@ -247,7 +249,7 @@ export class Orchestrator {
       } else if (t.status === 'review') {
         // Auto-merge only from Review: a ticket a human moved (Canceled, Backlog, Done...) is never merged.
         const project = ctx.cfg.projects.find((p) => p.key === job.project);
-        if (project?.autoMerge) {
+        if (project && (project.autoMerge || project.decisionMode === 'continue')) {
           const outcome = await autoMergeStep(ctx, job, t, project).catch((e) => {
             logEvent(db, 'automerge.error', `${job.ticket_identifier}: ${(e as Error).message.slice(0, 300)}`, { jobId: job.id, ticketId: t.id, level: 'warn' });
             return 'waiting' as const;

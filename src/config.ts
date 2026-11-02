@@ -46,6 +46,8 @@ const ProjectSchema = z.object({
    * branch up to date with base. Requires secondReview.enabled and a reviewer GitHub account. Flagged PRs still wait.
    */
   autoMerge: z.boolean().default(false),
+  /** ask preserves owner approvals; continue delegates all approval stops and records risk only for audit ordering. */
+  decisionMode: z.enum(['ask', 'continue']).default('ask'),
   /** Repo-relative path regexes whose changes always need human review (e.g. lint boundary rules). */
   humanReviewPaths: z.array(z.string()).default([]),
   /** Send removed/changed assertions and newly skipped tests in test files to human review. */
@@ -120,7 +122,7 @@ const ConfigSchema = z.object({
   limits: z.object({
     maxAttempts: z.number().default(3),
     maxFixAttempts: z.number().default(3),
-    maxReviewCycles: z.number().default(2),
+    maxReviewCycles: z.number().default(3),
     maxDecisionsPerTicket: z.number().default(3),
     maxAttemptsPerQuestion: z.number().default(2),
     agentMaxTurns: z.number().default(200),
@@ -145,6 +147,7 @@ const ConfigSchema = z.object({
     codingComplex: z.string().default('opus'),
     decision: z.string().default('sonnet'),
     review: z.string().default('opus'),
+    reviewArbitration: z.string().default('opus'),
     classify: z.string().default('haiku'),
     /** Complexity at or above which codingComplex is used. */
     complexThreshold: z.number().default(4),

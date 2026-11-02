@@ -42,7 +42,7 @@ export interface Ctx {
 export function createCtx(cfg: Config, overrides: Partial<Pick<Ctx, 'tracker' | 'scm' | 'runner' | 'db' | 'runCommand' | 'secondReviewer' | 'primeNpmCache' | 'fetchPackument'>> = {}): Ctx {
   const db = overrides.db ?? openDb(join(cfg.dataDir, 'autodev.db'));
   const tracker = overrides.tracker ?? (cfg.tracker === 'linear' ? new LinearTracker(cfg, secret('LINEAR_API_KEY')!) : new LocalTracker(db));
-  const autoMerge = cfg.secondReview.enabled && cfg.projects.some((p) => p.autoMerge);
+  const autoMerge = cfg.secondReview.enabled && cfg.projects.some((p) => p.autoMerge || p.decisionMode === 'continue');
   if (cfg.projects.some((p) => p.autoMerge) && !cfg.secondReview.enabled) throw new Error('a project sets autoMerge but secondReview.enabled is false');
   const scm = overrides.scm ?? (cfg.scm === 'github'
     ? new GitHubScm(secret('GITHUB_TOKEN')!, autoMerge ? secret('GITHUB_REVIEWER_TOKEN')! : undefined)

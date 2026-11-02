@@ -127,4 +127,4 @@ export interface Job {
   updated_at: number;
 }
 
-export type AgentRole = 'planning' | 'coding' | 'decision' | 'review' | 'classify';
+export type AgentRole = 'planning' | 'coding' | 'decision' | 'review' | 'classify' | 'arbitration';

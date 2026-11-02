@@ -30,6 +30,7 @@ projects:
       NODE_ENV: test
     maxConcurrent: 1
     stackedBranches: false            # true = may base a ticket on an unmerged dependency's PR branch
+    decisionMode: ask                # ask | continue; continue delegates all approval stops, including protected/high-risk changes
     approvedDependencies: []          # packages the Decision Agent may add without asking you
     humanReviewPaths: []              # repo-relative regexes for product specs, architecture or other protected files
     protectTests: true                # existing test edits require review; new tests are checked for weakening
@@ -68,12 +69,13 @@ models:
   complexThreshold: 4
   decision: sonnet
   review: opus
+  reviewArbitration: opus
   classify: haiku
 
 limits:
   maxAttempts: 3
   maxFixAttempts: 3
-  maxReviewCycles: 2
+  maxReviewCycles: 3
   maxDecisionsPerTicket: 3
   maxAttemptsPerQuestion: 2
   agentMaxTurns: 200
