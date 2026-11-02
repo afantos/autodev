@@ -41,7 +41,9 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
       if (!job.worktree || !job.candidate_worktree || !sha) return 'waiting';
       const result = await resolveReview(ctx, job, ticket, project, { source: 'blocker', requirements: requirementsHash(ctx, ticket),
         summary: 'Resolve a merge stop. Execution checks must pass after any repair.', complaints: [{ id: 'finding-0', issue: reason }] });
-      if (result.kind === 'held' || result.kind === 'waiting') return 'waiting';
+      // Only a rework verdict sends the ticket back to coding. Accepting a merge stop means "wait": the stop's own
+      // condition (CI, policy, review) must still clear on a later pass before anything merges.
+      if (result.kind !== 'rework') return 'waiting';
       return requeue({ stage: 'workspace', fix_attempts: 0, pending_feedback: result.note }, 'automerge.stop_rework', result.note);
     }
     const key = `automerge-hold:${job.id}:${sha}`;
@@ -128,7 +130,8 @@ export async function autoMergeStep(ctx: Ctx, job: Job, ticket: Ticket, project:
         const resolution = await resolveReview(ctx, job, ticket, project, { source: 'policy', requirements,
           summary: 'Resolve every protected-diff policy finding before merge.', complaints: reasons.map((issue, i) => ({ id: `finding-${i}`, issue })) });
         if (resolution.kind === 'rework') return requeue({ stage: 'workspace', pending_feedback: resolution.note }, 'automerge.policy_rework', resolution.note);
-        if (resolution.kind !== 'accept') return hold(resolution.note);
+        // A failed or deferred adjudication is not a merge stop to adjudicate in turn: wait and retry the real findings.
+        if (resolution.kind !== 'accept') { logEvent(db, 'automerge.automatic_wait', resolution.note, { jobId: job.id, ticketId: ticket.id }); return 'waiting'; }
         approval = resolution.note; kvSet(db, approvalKey, approval);
       }
       policyNote = `delegated policy approval for exact diff ${policy.hash.slice(0, 12)}`;
